@@ -507,6 +507,21 @@ def test_throttle_task_uses_throttle_model():
     assert task.resume_session == MAIN_ID
 
 
+def test_throttle_task_respec_on_requeue():
+    from tokentracker import cli
+    cfg = _local_cfg()
+    cfg.main_session_ids = ["old-session"]
+    d = dispatch.Dispatcher(cfg)
+    cli._ensure_throttle_task(cfg, d)
+    d.set_status(cli.THROTTLE_TASK_ID, "killed")
+    cfg.main_session_ids = [MAIN_ID]
+    cfg.throttle_model = "claude-fable-5-1"
+    cli._ensure_throttle_task(cfg, d)
+    task = d.get(cli.THROTTLE_TASK_ID)
+    assert task.status == "pending", task
+    assert task.model == "claude-fable-5-1" and task.resume_session == MAIN_ID, task
+
+
 def test_gpu_guard():
     cfg = _local_cfg()
     d = dispatch.Dispatcher(cfg)

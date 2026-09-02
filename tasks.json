@@ -5,14 +5,14 @@
       "prompt": "FULL THROTTLE: the operator pressed the TokenDistributor full-throttle button. The goal is to exhaust the remaining weekly Claude token budget on useful work for this project before it resets. Continue the most valuable unfinished work from this conversation autonomously: pick the highest-impact pending items, work in long thorough passes, verify results as you go, and keep working until no genuinely useful work remains.",
       "cwd": "C:\\Users\\chenw",
       "weight": "heavy",
-      "model": null,
-      "resume_session": "cfec86cd-a83e-4f7a-92ab-864296e08d03",
+      "model": "claude-fable-5-1",
+      "resume_session": "329cb798-b055-4f92-ba8d-96174a22413d",
       "priority": 100,
       "max_minutes": 240,
       "status": "running",
       "lane": "cloud",
-      "started_at": "2026-09-02T22:08:40.505278+00:00",
-      "pid": 74724
+      "started_at": "2026-09-02T22:30:11.326985+00:00",
+      "pid": 87292
     }
   ]
 }

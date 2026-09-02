@@ -54,6 +54,10 @@ def _ensure_throttle_task(cfg: Config, dispatcher: Dispatcher) -> None:
             resume_session=cfg.main_session_ids[0],
         ))
     elif task.status in ("done", "failed", "killed"):
+        # The stored spec may predate a config change (main session handover,
+        # executive model directive); refresh it before every relaunch.
+        task.model = cfg.throttle_model or None
+        task.resume_session = cfg.main_session_ids[0]
         dispatcher.set_status(THROTTLE_TASK_ID, "pending")
 
 
