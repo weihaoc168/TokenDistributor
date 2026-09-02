@@ -13,7 +13,7 @@
   "yield_concurrency": 0,
   "claude_cmd": "claude",
   "permission_mode": "acceptEdits",
-  "main_session_ids": ["cfec86cd-a83e-4f7a-92ab-864296e08d03"],
+  "main_session_ids": ["329cb798-b055-4f92-ba8d-96174a22413d"],
   "local_enabled": true,
   "local_model": "Qwen3.8-27B-NVFP4",
   "local_model_path": "D:\\FreeToken Desktop\\Qwen3.8-27B-NVFP4",
