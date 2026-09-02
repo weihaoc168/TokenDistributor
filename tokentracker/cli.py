@@ -48,6 +48,7 @@ def _ensure_throttle_task(cfg: Config, dispatcher: Dispatcher) -> None:
             prompt=THROTTLE_PROMPT,
             cwd=str(Path.home()),
             weight="heavy",
+            model=cfg.throttle_model or None,
             priority=100,
             max_minutes=240,
             resume_session=cfg.main_session_ids[0],

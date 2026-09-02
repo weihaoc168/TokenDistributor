@@ -40,6 +40,8 @@ class Config:
     light_pct_per_hr_prior: float = 0.3
     claude_cmd: str = "claude"
     permission_mode: str = "acceptEdits"
+    worker_model: str = ""
+    throttle_model: str = ""
     extra_claude_args: list[str] = field(default_factory=list)
     main_session_ids: list[str] = field(default_factory=list)
     local_enabled: bool = False

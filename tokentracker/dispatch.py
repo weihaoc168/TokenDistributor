@@ -210,9 +210,9 @@ class Dispatcher:
         env = None
         if lane == "local":
             env = local_env(self.cfg)
-            cmd += ["--model", self.cfg.local_model]
-        elif task.model:
-            cmd += ["--model", task.model]
+        model = self._task_model(task, lane)
+        if model:
+            cmd += ["--model", model]
         if task.resume_session:
             cmd += ["--resume", task.resume_session, "--fork-session"]
         if self.cfg.permission_mode == "bypass":
@@ -247,6 +247,11 @@ class Dispatcher:
         self.save()
         suffix = f" -> {self.cfg.local_model}" if lane == "local" else ""
         return f"task {task.id}: launched {lane}{suffix} ({task.weight}, pid {popen.pid})"
+
+    def _task_model(self, task: TaskSpec, lane: str) -> str | None:
+        if lane == "local":
+            return self.cfg.local_model
+        return task.model or self.cfg.worker_model or None
 
     def _task_prompt(self, task: TaskSpec, lane: str) -> str:
         if lane == "local" and self.cfg.local_prompt_preamble:

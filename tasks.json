@@ -1,24 +1,18 @@
 {
   "tasks": [
     {
-      "id": "example-heavy-001",
-      "prompt": "Read the README.md in this directory and produce a detailed improvement plan in PLAN.md covering structure, missing sections, and clarity. Then apply the improvements to README.md.",
-      "cwd": "C:/Users/chenw/TokenDistributor/sandbox",
+      "id": "throttle-main-continue",
+      "prompt": "FULL THROTTLE: the operator pressed the TokenDistributor full-throttle button. The goal is to exhaust the remaining weekly Claude token budget on useful work for this project before it resets. Continue the most valuable unfinished work from this conversation autonomously: pick the highest-impact pending items, work in long thorough passes, verify results as you go, and keep working until no genuinely useful work remains.",
+      "cwd": "C:\\Users\\chenw",
       "weight": "heavy",
       "model": null,
-      "priority": 10,
-      "max_minutes": 90,
-      "status": "pending"
-    },
-    {
-      "id": "example-light-001",
-      "prompt": "List the files in this directory and write a one-line description of each into FILES.md.",
-      "cwd": "C:/Users/chenw/TokenDistributor/sandbox",
-      "weight": "light",
-      "model": "haiku",
-      "priority": 0,
-      "max_minutes": 20,
-      "status": "pending"
+      "resume_session": "cfec86cd-a83e-4f7a-92ab-864296e08d03",
+      "priority": 100,
+      "max_minutes": 240,
+      "status": "running",
+      "lane": "cloud",
+      "started_at": "2026-09-02T22:08:40.505278+00:00",
+      "pid": 74724
     }
   ]
 }

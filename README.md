@@ -85,6 +85,8 @@ When the decision is `blocked`, pending tasks are re-dispatched as headless `cla
 | `local_gpu_guard_procs` | `["UnrealEditor.exe"]` | never auto-start the engine while these run |
 | `local_prompt_preamble` | `""` | standing instructions prepended to every local dispatch |
 | `local_minutes_multiplier` | `3.0` | max_minutes headroom for slower local decode |
+| `worker_model` | `""` | default `--model` for dispatched cloud tasks (this machine: `claude-opus-4-8`) |
+| `throttle_model` | `""` | model for the full-throttle fork of the main session (this machine: `claude-fable-5-1`) |
 
 ## 🩻 Under the hood
 

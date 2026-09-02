@@ -483,6 +483,30 @@ def test_local_prompt_preamble():
     assert d._task_prompt(task, "cloud") == "fix the bug"
 
 
+def test_task_model_selection():
+    cfg = _local_cfg()
+    d = dispatch.Dispatcher(cfg)
+    task = TaskSpec(id="t", prompt="p", cwd=str(cfg.root))
+    assert d._task_model(task, "cloud") is None
+    cfg.worker_model = "claude-opus-4-8"
+    assert d._task_model(task, "cloud") == "claude-opus-4-8"
+    task.model = "haiku"
+    assert d._task_model(task, "cloud") == "haiku"
+    assert d._task_model(task, "local") == "Qwen-test"
+
+
+def test_throttle_task_uses_throttle_model():
+    from tokentracker import cli
+    cfg = _local_cfg()
+    cfg.main_session_ids = [MAIN_ID]
+    cfg.throttle_model = "claude-fable-5-1"
+    d = dispatch.Dispatcher(cfg)
+    cli._ensure_throttle_task(cfg, d)
+    task = d.get(cli.THROTTLE_TASK_ID)
+    assert task is not None and task.model == "claude-fable-5-1", task
+    assert task.resume_session == MAIN_ID
+
+
 def test_gpu_guard():
     cfg = _local_cfg()
     d = dispatch.Dispatcher(cfg)
