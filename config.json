@@ -1,0 +1,17 @@
+{
+  "poll_seconds": 300,
+  "slope_window_minutes": 45,
+  "activity_idle_minutes": 15,
+  "activity_cooldown_minutes": 60,
+  "reserve_week_frac": 0.15,
+  "ahead_margin": 0.03,
+  "endgame_hours": 12.0,
+  "five_hour_guard_active": 0.8,
+  "five_hour_guard_idle": 0.95,
+  "max_concurrency": 3,
+  "surge_concurrency": 4,
+  "yield_concurrency": 0,
+  "claude_cmd": "claude",
+  "permission_mode": "acceptEdits",
+  "main_session_ids": ["690b1fea-bf11-4d69-8e8f-4500794ec87d"]
+}
