@@ -9,7 +9,7 @@
   "five_hour_guard_active": 0.8,
   "five_hour_guard_idle": 0.95,
   "max_concurrency": 3,
-  "surge_concurrency": 20,
+  "surge_concurrency": 30,
   "yield_concurrency": 0,
   "worker_model": "claude-opus-4-8",
   "throttle_model": "claude-fable-5-1",
