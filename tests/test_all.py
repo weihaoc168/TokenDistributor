@@ -361,6 +361,40 @@ def test_sync_from_disk_merges_external_edits():
     assert d.get("new").status == "pending"
 
 
+def test_supervisor_adopts_live_orphan():
+    cfg = make_cfg()
+    my_pid = __import__("os").getpid()
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "fork", "prompt": "p", "cwd": str(cfg.root), "weight": "heavy",
+         "status": "running", "pid": my_pid},
+        {"id": "dead", "prompt": "p", "cwd": str(cfg.root), "weight": "light",
+         "status": "running", "pid": 999999},
+    ]}), encoding="utf-8")
+    d = dispatch.Dispatcher(cfg, supervise=True)
+    # Live pid (this test process) adopted; impossible pid orphan-marked.
+    assert d.get("fork").status == "running" and "fork" in d._adopted
+    assert d.get("dead").status == "failed" and "orphaned" in d.get("dead").error
+
+
+def test_adopted_task_finalizes_from_output_file():
+    cfg = make_cfg()
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "fork", "prompt": "p", "cwd": str(cfg.root), "weight": "heavy",
+         "status": "running", "pid": 999999,
+         "started_at": (utcnow() - timedelta(minutes=3)).isoformat()},
+    ]}), encoding="utf-8")
+    (cfg.logs_dir / "fork.out.json").write_text(json.dumps({
+        "is_error": False, "total_cost_usd": 1.5,
+        "usage": {"input_tokens": 10, "output_tokens": 5}}), encoding="utf-8")
+    d = dispatch.Dispatcher(cfg, supervise=False)
+    d._adopted["fork"] = 999999
+    actions = d.reap(utcnow())
+    task = d.get("fork")
+    assert task.status == "done" and task.cost_usd == 1.5, (task, actions)
+    assert any("[adopted]" in a for a in actions), actions
+    assert "fork" not in d._adopted
+
+
 def test_dispatcher_finalize():
     cfg = make_cfg()
     _seed_tasks(cfg)

@@ -13,6 +13,30 @@ from .config import Config
 from .models import Decision, QueueStats, TaskSpec, parse_iso, utcnow
 
 LOCAL_HEALTH_TIMEOUT = 4.0
+_PROCESS_QUERY = 0x00101000
+_WAIT_TIMEOUT = 0x102
+
+
+def pid_alive(pid: int | None) -> bool:
+    """Best-effort liveness probe for a process this tracker did not spawn.
+
+    Windows reuses pids, so a false positive is possible; for adoption that
+    only delays finalization until the impostor exits, which is acceptable.
+    """
+    if not pid:
+        return False
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+    except (ImportError, AttributeError):
+        return False
+    handle = k32.OpenProcess(_PROCESS_QUERY, False, int(pid))
+    if not handle:
+        return False
+    try:
+        return k32.WaitForSingleObject(handle, 0) == _WAIT_TIMEOUT
+    finally:
+        k32.CloseHandle(handle)
 LOCAL_MODEL_ENV_KEYS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
@@ -64,12 +88,19 @@ class Dispatcher:
         self._procs: dict[str, _Proc] = {}
         self._local_start_ts: float | None = None
         self.local_engine_healthy: bool | None = None
+        self._adopted: dict[str, int] = {}
         self.load()
         if not supervise:
             return
         changed = False
         for task in self._tasks:
             if task.status == "running" and task.id not in self._procs:
+                # A restart must not kill the bookkeeping of a session another
+                # loop instance launched and left alive (the fork keeps working
+                # detached); adopt it and finalize from its output file later.
+                if pid_alive(task.pid):
+                    self._adopted[task.id] = task.pid
+                    continue
                 task.status = "failed"
                 task.error = "orphaned by tracker restart"
                 changed = True
@@ -158,7 +189,12 @@ class Dispatcher:
     def _finalize(self, task: TaskSpec, proc: _Proc, now: datetime) -> str:
         proc.out.close()
         proc.err.close()
-        exit_code = proc.popen.returncode
+        return self._finalize_record(task, proc.popen.returncode, now)
+
+    def _finalize_record(self, task: TaskSpec, exit_code: int | None,
+                         now: datetime) -> str:
+        # exit_code None = adopted session (launched by a prior loop instance):
+        # the exit code is unknowable, so judge by the output file alone.
         out_path = self.cfg.logs_dir / f"{task.id}.out.json"
         result: dict = {}
         try:
@@ -179,7 +215,8 @@ class Dispatcher:
         task.cost_usd = float(cost) if isinstance(cost, (int, float)) else None
         task.finished_at = now.isoformat()
 
-        if exit_code == 0 and not result.get("is_error"):
+        ok = (exit_code == 0 or (exit_code is None and bool(result)))
+        if ok and not result.get("is_error"):
             task.status = "done"
         else:
             task.status = "failed"
@@ -229,6 +266,28 @@ class Dispatcher:
                 task.finished_at = now.isoformat()
                 del self._procs[task_id]
                 actions.append(f"task {task.id}: killed after {limit_minutes:g} min limit")
+        for task_id, pid in list(self._adopted.items()):
+            task = self.get(task_id)
+            if task is None or task.status != "running":
+                del self._adopted[task_id]
+                continue
+            if not pid_alive(pid):
+                del self._adopted[task_id]
+                actions.append(
+                    self._finalize_record(task, None, now) + " [adopted]")
+                continue
+            started = parse_iso(task.started_at)
+            limit_minutes = task.max_minutes * (
+                self.cfg.local_minutes_multiplier if task.lane == "local" else 1.0
+            )
+            if started and (now - started).total_seconds() > limit_minutes * 60:
+                self._kill_tree(pid)
+                del self._adopted[task_id]
+                task.status = "killed"
+                task.error = f"exceeded max_minutes={limit_minutes:g}"
+                task.finished_at = now.isoformat()
+                actions.append(
+                    f"task {task.id}: adopted session killed after {limit_minutes:g} min limit")
         if actions:
             self.save()
         return actions
