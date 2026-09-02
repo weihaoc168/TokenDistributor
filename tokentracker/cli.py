@@ -209,7 +209,7 @@ def _tick(
 def cmd_run(cfg: Config, once: bool) -> int:
     from .usage import RateLimitedError, UsageHistory
 
-    dispatcher = Dispatcher(cfg)
+    dispatcher = Dispatcher(cfg, supervise=True)
     history = UsageHistory(cfg)
     print(f"TokenDistributor loop started (poll every {cfg.poll_seconds}s, ctrl-c to stop)")
     next_fetch_ts = 0.0

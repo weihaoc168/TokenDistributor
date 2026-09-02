@@ -305,7 +305,7 @@ def _seed_tasks(cfg: Config) -> None:
 def test_dispatcher_orphan_and_queue():
     cfg = make_cfg()
     _seed_tasks(cfg)
-    d = dispatch.Dispatcher(cfg)
+    d = dispatch.Dispatcher(cfg, supervise=True)
     b = d.get("b")
     assert b.status == "failed" and "orphaned" in (b.error or ""), b
     stats = d.queue_stats()
@@ -322,6 +322,43 @@ def test_dispatcher_orphan_and_queue():
 
     d.set_status("b", "pending")
     assert d.get("b").error is None
+
+
+def test_cli_dispatcher_never_orphan_marks():
+    cfg = make_cfg()
+    _seed_tasks(cfg)
+    d = dispatch.Dispatcher(cfg)
+    b = d.get("b")
+    assert b.status == "running" and b.error is None, b
+    on_disk = json.loads(cfg.tasks_file.read_text(encoding="utf-8"))
+    assert on_disk["tasks"][1]["status"] == "running", on_disk
+
+
+def test_sync_from_disk_merges_external_edits():
+    cfg = make_cfg()
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "mine", "prompt": "p", "cwd": str(cfg.root), "weight": "heavy",
+         "status": "running", "pid": 1},
+        {"id": "stale", "prompt": "p", "cwd": str(cfg.root), "status": "pending"},
+    ]}), encoding="utf-8")
+    d = dispatch.Dispatcher(cfg, supervise=False)
+    # Simulate loop ownership of "mine" via a live proc handle.
+    out = open(cfg.logs_dir / "o", "w")
+    err = open(cfg.logs_dir / "e", "w")
+    fake = types.SimpleNamespace(returncode=None, pid=1, poll=lambda: None)
+    d._procs["mine"] = dispatch._Proc(fake, out, err)
+    # External CLI: adds "new", cancels "stale", falsely orphan-marks "mine".
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "mine", "prompt": "p", "cwd": str(cfg.root), "weight": "heavy",
+         "status": "failed", "error": "orphaned by tracker restart"},
+        {"id": "stale", "prompt": "p", "cwd": str(cfg.root), "status": "failed"},
+        {"id": "new", "prompt": "p", "cwd": str(cfg.root), "status": "pending"},
+    ]}), encoding="utf-8")
+    d.sync_from_disk()
+    assert d.get("mine").status == "running"      # proc-owned: memory wins
+    assert d.get("stale").status == "failed"      # external cancel sticks
+    assert d.get("new") is not None               # external add adopted
+    assert d.get("new").status == "pending"
 
 
 def test_dispatcher_finalize():

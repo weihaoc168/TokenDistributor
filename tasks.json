@@ -12,7 +12,8 @@
       "status": "running",
       "lane": "cloud",
       "started_at": "2026-09-02T22:30:11.326985+00:00",
-      "pid": 87292
+      "pid": 87292,
+      "error": null
     }
   ]
 }

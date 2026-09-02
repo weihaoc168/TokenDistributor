@@ -54,13 +54,19 @@ class _Proc:
 
 
 class Dispatcher:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, supervise: bool = False) -> None:
+        # Only the run loop supervises: it alone may orphan-mark running rows
+        # (a CLI invocation has an empty _procs by construction, so it must
+        # never conclude that a task another process launched is dead).
         self.cfg = cfg
+        self.supervise = supervise
         self._tasks: list[TaskSpec] = []
         self._procs: dict[str, _Proc] = {}
         self._local_start_ts: float | None = None
         self.local_engine_healthy: bool | None = None
         self.load()
+        if not supervise:
+            return
         changed = False
         for task in self._tasks:
             if task.status == "running" and task.id not in self._procs:
@@ -70,12 +76,37 @@ class Dispatcher:
         if changed:
             self.save()
 
-    def load(self) -> None:
+    def _read_tasks_file(self) -> list[TaskSpec]:
         if not self.cfg.tasks_file.exists():
-            self._tasks = []
-            return
+            return []
         data = json.loads(self.cfg.tasks_file.read_text(encoding="utf-8"))
-        self._tasks = [TaskSpec.from_dict(d) for d in data.get("tasks", [])]
+        return [TaskSpec.from_dict(d) for d in data.get("tasks", [])]
+
+    def load(self) -> None:
+        self._tasks = self._read_tasks_file()
+
+    def sync_from_disk(self) -> None:
+        """Merge external tasks.json edits (CLI add/requeue/cancel) into a
+        long-running loop, which otherwise saves its own memory over them.
+
+        Tasks with a live process are owned by this loop: memory wins. For
+        everything else the disk version wins, so CLI edits stick; disk-only
+        ids are adopted (external adds), memory-only non-running ids were
+        deleted externally and are dropped.
+        """
+        try:
+            disk = {t.id: t for t in self._read_tasks_file()}
+        except (OSError, json.JSONDecodeError, TypeError, KeyError):
+            return
+        merged: list[TaskSpec] = []
+        for task in self._tasks:
+            if task.id in self._procs:
+                merged.append(task)
+                disk.pop(task.id, None)
+            elif task.id in disk:
+                merged.append(disk.pop(task.id))
+        merged.extend(disk.values())
+        self._tasks = merged
 
     def save(self) -> None:
         tmp = self.cfg.tasks_file.with_suffix(".tmp")
@@ -340,6 +371,8 @@ class Dispatcher:
                 actions.append(f"task {task.id}: launch failed ({exc})")
 
     def apply(self, decision: Decision, now: datetime) -> list[str]:
+        if self.supervise:
+            self.sync_from_disk()
         actions = self.reap(now)
         running_cloud = sum(
             1 for t in self._tasks
