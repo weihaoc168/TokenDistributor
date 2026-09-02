@@ -4,11 +4,42 @@ import json
 import os
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 from datetime import datetime
 from typing import IO
 
 from .config import Config
 from .models import Decision, QueueStats, TaskSpec, parse_iso, utcnow
+
+LOCAL_HEALTH_TIMEOUT = 4.0
+LOCAL_MODEL_ENV_KEYS = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+)
+
+
+def local_env(cfg: Config, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for a claude -p session pinned to the local FreeToken engine.
+
+    Mirrors claude-local.cmd / `ft launch claude`: base URL + token swap, every
+    model alias mapped to the local model, and a generous API timeout because a
+    single-GPU decode turn is slow.
+    """
+    env = dict(os.environ if base is None else base)
+    env.pop("ANTHROPIC_API_KEY", None)
+    env["ANTHROPIC_BASE_URL"] = cfg.local_base_url
+    env["ANTHROPIC_AUTH_TOKEN"] = cfg.local_auth_token
+    for key in LOCAL_MODEL_ENV_KEYS:
+        env[key] = cfg.local_model
+    env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(cfg.local_max_context_tokens)
+    env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(cfg.local_max_output_tokens)
+    env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
+    env["API_TIMEOUT_MS"] = str(cfg.local_api_timeout_ms)
+    return env
 
 
 class DispatchError(Exception):
@@ -27,6 +58,8 @@ class Dispatcher:
         self.cfg = cfg
         self._tasks: list[TaskSpec] = []
         self._procs: dict[str, _Proc] = {}
+        self._local_start_ts: float | None = None
+        self.local_engine_healthy: bool | None = None
         self.load()
         changed = False
         for task in self._tasks:
@@ -78,6 +111,10 @@ class Dispatcher:
             pending_heavy=sum(1 for t in pending if t.weight == "heavy"),
             pending_light=sum(1 for t in pending if t.weight != "heavy"),
             running=sum(1 for t in self._tasks if t.status == "running"),
+            running_local=sum(
+                1 for t in self._tasks
+                if t.status == "running" and t.lane == "local"
+            ),
         )
 
     def own_project_dirs(self) -> set[str]:
@@ -119,12 +156,17 @@ class Dispatcher:
 
         started = parse_iso(task.started_at) or now
         minutes = max((now - started).total_seconds() / 60, 0.1)
-        try:
-            from .usage import record_task_outcome
-            record_task_outcome(self.cfg, task.weight, tokens, minutes)
-        except ImportError:
-            pass
-        return f"task {task.id}: {task.status} ({tokens} tokens, {minutes:.1f} min)"
+        if task.lane != "local":
+            # Local-lane runs burn zero Claude budget; feeding them into the
+            # burn-rate calibration would teach the pacer that heavy tasks are
+            # free and make it overshoot the real weekly budget.
+            try:
+                from .usage import record_task_outcome
+                record_task_outcome(self.cfg, task.weight, tokens, minutes)
+            except ImportError:
+                pass
+        lane = " local" if task.lane == "local" else ""
+        return f"task {task.id}: {task.status}{lane} ({tokens} tokens, {minutes:.1f} min)"
 
     def _kill_tree(self, pid: int) -> None:
         subprocess.run(
@@ -143,26 +185,33 @@ class Dispatcher:
                 del self._procs[task_id]
                 continue
             started = parse_iso(task.started_at)
-            if started and (now - started).total_seconds() > task.max_minutes * 60:
+            limit_minutes = task.max_minutes * (
+                self.cfg.local_minutes_multiplier if task.lane == "local" else 1.0
+            )
+            if started and (now - started).total_seconds() > limit_minutes * 60:
                 self._kill_tree(proc.popen.pid)
                 proc.popen.wait(timeout=15)
                 proc.out.close()
                 proc.err.close()
                 task.status = "killed"
-                task.error = f"exceeded max_minutes={task.max_minutes}"
+                task.error = f"exceeded max_minutes={limit_minutes:g}"
                 task.finished_at = now.isoformat()
                 del self._procs[task_id]
-                actions.append(f"task {task.id}: killed after {task.max_minutes} min limit")
+                actions.append(f"task {task.id}: killed after {limit_minutes:g} min limit")
         if actions:
             self.save()
         return actions
 
-    def launch(self, task: TaskSpec, now: datetime) -> str:
+    def launch(self, task: TaskSpec, now: datetime, lane: str = "cloud") -> str:
         exe = shutil.which(self.cfg.claude_cmd)
         if exe is None:
             raise DispatchError(f"claude executable not found: {self.cfg.claude_cmd}")
         cmd = [exe, "-p", "--output-format", "json"]
-        if task.model:
+        env = None
+        if lane == "local":
+            env = local_env(self.cfg)
+            cmd += ["--model", self.cfg.local_model]
+        elif task.model:
             cmd += ["--model", task.model]
         if task.resume_session:
             cmd += ["--resume", task.resume_session, "--fork-session"]
@@ -171,6 +220,8 @@ class Dispatcher:
         else:
             cmd += ["--permission-mode", self.cfg.permission_mode]
         cmd += self.cfg.extra_claude_args
+
+        prompt = self._task_prompt(task, lane)
 
         cwd = task.cwd
         os.makedirs(cwd, exist_ok=True)
@@ -181,39 +232,142 @@ class Dispatcher:
             flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         popen = subprocess.Popen(
             cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=out, stderr=err,
-            creationflags=flags, text=True, encoding="utf-8",
+            creationflags=flags, text=True, encoding="utf-8", env=env,
         )
         assert popen.stdin is not None
-        popen.stdin.write(task.prompt)
+        popen.stdin.write(prompt)
         popen.stdin.close()
 
         task.status = "running"
+        task.lane = lane
         task.started_at = now.isoformat()
         task.pid = popen.pid
         task.error = None
         self._procs[task.id] = _Proc(popen, out, err)
         self.save()
-        return f"task {task.id}: launched ({task.weight}, pid {popen.pid})"
+        suffix = f" -> {self.cfg.local_model}" if lane == "local" else ""
+        return f"task {task.id}: launched {lane}{suffix} ({task.weight}, pid {popen.pid})"
 
-    def apply(self, decision: Decision, now: datetime) -> list[str]:
-        actions = self.reap(now)
-        running = sum(1 for t in self._tasks if t.status == "running")
-        if running >= decision.target_concurrency:
-            return actions
-        candidates = sorted(
-            (t for t in self._tasks if t.status == "pending"
-             and (decision.allow_heavy or t.weight != "heavy")),
-            key=lambda t: (-t.priority, t.id),
-        )
+    def _task_prompt(self, task: TaskSpec, lane: str) -> str:
+        if lane == "local" and self.cfg.local_prompt_preamble:
+            return f"{self.cfg.local_prompt_preamble}\n\n{task.prompt}"
+        return task.prompt
+
+    def gpu_guard_proc(self) -> str | None:
+        """Name of a running GPU-exclusive process, or None.
+
+        The FreeToken engine pins ~31.5GB of the 32GB card, so it must never
+        be started while something like the UE editor needs the GPU.
+        """
+        names = [n.lower() for n in self.cfg.local_gpu_guard_procs]
+        if not names:
+            return None
+        try:
+            listing = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=15, check=False,
+            ).stdout.lower()
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        for name in names:
+            if f'"{name}"' in listing:
+                return name
+        return None
+
+    def local_engine_up(self) -> bool:
+        try:
+            with urllib.request.urlopen(
+                f"{self.cfg.local_base_url.rstrip('/')}/v1/models",
+                timeout=LOCAL_HEALTH_TIMEOUT,
+            ) as resp:
+                healthy = 200 <= resp.status < 300
+        except (urllib.error.URLError, OSError, ValueError):
+            healthy = False
+        self.local_engine_healthy = healthy
+        return healthy
+
+    def _start_local_engine(self, now: datetime) -> str:
+        # Ask the ft daemon (persistent supervisor) to bring the serve up; it
+        # returns immediately and loads the model in the background, so this is
+        # retried across ticks until the health probe passes.
+        import time
+
+        if not self.cfg.local_autostart:
+            return "local engine down (autostart disabled)"
+        guard = self.gpu_guard_proc()
+        if guard:
+            return f"local engine start deferred ({guard} owns the GPU)"
+        mono = time.monotonic()
+        if (self._local_start_ts is not None
+                and mono - self._local_start_ts < self.cfg.local_start_retry_seconds):
+            return "local engine still starting"
+        ft = self.cfg.local_ft_bin
+        if ft is None or not ft.exists():
+            return f"local engine down and ft binary missing: {ft}"
+        model = self.cfg.local_model_path or self.cfg.local_model
+        try:
+            port = self.cfg.local_base_url.rsplit(":", 1)[1].strip("/")
+            subprocess.Popen(
+                [str(ft), "daemon", "start", model, "--port", port,
+                 "--url", self.cfg.local_daemon_url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            self._local_start_ts = mono
+            return f"local engine starting ({model})"
+        except OSError as exc:
+            return f"local engine start failed ({exc})"
+
+    def _launch_batch(
+        self, candidates: list[TaskSpec], running: int, target: int,
+        now: datetime, actions: list[str], lane: str,
+    ) -> None:
         for task in candidates:
-            if running >= decision.target_concurrency:
+            if running >= target:
                 break
             try:
-                actions.append(self.launch(task, now))
+                actions.append(self.launch(task, now, lane=lane))
                 running += 1
             except (DispatchError, OSError) as exc:
                 task.status = "failed"
                 task.error = str(exc)[:200]
                 self.save()
                 actions.append(f"task {task.id}: launch failed ({exc})")
+
+    def apply(self, decision: Decision, now: datetime) -> list[str]:
+        actions = self.reap(now)
+        running_cloud = sum(
+            1 for t in self._tasks
+            if t.status == "running" and t.lane != "local"
+        )
+        running_local = sum(
+            1 for t in self._tasks
+            if t.status == "running" and t.lane == "local"
+        )
+        pending = [t for t in self._tasks if t.status == "pending"]
+
+        if running_cloud < decision.target_concurrency:
+            cloud_candidates = sorted(
+                (t for t in pending
+                 if decision.allow_heavy or t.weight != "heavy"),
+                key=lambda t: (-t.priority, t.id),
+            )
+            self._launch_batch(cloud_candidates, running_cloud,
+                               decision.target_concurrency, now, actions, "cloud")
+            pending = [t for t in self._tasks if t.status == "pending"]
+
+        local_target = getattr(decision, "local_concurrency", 0)
+        if local_target > 0 and running_local < local_target:
+            # Forked main-session tasks (full throttle) carry cloud-sized
+            # context and exist to spend cloud budget; they never run locally.
+            local_candidates = sorted(
+                (t for t in pending if not t.resume_session),
+                key=lambda t: (-t.priority, t.id),
+            )
+            if local_candidates:
+                if self.local_engine_up():
+                    self._launch_batch(local_candidates, running_local,
+                                       local_target, now, actions, "local")
+                else:
+                    actions.append(self._start_local_engine(now))
         return actions

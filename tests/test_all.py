@@ -345,6 +345,159 @@ def test_dispatcher_finalize():
     assert outcomes and outcomes[-1]["weight"] == "heavy", cal
 
 
+def _local_cfg() -> Config:
+    cfg = make_cfg()
+    cfg.local_enabled = True
+    cfg.local_model = "Qwen-test"
+    cfg.local_max_concurrency = 1
+    return cfg
+
+
+def test_decide_local_blocked_idle():
+    cfg = _local_cfg()
+    blocked = Decision("blocked", 0, False, "t")
+    assert scheduler.decide_local(blocked, idle(), cfg, NOW) == 1
+
+
+def test_decide_local_respects_activity():
+    cfg = _local_cfg()
+    blocked = Decision("blocked", 0, False, "t")
+    assert scheduler.decide_local(blocked, active(), cfg, NOW) == 0
+    cfg.local_when_active = True
+    assert scheduler.decide_local(blocked, active(), cfg, NOW) == 1
+
+
+def test_decide_local_only_when_blocked():
+    cfg = _local_cfg()
+    for mode in ("pace", "surge", "coast", "yield"):
+        assert scheduler.decide_local(Decision(mode, 1, True, "t"), idle(), cfg, NOW) == 0
+    cfg.local_enabled = False
+    assert scheduler.decide_local(Decision("blocked", 0, False, "t"), idle(), cfg, NOW) == 0
+
+
+def test_local_env():
+    cfg = _local_cfg()
+    base = {"ANTHROPIC_API_KEY": "sk-real", "PATH": "x"}
+    env = dispatch.local_env(cfg, base)
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["ANTHROPIC_BASE_URL"] == cfg.local_base_url
+    assert env["ANTHROPIC_AUTH_TOKEN"] == cfg.local_auth_token
+    for key in dispatch.LOCAL_MODEL_ENV_KEYS:
+        assert env[key] == "Qwen-test", key
+    assert env["API_TIMEOUT_MS"] == str(cfg.local_api_timeout_ms)
+    assert env["PATH"] == "x"
+    assert base["ANTHROPIC_API_KEY"] == "sk-real"
+
+
+def test_dispatcher_local_apply():
+    cfg = _local_cfg()
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "fork", "prompt": "p", "cwd": str(cfg.root), "weight": "heavy",
+         "priority": 9, "status": "pending", "resume_session": "sid-1"},
+        {"id": "pod", "prompt": "p", "cwd": str(cfg.root), "weight": "heavy",
+         "priority": 5, "status": "pending"},
+    ]}), encoding="utf-8")
+    d = dispatch.Dispatcher(cfg)
+    launched: list[tuple[str, str]] = []
+
+    def fake_launch(task, now, lane="cloud"):
+        task.status = "running"
+        task.lane = lane
+        launched.append((task.id, lane))
+        return f"task {task.id}: launched {lane}"
+
+    d.launch = fake_launch
+    d.local_engine_up = lambda: True
+    decision = Decision("blocked", 0, False, "t", local_concurrency=1)
+    d.apply(decision, utcnow())
+    # Forked main-session tasks never run locally; the pod task does.
+    assert launched == [("pod", "local")], launched
+
+
+def test_dispatcher_local_engine_down():
+    cfg = _local_cfg()
+    cfg.local_autostart = False
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "pod", "prompt": "p", "cwd": str(cfg.root), "weight": "heavy",
+         "status": "pending"},
+    ]}), encoding="utf-8")
+    d = dispatch.Dispatcher(cfg)
+    d.local_engine_up = lambda: False
+    decision = Decision("blocked", 0, False, "t", local_concurrency=1)
+    actions = d.apply(decision, utcnow())
+    assert d.get("pod").status == "pending"
+    assert any("local engine" in a for a in actions), actions
+
+
+def test_dispatcher_finalize_local_skips_calibration():
+    cfg = _local_cfg()
+    _seed_tasks(cfg)
+    d = dispatch.Dispatcher(cfg)
+    task = d.get("a")
+    task.status = "running"
+    task.lane = "local"
+    task.started_at = (utcnow() - timedelta(minutes=5)).isoformat()
+    (cfg.logs_dir / "a.out.json").write_text(json.dumps({
+        "is_error": False, "usage": {"input_tokens": 10, "output_tokens": 5}}),
+        encoding="utf-8")
+    out = open(cfg.logs_dir / "dummy1", "w")
+    err = open(cfg.logs_dir / "dummy2", "w")
+    fake = types.SimpleNamespace(returncode=0, pid=1)
+    line = d._finalize(task, dispatch._Proc(fake, out, err), utcnow())
+    assert task.status == "done" and "local" in line, (task, line)
+    cal = usage.load_calibration(cfg)
+    assert not cal.get("task_outcomes"), cal
+
+
+def test_reap_local_minutes_multiplier():
+    cfg = _local_cfg()
+    cfg.local_minutes_multiplier = 3.0
+    _seed_tasks(cfg)
+    d = dispatch.Dispatcher(cfg)
+    task = d.get("a")
+    task.status = "running"
+    task.lane = "local"
+    task.max_minutes = 90
+    task.started_at = (utcnow() - timedelta(minutes=120)).isoformat()
+    out = open(cfg.logs_dir / "dummy1", "w")
+    err = open(cfg.logs_dir / "dummy2", "w")
+    fake = types.SimpleNamespace(returncode=None, pid=1,
+                                 poll=lambda: None, wait=lambda timeout=None: 0)
+    d._procs["a"] = dispatch._Proc(fake, out, err)
+    d._kill_tree = lambda pid: None
+    assert d.reap(utcnow()) == []
+    assert task.status == "running"
+    task.lane = "cloud"
+    actions = d.reap(utcnow())
+    assert task.status == "killed", (task, actions)
+
+
+def test_local_prompt_preamble():
+    cfg = _local_cfg()
+    d = dispatch.Dispatcher(cfg)
+    task = TaskSpec(id="t", prompt="fix the bug", cwd=str(cfg.root))
+    assert d._task_prompt(task, "cloud") == "fix the bug"
+    assert d._task_prompt(task, "local") == "fix the bug"
+    cfg.local_prompt_preamble = "no GPU work"
+    assert d._task_prompt(task, "local") == "no GPU work\n\nfix the bug"
+    assert d._task_prompt(task, "cloud") == "fix the bug"
+
+
+def test_gpu_guard():
+    cfg = _local_cfg()
+    d = dispatch.Dispatcher(cfg)
+    cfg.local_gpu_guard_procs = []
+    assert d.gpu_guard_proc() is None
+    cfg.local_gpu_guard_procs = ["definitely-not-running-xyz.exe"]
+    assert d.gpu_guard_proc() is None
+    # The test itself runs under python.exe, so tasklist must report it.
+    cfg.local_gpu_guard_procs = ["python.exe"]
+    assert d.gpu_guard_proc() == "python.exe"
+    cfg.local_autostart = True
+    msg = d._start_local_engine(utcnow())
+    assert "deferred" in msg and "python.exe" in msg, msg
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

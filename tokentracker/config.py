@@ -42,6 +42,23 @@ class Config:
     permission_mode: str = "acceptEdits"
     extra_claude_args: list[str] = field(default_factory=list)
     main_session_ids: list[str] = field(default_factory=list)
+    local_enabled: bool = False
+    local_base_url: str = "http://127.0.0.1:1919"
+    local_daemon_url: str = "http://127.0.0.1:1900"
+    local_auth_token: str = "freetoken"
+    local_model: str = ""
+    local_model_path: str = ""
+    local_ft_bin: Path | None = None
+    local_max_concurrency: int = 1
+    local_when_active: bool = False
+    local_autostart: bool = True
+    local_start_retry_seconds: int = 120
+    local_minutes_multiplier: float = 3.0
+    local_max_context_tokens: int = 262144
+    local_max_output_tokens: int = 32768
+    local_api_timeout_ms: int = 1200000
+    local_prompt_preamble: str = ""
+    local_gpu_guard_procs: list[str] = field(default_factory=lambda: ["UnrealEditor.exe"])
     sundial_shell_path: Path | None = None
     overlay_offset_x: int = 0
     overlay_offset_y: int = 430
@@ -67,7 +84,7 @@ class Config:
 
 _PATH_KEYS = (
     "credentials_path", "projects_dir", "sessions_dir", "state_dir", "logs_dir",
-    "tasks_file", "sundial_shell_path",
+    "tasks_file", "sundial_shell_path", "local_ft_bin",
 )
 
 

@@ -33,6 +33,9 @@ FONT_SMALL = ("Segoe UI", 8)
 FABLE_HINTS = ("fable", "mythos")
 WEEK_HOURS_F = 168.0
 FIVE_HOURS_F = 5.0
+# All geometry below is authored in 96-dpi design pixels and scaled at draw
+# time by the same DPI factor tk applies to point-sized fonts; keeping the two
+# in lockstep is what stops text from outgrowing its boxes on scaled displays.
 CARD_MARGIN = 3
 CARD_RADIUS = 22
 PAD = 18
@@ -64,6 +67,8 @@ SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
+BASELINE_DPI = 96.0
+POINTS_PER_INCH = 72.0
 
 
 def _enable_dpi_awareness() -> None:
@@ -352,7 +357,7 @@ class Overlay:
         self.delta = (cfg.overlay_offset_x, cfg.overlay_offset_y)
         self._drag_origin: tuple[int, int, int, int] | None = None
         self._gear_angle = 0.0
-        self._gear_center: tuple[int, int] | None = None
+        self._gear_center: tuple[float, float] | None = None
         self._order: list[str] = []
         self._scroll_idx = 0
         self._max_scroll = 0
@@ -361,12 +366,24 @@ class Overlay:
 
         _enable_dpi_awareness()
         self.root = tk.Tk()
+        dpi = 0
         try:
             dpi = ctypes.windll.user32.GetDpiForWindow(self.root.winfo_id())
             if dpi:
-                self.root.tk.call("tk", "scaling", dpi / 72)
+                self.root.tk.call("tk", "scaling", dpi / POINTS_PER_INCH)
         except (AttributeError, OSError, tk.TclError):
             pass
+        if dpi:
+            self.s = dpi / BASELINE_DPI
+        else:
+            # No per-window DPI available: derive the factor from whatever tk
+            # is actually using for fonts, so boxes still track text size.
+            try:
+                self.s = (float(self.root.tk.call("tk", "scaling"))
+                          * POINTS_PER_INCH / BASELINE_DPI)
+            except (tk.TclError, ValueError):
+                self.s = 1.0
+        self.width = self._px(cfg.overlay_width)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self._transparent = True
@@ -379,7 +396,7 @@ class Overlay:
 
         bg = TRANSPARENT if self._transparent else CARD_BG
         self.canvas = tk.Canvas(
-            self.root, width=cfg.overlay_width, height=220,
+            self.root, width=self.width, height=self._px(220),
             bg=bg, highlightthickness=0,
         )
         self.canvas.pack()
@@ -396,6 +413,12 @@ class Overlay:
         self.canvas.tag_bind("throttle_btn", "<Button-1>", self._toggle_throttle)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
 
+    def _px(self, value: float) -> int:
+        return round(value * self.s)
+
+    def _pxf(self, value: float) -> float:
+        return value * self.s
+
     def _sundial_anchor(self) -> tuple[int, int]:
         path = self.cfg.sundial_shell_path
         if path is None:
@@ -410,7 +433,7 @@ class Overlay:
         if self._drag_origin is not None:
             return
         ax, ay = self._sundial_anchor()
-        width = self.cfg.overlay_width
+        width = self.width
         height = self.root.winfo_reqheight()
         vx, vy, vw, vh = _virtual_screen()
         x = min(max(ax + self.delta[0], vx), max(vx, vx + vw - width))
@@ -449,18 +472,19 @@ class Overlay:
             return None
         return state if isinstance(state, dict) else None
 
-    def _round_card(self, width: int, height: int) -> None:
-        x0, y0 = CARD_MARGIN, CARD_MARGIN
-        x1, y1 = width - CARD_MARGIN, height - CARD_MARGIN
-        r = CARD_RADIUS
+    def _round_rect(self, x0: float, y0: float, x1: float, y1: float,
+                    r: float, **kwargs) -> None:
         points = [
             x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
             x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
             x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
         ]
-        self.canvas.create_polygon(
-            points, smooth=True, fill=CARD_BG, outline=BORDER, width=1,
-        )
+        self.canvas.create_polygon(points, smooth=True, **kwargs)
+
+    def _round_card(self, width: int, height: int) -> None:
+        m = self._pxf(CARD_MARGIN)
+        self._round_rect(m, m, width - m, height - m, self._pxf(CARD_RADIUS),
+                         fill=CARD_BG, outline=BORDER, width=1)
 
     def _fit(self, text: str, font: tkfont.Font, max_px: float) -> str:
         if font.measure(text) <= max_px:
@@ -487,16 +511,10 @@ class Overlay:
 
     def _draw_button(self, x0: float, y0: float, x1: float, y1: float,
                      active: bool) -> None:
-        r = 14
-        points = [
-            x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
-            x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
-            x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
-        ]
-        self.canvas.create_polygon(points, smooth=True,
-                                   fill=BTN_ACTIVE_BG if active else SUB_BG,
-                                   outline=RED if active else AMBER, width=1,
-                                   tags="throttle_btn")
+        self._round_rect(x0, y0, x1, y1, self._pxf(14),
+                         fill=BTN_ACTIVE_BG if active else SUB_BG,
+                         outline=RED if active else AMBER, width=1,
+                         tags="throttle_btn")
         label = "THROTTLE ON - tap to stop" if active else "FULL THROTTLE"
         self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label,
                                 font=FONT_BOLD, fill=FG if active else AMBER,
@@ -504,24 +522,21 @@ class Overlay:
 
     def _sub_card(self, x0: float, y0: float, x1: float, y1: float,
                   outline: str = "") -> None:
-        r = 10
-        points = [
-            x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
-            x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
-            x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
-        ]
-        self.canvas.create_polygon(points, smooth=True, fill=SUB_BG,
-                                   outline=outline, width=1 if outline else 0)
+        self._round_rect(x0, y0, x1, y1, self._pxf(10), fill=SUB_BG,
+                         outline=outline, width=1 if outline else 0)
 
     def _draw_gear_face(self, cx: float, cy: float) -> None:
-        self.canvas.create_oval(cx - 12, cy - 12, cx + 12, cy + 12,
+        f = self._pxf
+        self.canvas.create_oval(cx - f(12), cy - f(12), cx + f(12), cy + f(12),
                                 fill=GEAR_BODY, outline="", tags="gear_face")
-        for dx in (-4.5, 4.5):
-            self.canvas.create_oval(cx + dx - 1.8, cy - 4.5, cx + dx + 1.8, cy - 1.0,
+        for dx in (-f(4.5), f(4.5)):
+            self.canvas.create_oval(cx + dx - f(1.8), cy - f(4.5),
+                                    cx + dx + f(1.8), cy - f(1.0),
                                     fill=CARD_BG, outline="", tags="gear_face")
-        self.canvas.create_arc(cx - 5.5, cy - 2.0, cx + 5.5, cy + 7.0,
+        self.canvas.create_arc(cx - f(5.5), cy - f(2.0), cx + f(5.5), cy + f(7.0),
                                start=200, extent=140, style="arc",
-                               outline=CARD_BG, width=2, tags="gear_face")
+                               outline=CARD_BG, width=max(2, self._px(2)),
+                               tags="gear_face")
 
     def _draw_gear_teeth(self) -> None:
         try:
@@ -529,12 +544,14 @@ class Overlay:
             if self._gear_center is None:
                 return
             cx, cy = self._gear_center
+            outer = self._pxf(GEAR_OUTER)
+            valley = self._pxf(GEAR_VALLEY)
             points: list[float] = []
             for i in range(GEAR_TEETH):
                 base = math.radians(self._gear_angle + i * 360.0 / GEAR_TEETH)
                 for delta_deg, radius in (
-                    (-14.0, GEAR_VALLEY), (-8.0, GEAR_OUTER),
-                    (8.0, GEAR_OUTER), (14.0, GEAR_VALLEY),
+                    (-14.0, valley), (-8.0, outer),
+                    (8.0, outer), (14.0, valley),
                 ):
                     a = base + math.radians(delta_deg)
                     points.append(cx + radius * math.sin(a))
@@ -553,22 +570,26 @@ class Overlay:
         except tk.TclError:
             return
 
-    def _gauge(self, cx: int, frac: float, color: str, label: str) -> None:
+    def _gauge(self, cx: float, frac: float, color: str, label: str) -> None:
         frac = min(max(frac, 0.0), 1.0)
-        r = GAUGE_RADIUS
-        bbox = (cx - r, GAUGE_CY - r, cx + r, GAUGE_CY + r)
+        r = self._pxf(GAUGE_RADIUS)
+        cy = self._pxf(GAUGE_CY)
+        stroke = self._px(GAUGE_STROKE)
+        bbox = (cx - r, cy - r, cx + r, cy + r)
         self.canvas.create_arc(bbox, start=90, extent=-359.9, style="arc",
-                               outline=TRACK, width=GAUGE_STROKE)
+                               outline=TRACK, width=stroke)
         if frac > 0:
             self.canvas.create_arc(bbox, start=90, extent=-max(frac * 359.9, 3.0),
-                                   style="arc", outline=color, width=GAUGE_STROKE)
-        self.canvas.create_text(cx, GAUGE_CY - 7, text=f"{frac:.0%}",
+                                   style="arc", outline=color, width=stroke)
+        self.canvas.create_text(cx, cy - self._pxf(9), text=f"{frac:.0%}",
                                 font=FONT_BIG, fill=FG)
-        self.canvas.create_text(cx, GAUGE_CY + 11, text=label,
+        self.canvas.create_text(cx, cy + self._pxf(13), text=label,
                                 font=FONT_SMALL, fill=DIM)
 
     def _refresh(self) -> None:
-        width = self.cfg.overlay_width
+        P = self._px
+        width = self.width
+        pad = P(PAD)
         if self._after_id is not None:
             self.root.after_cancel(self._after_id)
             self._after_id = None
@@ -582,6 +603,7 @@ class Overlay:
         info_line = None
         warn = None
         mode = None
+        mode_label = None
         updated_line = None
         five_frac = weekly_frac = fable_frac = 0.0
 
@@ -609,6 +631,10 @@ class Overlay:
                 info_line = " · ".join(parts)
 
             mode = str(state.get("decision", {}).get("mode", "?"))
+            mode_label = mode.upper()
+            queue = state.get("queue", {})
+            if queue.get("running_local"):
+                mode_label += " · LOCAL"
 
             dist = state.get("distribution", {})
             total = float(dist.get("total_tokens", 0) or 0)
@@ -622,10 +648,11 @@ class Overlay:
             if not rows:
                 rows.append((TRACK, "no burn in window", ""))
 
-            queue = state.get("queue", {})
             footer_left = f"{dist.get('window_minutes', '?')}m · {_fmt_tokens(total)}"
             footer_right = (f"{queue.get('running', 0)}R "
                             f"{queue.get('pending_heavy', 0)}H/{queue.get('pending_light', 0)}L")
+            if queue.get("running_local"):
+                footer_right += f" · {queue['running_local']} on Qwen"
 
             at = parse_iso(state.get("at"))
             stale_after = max(STALE_FACTOR * self.cfg.poll_seconds, STALE_MIN_SECONDS)
@@ -657,116 +684,129 @@ class Overlay:
                  + [("other", s) for s in visible])
         n_total = len(sessions)
 
-        gauge_bottom = GAUGE_CY + GAUGE_RADIUS
-        sess_header_y = gauge_bottom + (54 if info_line else 34)
-        cards_y = sess_header_y + 16
-        cards_h = (len(shown) * (SESSION_CARD_H + SESSION_CARD_GAP)) if shown else 18
-        dist_header_y = cards_y + cards_h + 16
-        rows_y = dist_header_y + 26
-        footer_y = rows_y + len(rows) * ROW_H + 12
-        btn_y = footer_y + 22
-        height = btn_y + BTN_H + 30
+        card_h = P(SESSION_CARD_H)
+        card_gap = P(SESSION_CARD_GAP)
+        row_h = P(ROW_H)
+        gauge_bottom = P(GAUGE_CY) + P(GAUGE_RADIUS)
+        sess_header_y = gauge_bottom + (P(54) if info_line else P(34))
+        cards_y = sess_header_y + P(16)
+        cards_h = (len(shown) * (card_h + card_gap)) if shown else P(18)
+        dist_header_y = cards_y + cards_h + P(16)
+        rows_y = dist_header_y + P(26)
+        footer_y = rows_y + len(rows) * row_h + P(12)
+        btn_y = footer_y + P(22)
+        height = btn_y + P(BTN_H) + P(30)
 
         self.canvas.config(height=height)
         self._round_card(width, height)
 
         center_cx = width // 2
-        self._gauge(PAD + 48, five_frac, AMBER, "5 hours")
-        self._gauge(width - PAD - 48, fable_frac, PINK, "Fable")
+        self._gauge(pad + P(48), five_frac, AMBER, "5 hours")
+        self._gauge(width - pad - P(48), fable_frac, PINK, "Fable")
 
-        r = GAUGE_RADIUS
-        bbox = (center_cx - r, GAUGE_CY - r, center_cx + r, GAUGE_CY + r)
+        r = self._pxf(GAUGE_RADIUS)
+        cy = self._pxf(GAUGE_CY)
+        bbox = (center_cx - r, cy - r, center_cx + r, cy + r)
         self.canvas.create_arc(bbox, start=90, extent=-359.9, style="arc",
-                               outline=TRACK, width=GAUGE_STROKE)
+                               outline=TRACK, width=P(GAUGE_STROKE))
         wf = min(max(weekly_frac, 0.0), 1.0)
         if wf > 0:
             self.canvas.create_arc(bbox, start=90, extent=-max(wf * 359.9, 3.0),
-                                   style="arc", outline=SILVER, width=GAUGE_STROKE)
-        self._gear_center = (center_cx, GAUGE_CY)
-        self._draw_gear_face(center_cx, GAUGE_CY)
+                                   style="arc", outline=SILVER, width=P(GAUGE_STROKE))
+        self._gear_center = (center_cx, cy)
+        self._draw_gear_face(center_cx, cy)
         self._draw_gear_teeth()
-        self.canvas.create_text(center_cx, gauge_bottom + 14,
+        self.canvas.create_text(center_cx, gauge_bottom + P(14),
                                 text=f"weekly {wf:.0%}", font=FONT_SMALL, fill=SILVER)
 
         if info_line:
-            self.canvas.create_text(width / 2, gauge_bottom + 34,
+            self.canvas.create_text(width / 2, gauge_bottom + P(34),
                                     text=info_line, font=FONT_SMALL, fill=DIM)
 
-        self.canvas.create_text(PAD, sess_header_y, text="Live sessions",
+        self.canvas.create_text(pad, sess_header_y, text="Live sessions",
                                 font=FONT_BOLD, fill=FG, anchor="w")
-        self.canvas.create_text(width - PAD, sess_header_y,
+        self.canvas.create_text(width - pad, sess_header_y,
                                 text=f"{n_total} active", font=FONT_SMALL,
                                 fill=DIM, anchor="e")
         if shown:
             for i, (kind, sess) in enumerate(shown):
-                y0 = cards_y + i * (SESSION_CARD_H + SESSION_CARD_GAP)
-                self._sub_card(PAD - 6, y0, width - PAD + 6, y0 + SESSION_CARD_H,
+                y0 = cards_y + i * (card_h + card_gap)
+                self._sub_card(pad - P(6), y0, width - pad + P(6), y0 + card_h,
                                outline=GREEN if kind == "main" else "")
-                name_x = PAD + 6
+                name_x = pad + P(6)
+                name_y = y0 + P(13)
+                detail_y = y0 + P(31)
                 if kind == "main":
-                    self.canvas.create_oval(PAD + 5, y0 + 9, PAD + 13, y0 + 17,
+                    self.canvas.create_oval(pad + P(5), y0 + P(9),
+                                            pad + P(13), y0 + P(17),
                                             fill=GREEN, outline="")
-                    name_x = PAD + 19
+                    name_x = pad + P(19)
                 name = self._fit(sess["name"], self._font_bold,
-                                 (width - PAD) - name_x - 6)
-                self.canvas.create_text(name_x, y0 + 13, text=name,
+                                 (width - pad) - name_x - P(6))
+                self.canvas.create_text(name_x, name_y, text=name,
                                         font=FONT_BOLD, fill=FG, anchor="w")
                 age_px = self._font_small.measure(sess["age"])
                 detail = self._fit(sess["detail"], self._font_small,
-                                   (width - PAD - 6) - (PAD + 6) - age_px - 10)
-                self.canvas.create_text(PAD + 6, y0 + 31, text=detail,
+                                   (width - pad - P(6)) - (pad + P(6))
+                                   - age_px - P(10))
+                self.canvas.create_text(pad + P(6), detail_y, text=detail,
                                         font=FONT_SMALL, fill=DIM, anchor="w")
-                self.canvas.create_text(width - PAD - 6, y0 + 31, text=sess["age"],
+                self.canvas.create_text(width - pad - P(6), detail_y,
+                                        text=sess["age"],
                                         font=FONT_SMALL, fill=DIM, anchor="e")
             if self._max_scroll > 0:
                 first_other = 1 if main_sess else 0
-                track_y0 = cards_y + first_other * (SESSION_CARD_H + SESSION_CARD_GAP)
-                track_y1 = cards_y + cards_h - SESSION_CARD_GAP
-                track_x = width - PAD + 9
+                track_y0 = cards_y + first_other * (card_h + card_gap)
+                track_y1 = cards_y + cards_h - card_gap
+                track_x = width - pad + P(9)
+                bar_w = max(2, P(SCROLLBAR_W))
                 self.canvas.create_rectangle(
-                    track_x, track_y0, track_x + SCROLLBAR_W, track_y1,
+                    track_x, track_y0, track_x + bar_w, track_y1,
                     fill=TRACK, outline="")
                 track_h = track_y1 - track_y0
-                thumb_h = max(14.0, track_h * OTHERS_VISIBLE / len(others))
+                thumb_h = max(self._pxf(14), track_h * OTHERS_VISIBLE / len(others))
                 thumb_y = track_y0 + (track_h - thumb_h) * (
                     self._scroll_idx / self._max_scroll)
                 self.canvas.create_rectangle(
-                    track_x, thumb_y, track_x + SCROLLBAR_W, thumb_y + thumb_h,
+                    track_x, thumb_y, track_x + bar_w, thumb_y + thumb_h,
                     fill=DIM, outline="")
         else:
-            self.canvas.create_text(PAD, cards_y + 4, text="no active sessions",
+            self.canvas.create_text(pad, cards_y + P(4), text="no active sessions",
                                     font=FONT_SMALL, fill=DIM, anchor="w")
 
-        self.canvas.create_text(PAD, dist_header_y, text="Token distribution",
+        self.canvas.create_text(pad, dist_header_y, text="Token distribution",
                                 font=FONT_BOLD, fill=FG, anchor="w")
-        if mode:
-            self.canvas.create_text(width - PAD, dist_header_y, text=mode.upper(),
+        if mode_label:
+            avail = (width - 2 * pad
+                     - self._font_bold.measure("Token distribution") - P(10))
+            mode_label = self._fit(mode_label, self._font_bold, avail)
+            self.canvas.create_text(width - pad, dist_header_y, text=mode_label,
                                     font=FONT_BOLD, anchor="e",
                                     fill=MODE_COLORS.get(mode, FG))
 
         for i, (dot, label, value) in enumerate(rows):
-            y = rows_y + i * ROW_H + ROW_H / 2
-            self.canvas.create_oval(PAD + 1, y - 4, PAD + 9, y + 4,
+            y = rows_y + i * row_h + row_h / 2
+            self.canvas.create_oval(pad + P(1), y - P(4), pad + P(9), y + P(4),
                                     fill=dot, outline="")
             label = self._fit(label, self._font,
-                              (width - PAD) - (PAD + 18)
-                              - self._font.measure(value) - 10)
-            self.canvas.create_text(PAD + 18, y, text=label, font=FONT,
+                              (width - pad) - (pad + P(18))
+                              - self._font.measure(value) - P(10))
+            self.canvas.create_text(pad + P(18), y, text=label, font=FONT,
                                     fill=FG, anchor="w")
-            self.canvas.create_text(width - PAD, y, text=value, font=FONT,
+            self.canvas.create_text(width - pad, y, text=value, font=FONT,
                                     fill=DIM, anchor="e")
 
         if footer_left or footer_right:
-            self.canvas.create_text(PAD, footer_y + 6, text=footer_left,
+            self.canvas.create_text(pad, footer_y + P(6), text=footer_left,
                                     font=FONT_SMALL, fill=DIM, anchor="w")
-            self.canvas.create_text(width - PAD, footer_y + 6, text=footer_right,
+            self.canvas.create_text(width - pad, footer_y + P(6), text=footer_right,
                                     font=FONT_SMALL, fill=DIM, anchor="e")
-        self._draw_button(PAD, btn_y, width - PAD, btn_y + BTN_H, self._throttle)
+        self._draw_button(pad, btn_y, width - pad, btn_y + P(BTN_H), self._throttle)
 
         bottom = warn or updated_line
         if bottom:
-            bottom = self._fit(bottom, self._font_small, width - 2 * PAD)
-            self.canvas.create_text(width / 2, height - 14, text=bottom,
+            bottom = self._fit(bottom, self._font_small, width - 2 * pad)
+            self.canvas.create_text(width / 2, height - P(14), text=bottom,
                                     font=FONT_SMALL, fill=AMBER if warn else DIM)
 
         self.root.update_idletasks()

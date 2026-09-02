@@ -131,3 +131,17 @@ def decide(
         "pace", n, True,
         f"Behind pace: need {own_required:.2f}%/h from background work; running {n} task(s).",
     )
+
+
+def decide_local(
+    decision: Decision, activity: ActivityState, cfg: Config, now: datetime,
+) -> int:
+    # The local FreeToken lane burns zero Claude budget, so it only makes sense
+    # when Claude itself is unavailable ("blocked": weekly exhausted or the
+    # five-hour guard tripped). It still yields the GPU to a present human
+    # unless local_when_active says otherwise.
+    if not cfg.local_enabled or decision.mode != "blocked":
+        return 0
+    if activity.user_active and not cfg.local_when_active:
+        return 0
+    return max(0, cfg.local_max_concurrency)

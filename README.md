@@ -22,6 +22,7 @@ Claude Code's weekly token budget expires whether you use it or not. TokenDistri
 - 📌 **Main session aware** — one session is designated the project's own; its burn never counts against you
 - 🎛️ **Desktop overlay** — Sundial-style card docked to the Sundial widget: ring gauges, a rotating gear mascot, live session cards (real titles, pinned main, scrollable), token distribution, and a FULL THROTTLE button
 - 🧾 **Attribution** — parses local session transcripts to split burn between main / tracker / interactive, and calibrates task burn rates online
+- 🖥️ **Local fallback lane** — when Claude is `blocked` (weekly exhausted or 5-hour guard), queued work is dispatched to a local FreeToken engine (Qwen on the 5090) instead of stalling: zero cloud tokens, auto-starts the engine via the ft daemon, GPU-guarded so it never fights the UE editor for VRAM
 
 ## 🚀 Quickstart
 
@@ -43,13 +44,22 @@ Requires Python 3.12+ (stdlib only) and a logged-in Claude Code install — the 
 
 | Mode | When | Effect |
 |---|---|---|
-| `blocked` | weekly exhausted, or 5h window ≥ guard (80% active / 95% idle) | launch nothing |
+| `blocked` | weekly exhausted, or 5h window ≥ guard (80% active / 95% idle) | launch nothing on the cloud; dispatch to the **local lane** if enabled |
 | `surge` | < 12 h to weekly reset with budget left | max concurrency, even during activity |
 | `yield` | a foreign (interactive) session is active | launch nothing |
 | `coast` | ahead of the pacing curve | launch nothing |
 | `pace` | behind the curve | launch enough heavy/light tasks to land at ~100% by reset |
 
 Throttling never kills running tasks — it only stops launching new ones. Failed usage fetches fall back to the last snapshot (≤ 30 min) with exponential backoff honoring `Retry-After`.
+
+## 🖥️ Local fallback lane (FreeToken × Qwen)
+
+When the decision is `blocked`, pending tasks are re-dispatched as headless `claude -p` sessions pointed at the local FreeToken engine (`ANTHROPIC_BASE_URL` swap, all model aliases pinned to `local_model`, 20-min API timeout — the same recipe as `claude-local.cmd`). Rules:
+
+- Only when **blocked**, and only while the user is idle (`local_when_active` overrides)
+- If the engine on `local_base_url` is down, it is auto-started through `ft daemon start` — but **never** while a process in `local_gpu_guard_procs` (UE editor, games) is running: the engine pins ~31.5GB of the 32GB card
+- `local_prompt_preamble` is prepended to every local dispatch — the technical director's standing instructions telling the Qwen agent what work is safe (CPU-only; no editor/PIE/visual verification, defer those to the cloud tier via DEFERRED.md)
+- Tasks forked from the main session (full throttle) never run locally; local runs never feed the cloud burn-rate calibration; timeouts get `local_minutes_multiplier` headroom for slower decode
 
 ## 🔥 Full throttle
 
@@ -66,6 +76,15 @@ Throttling never kills running tasks — it only stops launching new ones. Faile
 | `five_hour_guard_active` / `_idle` | `0.80` / `0.95` | 5-hour-window ceilings for background launches |
 | `max_concurrency` / `surge_concurrency` | `3` / `4` | parallel headless sessions |
 | `permission_mode` | `acceptEdits` | `bypass` maps to `--dangerously-skip-permissions` — opt-in only |
+| `local_enabled` | `false` | turn on the local FreeToken lane |
+| `local_base_url` / `local_daemon_url` | `:1919` / `:1900` | engine + supervisor endpoints |
+| `local_model` / `local_model_path` | — | served model name / path for `ft daemon start` |
+| `local_ft_bin` | — | path to `ft.exe` (engine venv) |
+| `local_max_concurrency` | `1` | one 5090 = one session |
+| `local_when_active` | `false` | let local tasks run even while the user is at the keyboard |
+| `local_gpu_guard_procs` | `["UnrealEditor.exe"]` | never auto-start the engine while these run |
+| `local_prompt_preamble` | `""` | standing instructions prepended to every local dispatch |
+| `local_minutes_multiplier` | `3.0` | max_minutes headroom for slower local decode |
 
 ## 🩻 Under the hood
 

@@ -113,7 +113,7 @@ def _tick(
     cfg: Config, dispatcher: Dispatcher, history, do_fetch: bool = True,
 ) -> tuple[Decision, list[str], Exception | None, "object | None", bool]:
     from .activity import detect_activity
-    from .scheduler import decide, normalize, pacing
+    from .scheduler import decide, decide_local, normalize, pacing
     from .usage import (
         UsageFetchError,
         compute_burn_rates,
@@ -139,6 +139,10 @@ def _tick(
     if snap is None:
         reason = f"usage fetch failed: {fetch_exc}" if fetch_exc else "no usage snapshot available"
         decision = Decision("blocked", 0, False, reason)
+        # Usage unknown means Claude may or may not have budget; the local lane
+        # costs no budget either way, so it may still run.
+        activity = detect_activity(cfg, own_dirs, now)
+        decision.local_concurrency = decide_local(decision, activity, cfg, now)
         actions = dispatcher.apply(decision, now)
         _write_state(cfg, {"at": now.isoformat(), "decision": decision.to_dict(),
                            "error": str(fetch_exc) if fetch_exc else reason})
@@ -168,6 +172,7 @@ def _tick(
         if stale_task is not None and stale_task.status == "pending":
             dispatcher.set_status(THROTTLE_TASK_ID, "killed")
 
+    decision.local_concurrency = decide_local(decision, activity, cfg, now)
     actions = dispatcher.apply(decision, now)
 
     _write_state(cfg, {
@@ -182,7 +187,12 @@ def _tick(
             "sessions": activity.active_foreign_sessions,
         },
         "decision": decision.to_dict(),
-        "queue": queue.__dict__,
+        "queue": dispatcher.queue_stats().__dict__,
+        "local": {
+            "enabled": cfg.local_enabled,
+            "model": cfg.local_model,
+            "engine_healthy": dispatcher.local_engine_healthy,
+        },
         "distribution": _distribution(cfg, own_dirs, now),
         "usage_stale": bool(fetch_exc) or not do_fetch,
         "fetch_error": str(fetch_exc) if fetch_exc else None,
@@ -215,7 +225,10 @@ def cmd_run(cfg: Config, once: bool) -> int:
             print(f"{stamp}   usage fetch backing off {backoff:.0f}s ({fetch_exc})")
         elif do_fetch:
             backoff = 0.0
-        print(f"{stamp} mode={decision.mode} conc={decision.target_concurrency} | {decision.reason}")
+        local_note = (f" local={decision.local_concurrency}"
+                      if decision.local_concurrency else "")
+        print(f"{stamp} mode={decision.mode} conc={decision.target_concurrency}"
+              f"{local_note} | {decision.reason}")
         for line in actions:
             print(f"{stamp}   {line}")
         if once:
@@ -280,12 +293,17 @@ def cmd_status(cfg: Config) -> int:
 
     dispatcher = Dispatcher(cfg)
     stats = dispatcher.queue_stats()
-    print(f"queue: {stats.running} running, {stats.pending_heavy} heavy pending, "
+    print(f"queue: {stats.running} running ({stats.running_local} local), "
+          f"{stats.pending_heavy} heavy pending, "
           f"{stats.pending_light} light pending")
+    if cfg.local_enabled:
+        engine = "up" if dispatcher.local_engine_up() else "down"
+        print(f"local lane: {cfg.local_model} via {cfg.local_base_url} - engine {engine}")
     for t in dispatcher.tasks():
         extra = f" tokens={t.session_tokens}" if t.session_tokens else ""
         extra += f" err={t.error}" if t.error else ""
-        print(f"  {t.id:<24} {t.weight:<6} {t.status:<8} prio={t.priority}{extra}")
+        lane = f" [{t.lane}]" if t.lane else ""
+        print(f"  {t.id:<24} {t.weight:<6} {t.status:<8} prio={t.priority}{lane}{extra}")
     return 0
 
 

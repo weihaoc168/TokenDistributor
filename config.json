@@ -13,5 +13,11 @@
   "yield_concurrency": 0,
   "claude_cmd": "claude",
   "permission_mode": "acceptEdits",
-  "main_session_ids": ["690b1fea-bf11-4d69-8e8f-4500794ec87d"]
+  "main_session_ids": ["cfec86cd-a83e-4f7a-92ab-864296e08d03"],
+  "local_enabled": true,
+  "local_model": "Qwen3.8-27B-NVFP4",
+  "local_model_path": "D:\\FreeToken Desktop\\Qwen3.8-27B-NVFP4",
+  "local_ft_bin": "C:\\Users\\chenw\\AppData\\Local\\FreeToken\\venv\\Scripts\\ft.exe",
+  "local_gpu_guard_procs": ["UnrealEditor.exe", "UnrealEditor-Cmd.exe", "RainbowSix.exe"],
+  "local_prompt_preamble": "You are the local Qwen backup agent (FreeToken engine on a single RTX 5090), dispatched because the Claude cloud budget is exhausted. Operating constraints from the technical director: the model engine itself occupies ~31.5GB of the GPU's 32GB, so you must NOT launch the Unreal editor, PIE, or any GPU- or display-heavy program - there is no VRAM left and it will fail or destabilize the machine. Stick to CPU-only work: reading and editing code, command-line builds (Build.bat), triaging saved logs and build reports, running tests, and writing docs. If your task genuinely requires the editor, PIE, rendering, or visual verification, do the CPU-side preparation only and append a note to DEFERRED.md in the working directory describing exactly what the cloud tier must verify later. Keep changes small, correct, and reviewable; do not commit or push unless the task explicitly says to."
 }

@@ -3,7 +3,7 @@
     {
       "id": "example-heavy-001",
       "prompt": "Read the README.md in this directory and produce a detailed improvement plan in PLAN.md covering structure, missing sections, and clarity. Then apply the improvements to README.md.",
-      "cwd": "C:/Users/weiha/TokenDistributor/sandbox",
+      "cwd": "C:/Users/chenw/TokenDistributor/sandbox",
       "weight": "heavy",
       "model": null,
       "priority": 10,
@@ -13,7 +13,7 @@
     {
       "id": "example-light-001",
       "prompt": "List the files in this directory and write a one-line description of each into FILES.md.",
-      "cwd": "C:/Users/weiha/TokenDistributor/sandbox",
+      "cwd": "C:/Users/chenw/TokenDistributor/sandbox",
       "weight": "light",
       "model": "haiku",
       "priority": 0,

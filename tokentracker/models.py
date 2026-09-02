@@ -102,6 +102,7 @@ class TaskSpec:
     priority: int = 0
     max_minutes: int = 90
     status: str = "pending"
+    lane: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     pid: int | None = None
@@ -123,6 +124,7 @@ class QueueStats:
     pending_heavy: int
     pending_light: int
     running: int
+    running_local: int = 0
 
 
 @dataclass
@@ -131,6 +133,7 @@ class Decision:
     target_concurrency: int
     allow_heavy: bool
     reason: str
+    local_concurrency: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
