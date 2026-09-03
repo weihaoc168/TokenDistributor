@@ -946,7 +946,7 @@ def test_repo_config_arms_the_fork_on_the_executive_model():
     assert cfg.main_session_ids[0].startswith("329cb798"), cfg.main_session_ids
     prompt = cfg.throttle_prompt
     assert 0 < len(prompt) < 2500, len(prompt)
-    assert "acting technical director" in prompt and "claude-opus-5" in prompt
+    assert "acting technical director" in prompt and "{graph}" in prompt  # models come from the graph line, not literals
     assert "monitor-only" in prompt and "dev_JSON/HANDOFF.md" in prompt
     # The stop rule the brief gives the fork must name the file the tracker
     # actually writes: the fork runs with cwd=~, so a relative state/stop.json
