@@ -9,13 +9,13 @@
       "resume_session": "329cb798-b055-4f92-ba8d-96174a22413d",
       "priority": 100,
       "max_minutes": 240,
-      "status": "running",
+      "status": "done",
       "lane": "cloud",
       "started_at": "2026-09-03T00:23:13.091115+00:00",
-      "finished_at": "2026-09-03T00:18:12.665530+00:00",
+      "finished_at": "2026-09-03T00:45:21.913471+00:00",
       "pid": 89908,
-      "session_tokens": 494926,
-      "cost_usd": 14.165793250000002
+      "session_tokens": 565127,
+      "cost_usd": 17.542899749999997
     }
   ]
 }

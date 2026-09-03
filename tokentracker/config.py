@@ -30,6 +30,7 @@ class Config:
     activity_cooldown_minutes: int = 60
     reserve_week_frac: float = 0.15
     ahead_margin: float = 0.03
+    weekly_goal: float = 0.90
     endgame_hours: float = 12.0
     five_hour_guard_active: float = 0.80
     five_hour_guard_idle: float = 0.95
@@ -83,6 +84,20 @@ class Config:
     @property
     def throttle_file(self) -> Path:
         return self.state_dir / "throttle.json"
+
+    @property
+    def control_file(self) -> Path:
+        return self.state_dir / "control.json"
+
+    @property
+    def goal_file(self) -> Path:
+        """Per-user weekly-goal override; wins over config.json when present."""
+        return self.state_dir / "goal.json"
+
+    @property
+    def stop_file(self) -> Path:
+        """Written once the weekly goal is reached; the main session's stop point."""
+        return self.state_dir / "stop.json"
 
 
 _PATH_KEYS = (

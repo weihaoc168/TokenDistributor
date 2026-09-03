@@ -9,6 +9,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import Config
+from .control import RUNNING as CONTROL_RUNNING
+from .control import STOPPED as CONTROL_STOPPED
+from .control import read_control, write_control
+from .goal import GOAL_FALLBACK, GOAL_STEP, read_goal, read_stop, write_goal
 from .models import parse_iso, utcnow
 
 TRANSPARENT = "#010203"
@@ -25,6 +29,7 @@ BLUE = "#5b8dd9"
 RED = "#d9534f"
 MODE_COLORS = {
     "pace": GREEN, "surge": AMBER, "yield": BLUE, "coast": DIM, "blocked": RED,
+    "stopped": RED,
 }
 FONT_BIG = ("Segoe UI", 11, "bold")
 FONT = ("Segoe UI", 9)
@@ -52,6 +57,19 @@ GEAR_STEP_DEG = 5.0
 GEAR_FRAME_MS = 90
 SUB_BG = "#2c2c2f"
 BTN_H = 30
+# Vertical gap between the START/STOP row and the FULL THROTTLE button, and the
+# horizontal gap splitting START from STOP.
+BTN_ROW_GAP = 8
+CTL_BTN_GAP = 8
+# WEEKLY GOAL row: a shorter strip above START/STOP holding "-", the goal, "+".
+GOAL_ROW_H = 24
+GOAL_STEP_BTN_W = 26
+# Red band naming the stop point, drawn under the mode label when stop.json is
+# on disk (expanded), or across the usage readouts (collapsed).
+STOP_BAND_H = 20
+# Centre-to-centre spacing of the close and minimize buttons (each is 16 design
+# px wide), so close sits immediately left of minimize with a small gap.
+TITLE_BTN_STEP = 20
 BTN_ACTIVE_BG = "#8a3d33"
 OTHERS_VISIBLE = 2
 SCROLLBAR_W = 3
@@ -362,6 +380,9 @@ class Overlay:
         self._scroll_idx = 0
         self._max_scroll = 0
         self._throttle = False
+        self._control = read_control(cfg)
+        self._goal = read_goal(cfg)
+        self._stop = read_stop(cfg)
         self._after_id: str | None = None
         self._collapsed = self._load_collapsed()
 
@@ -412,7 +433,12 @@ class Overlay:
         self.root.bind("<Escape>", lambda _e: self.root.destroy())
         self.root.bind("<Button-3>", lambda _e: self.root.destroy())
         self.canvas.tag_bind("throttle_btn", "<Button-1>", self._toggle_throttle)
+        self.canvas.tag_bind("start_btn", "<Button-1>", self._click_start)
+        self.canvas.tag_bind("stop_btn", "<Button-1>", self._click_stop)
+        self.canvas.tag_bind("goal_minus", "<Button-1>", self._click_goal_minus)
+        self.canvas.tag_bind("goal_plus", "<Button-1>", self._click_goal_plus)
         self.canvas.tag_bind("min_btn", "<Button-1>", self._toggle_collapsed)
+        self.canvas.tag_bind("close_btn", "<Button-1>", self._click_close)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
 
     def _collapsed_file(self) -> Path:
@@ -447,6 +473,31 @@ class Overlay:
             self.canvas.create_line(cx, cy - w, cx, cy + w, fill=FG,
                                     width=max(1, self._px(2)), tags="min_btn")
 
+    def _draw_close_button(self, cx: float, cy: float) -> None:
+        h = self._pxf(8)
+        self._round_rect(cx - h, cy - h, cx + h, cy + h, self._pxf(4),
+                         fill=SUB_BG, outline=BORDER, width=1, tags="close_btn")
+        w = self._pxf(3.5)
+        stroke = max(1, self._px(2))
+        self.canvas.create_line(cx - w, cy - w, cx + w, cy + w, fill=FG,
+                                width=stroke, tags="close_btn")
+        self.canvas.create_line(cx - w, cy + w, cx + w, cy - w, fill=FG,
+                                width=stroke, tags="close_btn")
+
+    def _draw_title_buttons(self, min_cx: float, cy: float,
+                            collapsed: bool) -> None:
+        # Close sits immediately left of minimize; minimize keeps its corner.
+        self._draw_close_button(min_cx - self._pxf(TITLE_BTN_STEP), cy)
+        self._draw_min_button(min_cx, cy, collapsed=collapsed)
+
+    def _click_close(self, _event: tk.Event) -> str:
+        # Deferred: destroying the window from inside a canvas item binding frees
+        # the canvas while tk is still walking that item's binding chain, which
+        # faults the interpreter. after_idle runs the same teardown as the
+        # Escape / right-click bindings once the event has fully unwound.
+        self.root.after_idle(self.root.destroy)
+        return "break"
+
     def _refresh_collapsed(self, state: dict | None) -> None:
         P = self._px
         width = self.width
@@ -471,16 +522,46 @@ class Overlay:
                     parts.append((f"Fable {fable:.0%}", PINK))
                     break
             mode = str(state.get("decision", {}).get("mode", "?"))
-        x = pad
-        for text, color in parts:
-            self.canvas.create_text(x, cy, text=text, font=FONT_BOLD,
-                                    fill=color, anchor="w")
-            x += self._font_bold.measure(text) + P(12)
+        if self._control == CONTROL_STOPPED:
+            # The switch is authoritative even when the loop is offline or its
+            # last state predates the click.
+            mode = "stopped"
+        # The mode reserves its room first (it is the one word the bar must never
+        # garble), then the usage parts fill whatever is left; Fable drops off
+        # the end rather than colliding with STOPPED at wide values.
+        mode_right = width - pad - P(44)  # clear of the close + minimize pair
+        mode_text = ""
+        # Starts at mode_right, not at the card edge: with no decision to show
+        # (loop offline, or a mode that came back empty) the strip still has to
+        # stop short of the close and minimize buttons, which are drawn over it.
+        mode_left = mode_right
         if mode:
-            self.canvas.create_text(width - pad - P(30), cy, text=mode.upper(),
+            mode_text = self._fit(mode.upper(), self._font_small,
+                                  mode_right - pad)
+            mode_left = mode_right - self._font_small.measure(mode_text) - P(10)
+        # Short form here: the sentence the expanded band uses cannot fit beside
+        # the mode word at any DPI, and the half it loses is the weekly reading.
+        stop_text = self._stop_text(short=True)
+        band_right = mode_left - P(6)
+        if stop_text and band_right > pad + P(40):
+            # The band takes the whole usage strip rather than sharing it: at
+            # this width the readouts and the band cannot both fit unclipped.
+            self._draw_stop_band(pad - P(4), cy - P(9), band_right, cy + P(9),
+                                 stop_text)
+        else:
+            x = pad
+            for text, color in parts:
+                text_w = self._font_bold.measure(text)
+                if x + text_w > mode_left:
+                    break
+                self.canvas.create_text(x, cy, text=text, font=FONT_BOLD,
+                                        fill=color, anchor="w")
+                x += text_w + P(12)
+        if mode_text:
+            self.canvas.create_text(mode_right, cy, text=mode_text,
                                     font=FONT_SMALL, anchor="e",
                                     fill=MODE_COLORS.get(mode, FG))
-        self._draw_min_button(width - P(30), cy, collapsed=True)
+        self._draw_title_buttons(width - P(30), cy, collapsed=True)
         self._gear_center = None
         self.root.update_idletasks()
         self._place()
@@ -594,6 +675,117 @@ class Overlay:
                                 font=FONT_BOLD, fill=FG if active else AMBER,
                                 tags="throttle_btn")
 
+    def _set_control(self, mode: str) -> str:
+        self._control = write_control(self.cfg, mode)
+        self._refresh()
+        return "break"
+
+    def _click_start(self, _event: tk.Event) -> str:
+        return self._set_control(CONTROL_RUNNING)
+
+    def _click_stop(self, _event: tk.Event) -> str:
+        return self._set_control(CONTROL_STOPPED)
+
+    def _draw_ctl_button(self, x0: float, y0: float, x1: float, y1: float,
+                         kind: str) -> None:
+        # kind is "start" or "stop"; the active one is whichever matches the
+        # control file, and it reads as a state ("RUNNING"/"STOPPED") rather
+        # than as an action, so the current mode is never ambiguous.
+        running = self._control != CONTROL_STOPPED
+        active = running if kind == "start" else not running
+        color = GREEN if kind == "start" else RED
+        if kind == "start":
+            label = "RUNNING" if active else "START"
+        else:
+            label = "STOPPED" if active else "STOP"
+        self._round_rect(x0, y0, x1, y1, self._pxf(14),
+                         fill=BTN_ACTIVE_BG if active else SUB_BG,
+                         outline=color, width=1, tags=f"{kind}_btn")
+        self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label,
+                                font=FONT_BOLD, fill=FG if active else color,
+                                tags=f"{kind}_btn")
+
+    def _step_goal(self, delta: float) -> str:
+        # Snap to the 5-point grid first, so a goal typed as 87% still lands on
+        # 90 / 85 rather than drifting off-grid forever. A goal that is not a
+        # number at all starts from the default: round() would raise here and
+        # the taps are the only way to repair the file from the overlay.
+        current = self._goal if isinstance(self._goal, (int, float)) else GOAL_FALLBACK
+        if not math.isfinite(current):
+            current = GOAL_FALLBACK
+        pct = round(current * 100.0 / 5.0) * 5.0 + delta * 100.0
+        self._goal = write_goal(self.cfg, min(max(pct, 5.0), 100.0) / 100.0)
+        self._refresh()
+        return "break"
+
+    def _click_goal_minus(self, _event: tk.Event) -> str:
+        return self._step_goal(-GOAL_STEP)
+
+    def _click_goal_plus(self, _event: tk.Event) -> str:
+        return self._step_goal(GOAL_STEP)
+
+    def _draw_goal_row(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        """"- GOAL 90% +": the weekly utilization the loop stops the week at."""
+        P = self._px
+        self._sub_card(x0, y0, x1, y1, outline=AMBER)
+        btn_w = P(GOAL_STEP_BTN_W)
+        mid_y = (y0 + y1) / 2
+        for tag, label, bx0 in (("goal_minus", "-", x0),
+                                ("goal_plus", "+", x1 - btn_w)):
+            self._round_rect(bx0 + P(2), y0 + P(2), bx0 + btn_w - P(2), y1 - P(2),
+                             self._pxf(8), fill=CARD_BG, outline=AMBER, width=1,
+                             tags=tag)
+            self.canvas.create_text((bx0 + btn_w / 2), mid_y, text=label,
+                                    font=FONT_BOLD, fill=AMBER, tags=tag)
+        text = self._fit(f"GOAL {self._goal:.0%}", self._font_bold,
+                         (x1 - x0) - 2 * btn_w - P(8))
+        self.canvas.create_text((x0 + x1) / 2, mid_y, text=text,
+                                font=FONT_BOLD, fill=AMBER)
+
+    def _draw_goal_tick(self, cx: float, cy: float, frac: float) -> None:
+        """Amber tick on the weekly ring at the goal, inside the ring's stroke.
+
+        The ring is drawn start=90, extent=-359.9 (12 o'clock, clockwise), so a
+        fraction maps to 90 - frac*359.9 degrees in the same canvas angle space.
+        """
+        frac = min(max(frac, 0.0), 1.0)
+        r = self._pxf(GAUGE_RADIUS)
+        half = self._pxf(GAUGE_STROKE) / 2 + self._pxf(1.5)
+        a = math.radians(90.0 - frac * 359.9)
+        dx, dy = math.cos(a), -math.sin(a)
+        self.canvas.create_line(cx + dx * (r - half), cy + dy * (r - half),
+                                cx + dx * (r + half), cy + dy * (r + half),
+                                fill=AMBER, width=max(2, self._px(2)))
+
+    def _stop_text(self, short: bool = False) -> str | None:
+        """The red band's wording; `short` is the collapsed bar's one-line form.
+
+        Collapsed, the band shares its row with the mode word (already reading
+        STOPPED), so the prefix is dead weight there while the two numbers are
+        the whole point - and the long form only ever fits by dropping them.
+        """
+        if not self._stop:
+            return None
+        try:
+            goal = float(self._stop.get("goal", self._goal))
+            weekly = float(self._stop.get("weekly", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(goal) and math.isfinite(weekly)):
+            return None
+        if short:
+            return f"GOAL {goal:.0%} HIT ({weekly:.0%})"
+        return f"STOPPED: weekly goal {goal:.0%} reached ({weekly:.0%})"
+
+    def _draw_stop_band(self, x0: float, y0: float, x1: float, y1: float,
+                        text: str) -> None:
+        # Tagged so the layout tests can measure it against the title buttons.
+        self._round_rect(x0, y0, x1, y1, self._pxf(9), fill=BTN_ACTIVE_BG,
+                         outline=RED, width=1, tags="stop_band")
+        label = self._fit(text, self._font_small, (x1 - x0) - self._px(14))
+        self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label,
+                                font=FONT_SMALL, fill=FG, tags="stop_band")
+
     def _sub_card(self, x0: float, y0: float, x1: float, y1: float,
                   outline: str = "") -> None:
         self._round_rect(x0, y0, x1, y1, self._pxf(10), fill=SUB_BG,
@@ -668,6 +860,11 @@ class Overlay:
             self.root.after_cancel(self._after_id)
             self._after_id = None
         state = self._load_state()
+        self._control = read_control(self.cfg)
+        # Both files are re-read every refresh, like the control flag: the loop
+        # writes stop.json on its own tick and the goal may change from the CLI.
+        self._goal = read_goal(self.cfg)
+        self._stop = read_stop(self.cfg)
         self.canvas.delete("all")
         if self._collapsed:
             self._refresh_collapsed(state)
@@ -745,6 +942,13 @@ class Overlay:
                 updated_line = ("updated just now" if age_s < 30
                                 else f"updated {int(age_s // 60)}m ago")
 
+        if self._control == CONTROL_STOPPED:
+            # The operator switch wins over the last written decision, so a
+            # stopped overlay never claims to be pacing - and it still says so
+            # when the loop is offline and there is no decision at all.
+            mode = "stopped"
+            mode_label = "STOPPED"
+
         main_ids = set(self.cfg.main_session_ids)
         alive = {s["sid"]: s for s in sessions}
         self._order = [sid for sid in self._order
@@ -769,15 +973,24 @@ class Overlay:
         cards_y = sess_header_y + P(16)
         cards_h = (len(shown) * (card_h + card_gap)) if shown else P(18)
         dist_header_y = cards_y + cards_h + P(16)
-        rows_y = dist_header_y + P(26)
+        stop_text = self._stop_text()
+        # The stop band sits between the mode label and the first share row, so
+        # the rows move down by exactly the band it makes room for.
+        band_y0 = dist_header_y + P(12)
+        band_h = P(STOP_BAND_H) if stop_text else 0
+        rows_y = dist_header_y + P(26) + (band_h + P(6) if stop_text else 0)
         footer_y = rows_y + len(rows) * row_h + P(12)
-        btn_y = footer_y + P(22)
+        # WEEKLY GOAL row, then START/STOP, then FULL THROTTLE: the card grows
+        # by each row plus its gap so nothing overlaps the bottom status line.
+        goal_y = footer_y + P(22)
+        ctl_y = goal_y + P(GOAL_ROW_H) + P(BTN_ROW_GAP)
+        btn_y = ctl_y + P(BTN_H) + P(BTN_ROW_GAP)
         height = btn_y + P(BTN_H) + P(30)
 
         self.canvas.config(height=height)
         self._round_card(width, height)
         # Top-right, above the Fable gauge and inside the corner radius.
-        self._draw_min_button(width - P(34), P(22), collapsed=False)
+        self._draw_title_buttons(width - P(34), P(22), collapsed=False)
 
         center_cx = width // 2
         self._gauge(pad + P(48), five_frac, AMBER, "5 hours")
@@ -792,6 +1005,7 @@ class Overlay:
         if wf > 0:
             self.canvas.create_arc(bbox, start=90, extent=-max(wf * 359.9, 3.0),
                                    style="arc", outline=SILVER, width=P(GAUGE_STROKE))
+        self._draw_goal_tick(center_cx, cy, self._goal)
         self._gear_center = (center_cx, cy)
         self._draw_gear_face(center_cx, cy)
         self._draw_gear_teeth()
@@ -862,6 +1076,9 @@ class Overlay:
             self.canvas.create_text(width - pad, dist_header_y, text=mode_label,
                                     font=FONT_BOLD, anchor="e",
                                     fill=MODE_COLORS.get(mode, FG))
+        if stop_text:
+            self._draw_stop_band(pad - P(6), band_y0, width - pad + P(6),
+                                 band_y0 + band_h, stop_text)
 
         for i, (dot, label, value) in enumerate(rows):
             y = rows_y + i * row_h + row_h / 2
@@ -880,6 +1097,12 @@ class Overlay:
                                     font=FONT_SMALL, fill=DIM, anchor="w")
             self.canvas.create_text(width - pad, footer_y + P(6), text=footer_right,
                                     font=FONT_SMALL, fill=DIM, anchor="e")
+        self._draw_goal_row(pad, goal_y, width - pad, goal_y + P(GOAL_ROW_H))
+        ctl_gap = P(CTL_BTN_GAP)
+        ctl_w = (width - 2 * pad - ctl_gap) / 2
+        self._draw_ctl_button(pad, ctl_y, pad + ctl_w, ctl_y + P(BTN_H), "start")
+        self._draw_ctl_button(width - pad - ctl_w, ctl_y, width - pad,
+                              ctl_y + P(BTN_H), "stop")
         self._draw_button(pad, btn_y, width - pad, btn_y + P(BTN_H), self._throttle)
 
         bottom = warn or updated_line

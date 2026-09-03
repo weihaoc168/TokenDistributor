@@ -623,6 +623,740 @@ def test_gpu_guard():
     assert "deferred" in msg and "python.exe" in msg, msg
 
 
+def test_read_control_defaults_to_running():
+    from tokentracker import control
+    cfg = make_cfg()
+    assert not cfg.control_file.exists()
+    assert control.read_control(cfg) == control.RUNNING
+    for junk in ("{not json", "[]", '"stopped"', '{"dispatch": "wat"}', ""):
+        cfg.control_file.write_text(junk, encoding="utf-8")
+        assert control.read_control(cfg) == control.RUNNING, junk
+
+
+def test_write_control_round_trip():
+    from tokentracker import control
+    cfg = make_cfg()
+    assert control.write_control(cfg, "stopped") == control.STOPPED
+    assert control.read_control(cfg) == control.STOPPED
+    payload = json.loads(cfg.control_file.read_text(encoding="utf-8"))
+    assert payload["dispatch"] == "stopped"
+    assert utcnow() - datetime.fromisoformat(payload["changed_at"]) < timedelta(minutes=5)
+    assert control.write_control(cfg, "running") == control.RUNNING
+    assert control.read_control(cfg) == control.RUNNING
+    # Anything unrecognized is normalized to running, never left ambiguous.
+    assert control.write_control(cfg, "nonsense") == control.RUNNING
+    assert control.read_control(cfg) == control.RUNNING
+
+
+def test_gate_decision_passes_through_when_running():
+    from tokentracker import control
+    d = Decision("pace", 3, True, "behind", local_concurrency=2)
+    assert control.gate_decision(d, control.RUNNING) is d
+
+
+def test_gate_decision_zeroes_both_lanes_when_stopped():
+    from tokentracker import control
+    d = Decision("surge", 4, True, "throttle", local_concurrency=1)
+    gated = control.gate_decision(d, control.STOPPED)
+    assert gated.mode == "stopped"
+    assert gated.target_concurrency == 0 and gated.local_concurrency == 0
+    assert not gated.allow_heavy
+    assert d.target_concurrency == 4, "gate must not mutate the input decision"
+
+
+def _gate_cfg() -> Config:
+    cfg = _local_cfg()
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "pod", "prompt": "p", "cwd": str(cfg.root), "weight": "heavy",
+         "status": "pending"},
+    ]}), encoding="utf-8")
+    return cfg
+
+
+def test_stopped_gate_launches_nothing():
+    from tokentracker import control
+    cfg = _gate_cfg()
+    d = dispatch.Dispatcher(cfg)
+    launched: list[tuple[str, str]] = []
+
+    def fake_launch(task, now, lane="cloud"):
+        task.status = "running"
+        task.lane = lane
+        launched.append((task.id, lane))
+        return f"task {task.id}: launched {lane}"
+
+    d.launch = fake_launch
+    d.local_engine_up = lambda: True
+
+    running = Decision("pace", 2, True, "t", local_concurrency=1)
+    d.apply(control.gate_decision(running, control.RUNNING), utcnow())
+    assert launched == [("pod", "cloud")], launched
+
+    launched.clear()
+    d.get("pod").status = "pending"
+    stopped = control.gate_decision(running, control.STOPPED)
+    actions = d.apply(stopped, utcnow())
+    assert launched == [], launched
+    assert d.get("pod").status == "pending", d.get("pod")
+    assert actions == [], actions
+
+
+def test_stopped_gate_still_reaps_running_work():
+    from tokentracker import control
+    cfg = _gate_cfg()
+    d = dispatch.Dispatcher(cfg)
+
+    def never_launch(task, now, lane="cloud"):
+        raise AssertionError(f"launched {task.id} while dispatch was stopped")
+
+    d.launch = never_launch
+    task = TaskSpec(id="live", prompt="p", cwd=str(cfg.root), status="running",
+                    started_at=(utcnow() - timedelta(minutes=2)).isoformat())
+    d.add(task)
+    (cfg.logs_dir / "live.out.json").write_text(json.dumps({
+        "is_error": False, "usage": {"input_tokens": 7}}), encoding="utf-8")
+    out = open(cfg.logs_dir / "d1", "w")
+    err = open(cfg.logs_dir / "d2", "w")
+    d._procs["live"] = dispatch._Proc(
+        types.SimpleNamespace(returncode=0, pid=1, poll=lambda: 0), out, err)
+
+    stopped = control.gate_decision(
+        Decision("pace", 3, True, "t", local_concurrency=1), control.STOPPED)
+    actions = d.apply(stopped, utcnow())
+    assert d.get("live").status == "done", d.get("live")
+    assert any("live" in a for a in actions), actions
+
+
+def _gate_dispatcher(cfg: Config) -> tuple[object, list]:
+    d = dispatch.Dispatcher(cfg)
+    launched: list[tuple[str, str]] = []
+
+    def fake_launch(task, now, lane="cloud"):
+        task.status = "running"
+        task.lane = lane
+        launched.append((task.id, lane))
+        return f"task {task.id}: launched {lane}"
+
+    d.launch = fake_launch
+    d.local_engine_up = lambda: True
+    return d, launched
+
+
+def test_tick_gates_launches_on_control_file():
+    # Covers the real call-site wiring in cli._tick, not just gate_decision:
+    # the per-tick read, both gate points and the "dispatch" key in the state.
+    from tokentracker import cli, control
+    cfg = _gate_cfg()
+    d, launched = _gate_dispatcher(cfg)
+    history = usage.UsageHistory(cfg)
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.2, left_h=100.0)
+    try:
+        control.write_control(cfg, control.STOPPED)
+        decision, actions, _exc, _snap, _rolled = cli._tick(cfg, d, history)
+        assert decision.mode == "stopped", decision
+        assert decision.target_concurrency == 0 and decision.local_concurrency == 0
+        assert launched == [], launched
+        assert d.get("pod").status == "pending", d.get("pod")
+        state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
+        assert state["dispatch"] == "stopped", state
+        assert state["decision"]["mode"] == "stopped", state
+
+        control.write_control(cfg, control.RUNNING)
+        decision, actions, _exc, _snap, _rolled = cli._tick(cfg, d, history)
+        assert decision.mode == "pace" and decision.target_concurrency >= 1, decision
+        assert launched == [("pod", "cloud")], launched
+        state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
+        assert state["dispatch"] == "running", state
+    finally:
+        usage.fetch_usage = real_fetch
+
+
+def test_tick_gates_the_no_snapshot_branch():
+    # With usage unknown the local lane normally still runs; stopped must zero
+    # that too, and the state must say so.
+    from tokentracker import cli, control
+    cfg = _gate_cfg()
+    d, launched = _gate_dispatcher(cfg)
+    history = usage.UsageHistory(cfg)
+    real_fetch = usage.fetch_usage
+
+    def boom(_cfg):
+        raise usage.UsageFetchError("no network")
+
+    usage.fetch_usage = boom
+    try:
+        decision, _actions, exc, _snap, _rolled = cli._tick(cfg, d, history)
+        assert isinstance(exc, usage.UsageFetchError), exc
+        assert decision.local_concurrency >= 1, decision
+
+        launched.clear()
+        d.get("pod").status = "pending"
+        control.write_control(cfg, control.STOPPED)
+        decision, _actions, _exc, _snap, _rolled = cli._tick(cfg, d, history)
+        assert decision.mode == "stopped", decision
+        assert decision.local_concurrency == 0, decision
+        assert launched == [], launched
+        state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
+        assert state["dispatch"] == "stopped", state
+        assert state["decision"]["mode"] == "stopped", state
+    finally:
+        usage.fetch_usage = real_fetch
+
+
+def test_status_prints_dispatch_state():
+    import contextlib
+    import io
+
+    from tokentracker import cli, control
+    cfg = make_cfg()
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.4)
+    try:
+        for mode in (control.RUNNING, control.STOPPED):
+            control.write_control(cfg, mode)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                assert cli.cmd_status(cfg) == 0
+            assert f"dispatch: {mode}" in buf.getvalue().splitlines(), buf.getvalue()
+    finally:
+        usage.fetch_usage = real_fetch
+
+
+def test_read_goal_defaults_to_config():
+    from tokentracker import goal
+    cfg = make_cfg()
+    assert not cfg.goal_file.exists()
+    assert abs(goal.read_goal(cfg) - cfg.weekly_goal) < 1e-9
+    value, source = goal.read_goal_source(cfg)
+    assert source == goal.SOURCE_CONFIG and abs(value - 0.90) < 1e-9
+    cfg.weekly_goal = 0.5
+    assert abs(goal.read_goal(cfg) - 0.5) < 1e-9
+
+
+def test_read_goal_clamps_both_ends():
+    from tokentracker import goal
+    cfg = make_cfg()
+    for raw, want in ((0.0, goal.GOAL_MIN), (-3, goal.GOAL_MIN),
+                      (2.5, goal.GOAL_MAX), (1.0, 1.0), (0.05, 0.05)):
+        cfg.goal_file.write_text(json.dumps({"weekly_goal": raw}), encoding="utf-8")
+        assert abs(goal.read_goal(cfg) - want) < 1e-9, raw
+    # A config default out of range is clamped the same way.
+    cfg.goal_file.unlink()
+    cfg.weekly_goal = 0.0
+    assert goal.read_goal(cfg) == goal.GOAL_MIN
+
+
+def test_read_goal_survives_malformed_override():
+    from tokentracker import goal
+    cfg = make_cfg()
+    # json.loads accepts the non-standard NaN / Infinity literals, and NaN would
+    # pass every comparison in apply_goal_stop as False - a goal that can never
+    # be reached. It has to read as junk, not as an override.
+    for junk in ("{not json", "[]", '"0.5"', "", "{}", '{"weekly_goal": null}',
+                 '{"weekly_goal": "abc"}', '{"weekly_goal": true}',
+                 '{"weekly_goal": NaN}', '{"weekly_goal": Infinity}',
+                 '{"weekly_goal": -Infinity}', '{"weekly_goal": "nan"}'):
+        cfg.goal_file.write_text(junk, encoding="utf-8")
+        value, source = goal.read_goal_source(cfg)
+        assert abs(value - cfg.weekly_goal) < 1e-9, junk
+        assert source == goal.SOURCE_CONFIG, junk
+    # A string percentage is still honored rather than discarded.
+    cfg.goal_file.write_text('{"weekly_goal": "85%"}', encoding="utf-8")
+    assert abs(goal.read_goal(cfg) - 0.85) < 1e-9
+
+
+def test_write_goal_round_trip():
+    from tokentracker import goal
+    cfg = make_cfg()
+    assert abs(goal.write_goal(cfg, 0.85) - 0.85) < 1e-9
+    value, source = goal.read_goal_source(cfg)
+    assert abs(value - 0.85) < 1e-9 and source == goal.SOURCE_OVERRIDE
+    payload = json.loads(cfg.goal_file.read_text(encoding="utf-8"))
+    assert set(payload) == {"weekly_goal", "set_at"}, payload
+    assert utcnow() - datetime.fromisoformat(payload["set_at"]) < timedelta(minutes=5)
+    # The override wins over config.json, and out-of-range writes are clamped.
+    cfg.weekly_goal = 0.4
+    assert abs(goal.read_goal(cfg) - 0.85) < 1e-9
+    assert goal.write_goal(cfg, 5.0) == goal.GOAL_MAX
+    assert goal.write_goal(cfg, 0.0) == goal.GOAL_MIN
+    # A non-finite goal is refused outright rather than stored as a target no
+    # weekly value can ever reach.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        try:
+            goal.write_goal(cfg, bad)
+            raise AssertionError(f"stored {bad}")
+        except ValueError:
+            pass
+    assert abs(goal.read_goal(cfg) - goal.GOAL_MIN) < 1e-9
+
+
+def test_read_goal_survives_hostile_config_default():
+    # config.json is hand-edited, and read_goal runs on every poll of the run
+    # loop: a bad value there must degrade to the built-in default, never raise.
+    from tokentracker import goal
+    cfg = make_cfg()
+    for bad in (None, "ninety", "", [0.9], {}, True, float("nan"), float("inf")):
+        cfg.weekly_goal = bad
+        assert abs(goal.read_goal(cfg) - goal.GOAL_FALLBACK) < 1e-9, bad
+        assert goal.read_goal_source(cfg)[1] == goal.SOURCE_CONFIG, bad
+    # And a plausible hand edit means what the same token means on the CLI.
+    for raw, want in ((90, 0.90), ("85%", 0.85), ("0.7", 0.70), (85, 0.85)):
+        cfg.weekly_goal = raw
+        assert abs(goal.read_goal(cfg) - want) < 1e-9, raw
+        assert abs(goal.parse_goal(str(raw)) - want) < 1e-9, raw
+
+
+def test_parse_goal_accepts_fraction_percent_and_suffix():
+    from tokentracker import goal
+    for text in ("0.85", "85", "85%", " 85 % ", ".85"):
+        assert abs(goal.parse_goal(text) - 0.85) < 1e-9, text
+    assert goal.parse_goal("100%") == 1.0
+    assert goal.parse_goal("1") == 1.0
+    assert goal.parse_goal("3") == goal.GOAL_MIN
+    for bad in ("abc", "", "%", "eighty", "nan", "NaN", "inf", "-inf",
+                "infinity", "nan%"):
+        try:
+            goal.parse_goal(bad)
+            raise AssertionError(f"accepted {bad!r}")
+        except ValueError:
+            pass
+
+
+def _capture(fn) -> str:
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn()
+    return buf.getvalue()
+
+
+def test_cli_goal_prints_and_sets():
+    from tokentracker import cli, goal
+    cfg = make_cfg()
+    out = _capture(lambda: cli.cmd_goal(cfg, None))
+    assert f"weekly goal: 90% (source: {goal.SOURCE_CONFIG})" in out, out
+    for text, want_pct in (("0.85", 85), ("85", 85), ("85%", 85), ("0.6", 60)):
+        cfg.goal_file.unlink(missing_ok=True)
+        out = _capture(lambda: cli.cmd_goal(cfg, text))
+        assert f"weekly goal: {want_pct}%" in out, (text, out)
+        assert abs(goal.read_goal(cfg) - want_pct / 100) < 1e-9, text
+        assert goal.read_goal_source(cfg)[1] == goal.SOURCE_OVERRIDE
+    # Unparseable input is refused without touching the stored goal.
+    assert cli.cmd_goal(cfg, "later") == 1
+    assert abs(goal.read_goal(cfg) - 0.6) < 1e-9
+
+
+def test_cli_goal_subcommand_wiring():
+    from tokentracker import goal
+    from tokentracker.cli import main as cli_main
+    from tokentracker.config import load_config
+    tmp = Path(tempfile.mkdtemp(prefix="tokdist_goalcli_"))
+    out = _capture(lambda: cli_main(["--root", str(tmp), "goal", "85%"]))
+    assert "weekly goal: 85%" in out, out
+    cfg = load_config(tmp)
+    assert abs(goal.read_goal(cfg) - 0.85) < 1e-9
+    out = _capture(lambda: cli_main(["--root", str(tmp), "goal"]))
+    assert f"weekly goal: 85% (source: {goal.SOURCE_OVERRIDE})" in out, out
+
+
+def test_goal_stop_writes_once_then_clears():
+    from tokentracker import control, goal
+    cfg = make_cfg()
+    goal.write_goal(cfg, 0.90)
+
+    # Under goal: nothing written, dispatch untouched.
+    stop, line = goal.apply_goal_stop(cfg, 0.5, NOW)
+    assert stop is None and line is None
+    assert not cfg.stop_file.exists()
+    assert control.read_control(cfg) == control.RUNNING
+
+    # Crossing the goal: the stop point appears and dispatch halts.
+    stop, line = goal.apply_goal_stop(cfg, 0.91, NOW)
+    assert list(stop) == ["reason", "goal", "weekly", "at"], stop
+    assert stop["reason"] == goal.STOP_REASON
+    assert abs(stop["goal"] - 0.90) < 1e-9 and abs(stop["weekly"] - 0.91) < 1e-9
+    assert stop["at"] == NOW.isoformat()
+    assert line and "weekly goal" in line
+    on_disk = json.loads(cfg.stop_file.read_text(encoding="utf-8"))
+    assert on_disk == stop, on_disk
+    assert control.read_control(cfg) == control.STOPPED
+
+    # Still over goal: the record is left exactly as written and START sticks,
+    # so the operator is not re-stopped on every poll.
+    control.write_control(cfg, control.RUNNING)
+    again, line2 = goal.apply_goal_stop(cfg, 0.99, NOW + timedelta(hours=1))
+    assert again == stop and line2 is None
+    assert json.loads(cfg.stop_file.read_text(encoding="utf-8")) == stop
+    assert control.read_control(cfg) == control.RUNNING
+
+    # Weekly reset drops below the goal: cleared, but never auto-restarted.
+    control.write_control(cfg, control.STOPPED)
+    cleared, line3 = goal.apply_goal_stop(cfg, 0.02, NOW + timedelta(days=7))
+    assert cleared is None and line3 and "cleared" in line3
+    assert not cfg.stop_file.exists()
+    assert control.read_control(cfg) == control.STOPPED
+    # And once cleared it is silent again until the next crossing.
+    assert goal.apply_goal_stop(cfg, 0.02, NOW) == (None, None)
+
+
+def test_goal_stop_uses_current_goal_value():
+    from tokentracker import goal
+    cfg = make_cfg()
+    goal.write_goal(cfg, 0.50)
+    stop, _line = goal.apply_goal_stop(cfg, 0.55, NOW)
+    assert stop is not None and abs(stop["goal"] - 0.50) < 1e-9
+    goal.clear_stop(cfg)
+    goal.write_goal(cfg, 0.95)
+    assert goal.apply_goal_stop(cfg, 0.55, NOW) == (None, None)
+
+
+def test_goal_stop_ignores_an_unusable_weekly_reading():
+    # utilization comes from remote JSON: null and NaN both reach here (models
+    # float()s it, usage._coerce_utilization lets NaN through). Neither may kill
+    # the loop, and neither may clear a standing stop - clearing one resumes the
+    # main session as if the week had rolled over.
+    from tokentracker import control, goal
+    cfg = make_cfg()
+    goal.write_goal(cfg, 0.90)
+    for junk in (None, float("nan"), "abc", [1], float("inf")):
+        assert goal.apply_goal_stop(cfg, junk, NOW) == (None, None), junk
+        assert not cfg.stop_file.exists(), junk
+        assert control.read_control(cfg) == control.RUNNING, junk
+
+    stop, _line = goal.apply_goal_stop(cfg, 0.95, NOW)
+    assert stop is not None and cfg.stop_file.exists()
+    for junk in (None, float("nan"), "abc"):
+        assert goal.apply_goal_stop(cfg, junk, NOW) == (stop, None), junk
+        assert json.loads(cfg.stop_file.read_text(encoding="utf-8")) == stop, junk
+
+
+def test_goal_stop_replaces_an_unreadable_record():
+    # A truncated or hand-edited stop.json is still a JSON object, so it used to
+    # read as "already stopped": the real record was never written and dispatch
+    # was never halted for the rest of the week.
+    from tokentracker import control, goal
+    cfg = make_cfg()
+    goal.write_goal(cfg, 0.90)
+    for junk in ("{}", '{"reason": "weekly goal reached"}',
+                 '{"reason": 1, "goal": 0.9, "weekly": 0.95, "at": "x"}',
+                 '{"reason": "r", "goal": null, "weekly": 0.95, "at": "x"}',
+                 '{"reason": "r", "goal": NaN, "weekly": 0.95, "at": "x"}',
+                 '{"reason": "r", "goal": 0.9, "weekly": 0.95, "at": "x", "n": 1}'):
+        cfg.stop_file.write_text(junk, encoding="utf-8")
+        control.write_control(cfg, control.RUNNING)
+        stop, line = goal.apply_goal_stop(cfg, 0.95, NOW)
+        assert goal.valid_stop(stop), (junk, stop)
+        assert list(stop) == ["reason", "goal", "weekly", "at"], (junk, stop)
+        assert line and "weekly goal" in line, (junk, line)
+        assert control.read_control(cfg) == control.STOPPED, junk
+        assert json.loads(cfg.stop_file.read_text(encoding="utf-8")) == stop, junk
+        goal.clear_stop(cfg)
+
+    # Below the goal the same junk is discarded rather than left for the main
+    # session to read as a stop point.
+    cfg.stop_file.write_text("{}", encoding="utf-8")
+    cleared, line = goal.apply_goal_stop(cfg, 0.10, NOW)
+    assert cleared is None and line and "discarded" in line, line
+    assert not cfg.stop_file.exists()
+    # A record written by write_goal/apply_goal_stop is of course kept as is.
+    stop, _line = goal.apply_goal_stop(cfg, 0.95, NOW)
+    assert goal.valid_stop(stop) and goal.apply_goal_stop(cfg, 0.96, NOW) == (stop, None)
+
+
+def test_tick_stops_dispatch_at_weekly_goal():
+    # The wiring inside cli._tick: the goal check runs before anything launches,
+    # gates that same tick, and the state names the stop reason.
+    from tokentracker import cli, control, goal
+    cfg = _gate_cfg()
+    goal.write_goal(cfg, 0.90)
+    d, launched = _gate_dispatcher(cfg)
+    history = usage.UsageHistory(cfg)
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.95, left_h=100.0)
+    try:
+        decision, actions, _exc, _snap, _rolled = cli._tick(cfg, d, history)
+        assert decision.mode == "stopped", decision
+        assert launched == [], launched
+        assert control.read_control(cfg) == control.STOPPED
+        stop = json.loads(cfg.stop_file.read_text(encoding="utf-8"))
+        assert list(stop) == ["reason", "goal", "weekly", "at"], stop
+        assert any("weekly goal" in a for a in actions), actions
+        state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
+        assert state["decision"]["mode"] == "stopped", state
+        assert state["decision"]["stop_reason"] == goal.STOP_REASON, state
+        assert abs(state["weekly_goal"] - 0.90) < 1e-9, state
+        assert state["goal_stop"] == stop, state
+
+        # Second tick over the goal: no second log line, no rewrite.
+        _decision, actions2, _e, _s, _r = cli._tick(cfg, d, history)
+        assert not any("weekly goal" in a for a in actions2), actions2
+        assert json.loads(cfg.stop_file.read_text(encoding="utf-8")) == stop
+
+        # Weekly reset: the stop point clears, dispatch stays parked.
+        usage.fetch_usage = lambda _cfg: snap(0.05, left_h=160.0)
+        decision, actions3, _e, _s, _r = cli._tick(cfg, d, history)
+        assert not cfg.stop_file.exists()
+        assert any("cleared" in a for a in actions3), actions3
+        assert control.read_control(cfg) == control.STOPPED
+        assert decision.mode == "stopped", decision
+        assert launched == [], launched
+        state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
+        assert state["goal_stop"] is None, state
+
+        # Only now, on an operator START, does work resume.
+        control.write_control(cfg, control.RUNNING)
+        cli._tick(cfg, d, history)
+        assert launched == [("pod", "cloud")], launched
+    finally:
+        usage.fetch_usage = real_fetch
+
+
+def test_status_prints_weekly_goal_line():
+    from tokentracker import cli, goal
+    cfg = make_cfg()
+    goal.write_goal(cfg, 0.85)
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.57)
+    try:
+        out = _capture(lambda: cli.cmd_status(cfg))
+        assert "weekly goal: 85% (weekly now 57%)" in out.splitlines(), out
+        goal.apply_goal_stop(cfg, 0.57, NOW)  # under goal: no stop line
+        assert "STOPPED:" not in _capture(lambda: cli.cmd_status(cfg))
+        goal.apply_goal_stop(cfg, 0.86, NOW)
+        out = _capture(lambda: cli.cmd_status(cfg))
+        assert f"STOPPED: {goal.STOP_REASON}" in out, out
+    finally:
+        usage.fetch_usage = real_fetch
+
+
+def test_overlay_exposes_goal_controls():
+    import inspect
+    try:
+        import tkinter  # noqa: F401  - absent on headless builds
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    src = inspect.getsource(overlay.Overlay)
+    for tag in ("goal_minus", "goal_plus"):
+        assert f'tag_bind("{tag}"' in src, tag
+    for name in ("_click_goal_minus", "_click_goal_plus", "_step_goal",
+                 "_draw_goal_row", "_draw_goal_tick", "_draw_stop_band",
+                 "_stop_text"):
+        assert callable(getattr(overlay.Overlay, name)), name
+    # Both handlers must swallow the click so the drag binding never sees it.
+    for name in ("_click_goal_minus", "_click_goal_plus"):
+        assert 'return "break"' in inspect.getsource(
+            getattr(overlay.Overlay, "_step_goal")), name
+
+
+def test_overlay_goal_step_clamps_and_writes():
+    try:
+        from tokentracker import goal, overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    cfg = make_cfg()
+    fake = overlay.Overlay.__new__(overlay.Overlay)
+    fake.cfg = cfg
+    fake._refresh = lambda: None
+    fake._goal = goal.write_goal(cfg, 0.90)
+    assert fake._step_goal(0.05) == "break"
+    assert abs(goal.read_goal(cfg) - 0.95) < 1e-9
+    fake._step_goal(0.05)
+    fake._step_goal(0.05)          # clamped at 100%
+    assert abs(goal.read_goal(cfg) - 1.0) < 1e-9
+    for _ in range(30):            # walk it down past the floor
+        fake._step_goal(-0.05)
+    assert abs(goal.read_goal(cfg) - goal.GOAL_MIN) < 1e-9
+    # An off-grid goal snaps onto the 5-point grid instead of drifting.
+    fake._goal = goal.write_goal(cfg, 0.87)
+    fake._step_goal(-0.05)
+    assert abs(goal.read_goal(cfg) - 0.80) < 1e-9
+    # The taps are the only in-overlay repair for a broken goal, so they must
+    # survive one: round(nan) raises, which would deaden the button for good.
+    for broken in (float("nan"), None, float("inf")):
+        fake._goal = broken
+        assert fake._step_goal(0.05) == "break", broken
+        assert abs(goal.read_goal(cfg) - 0.95) < 1e-9, broken
+
+
+def test_overlay_exposes_control_and_close_buttons():
+    import inspect
+    try:
+        import tkinter  # noqa: F401  - absent on headless builds
+        from tokentracker import overlay
+    except ImportError as exc:
+        # Only a missing tkinter may skip this; a broken overlay import (say a
+        # renamed name in control.py) must fail loudly instead of passing.
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    assert overlay.MODE_COLORS["stopped"] == overlay.RED
+    src = inspect.getsource(overlay.Overlay)
+    for tag in ("throttle_btn", "start_btn", "stop_btn", "min_btn", "close_btn"):
+        assert f'tag_bind("{tag}"' in src, tag
+    assert 'tags="close_btn"' in src
+    assert 'tags=f"{kind}_btn"' in src
+    for name in ("_click_start", "_click_stop", "_click_close",
+                 "_draw_ctl_button", "_draw_close_button", "_draw_title_buttons"):
+        assert callable(getattr(overlay.Overlay, name)), name
+
+
+# Runs in its own interpreter: a bad close handler takes the whole process down
+# with an access violation, which would otherwise swallow the suite's output.
+_TK_PROBE = r'''
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+tmp = Path(sys.argv[2])
+
+try:
+    import tkinter as tk
+    import tkinter.font as tkfont
+except Exception as exc:
+    print("SKIP tkinter:", exc)
+    raise SystemExit(0)
+
+from tokentracker import control, goal, overlay
+from tokentracker.config import Config
+
+cfg = Config(
+    root=tmp, credentials_path=tmp / "creds.json", projects_dir=tmp / "projects",
+    sessions_dir=tmp / "sessions", state_dir=tmp / "state", logs_dir=tmp / "logs",
+    tasks_file=tmp / "tasks.json",
+)
+for d in (cfg.state_dir, cfg.logs_dir, cfg.projects_dir):
+    d.mkdir(parents=True, exist_ok=True)
+full = {"utilization": 1.0, "resets_at": None}
+cfg.state_file.write_text(json.dumps({
+    "at": overlay.utcnow().isoformat(),
+    "usage": {"five_hour": dict(full), "seven_day": dict(full),
+              "extra": {"fable_weekly": dict(full)}},
+    "decision": {"mode": "pace"},
+    "queue": {},
+    "distribution": {"window_minutes": 60, "total_tokens": 0, "shares": []},
+}), encoding="utf-8")
+control.write_control(cfg, control.STOPPED)
+goal.write_goal(cfg, 0.90)
+goal.apply_goal_stop(cfg, 1.0, overlay.utcnow())
+
+try:
+    ov = overlay.Overlay(cfg)
+except tk.TclError as exc:
+    print("SKIP display:", exc)
+    raise SystemExit(0)
+
+
+def spans():
+    out = []
+    for item in ov.canvas.find_all():
+        if ov.canvas.type(item) != "text":
+            continue
+        x0, _y0, x1, _y1 = ov.canvas.bbox(item)
+        out.append((ov.canvas.itemcget(item, "text"), x0, x1))
+    return out
+
+
+def check_collapsed(tag, expect_mode=True):
+    ov._collapsed = True
+    ov._refresh()
+    ov.root.update_idletasks()
+    drawn = spans()
+    labels = [t for t, _a, _b in drawn]
+    if expect_mode:
+        assert "STOPPED" in labels, (tag, drawn)
+    # The stop band must say the weekly reading it exists to report, not an
+    # ellipsis, and must not slide under the close / minimize buttons that are
+    # painted over it.
+    band = [t for t in labels if t.startswith("GOAL ")]
+    assert band and "..." not in band[0], (tag, drawn)
+    box = ov.canvas.bbox("stop_band")
+    buttons = [ov.canvas.bbox(i) for t in ("close_btn", "min_btn")
+               for i in ov.canvas.find_withtag(t)]
+    assert box and buttons, (tag, box, buttons)
+    assert box[2] <= min(b[0] for b in buttons), (tag, box, buttons)
+    for i, (ta, a0, a1) in enumerate(drawn):
+        for tb, b0, b1 in drawn[i + 1:]:
+            assert a1 <= b0 or b1 <= a0, (tag, ta, tb, a0, a1, b0, b1)
+
+
+check_collapsed("native")
+
+# Again at a 2x display scale, where the wide "Fable 100%" readout used to run
+# straight into the mode label.
+try:
+    ov.root.tk.call("tk", "scaling",
+                    2.0 * overlay.BASELINE_DPI / overlay.POINTS_PER_INCH)
+    ov._font = tkfont.Font(family="Segoe UI", size=9)
+    ov._font_bold = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+    ov._font_small = tkfont.Font(family="Segoe UI", size=8)
+    ov.s = 2.0
+    ov.width = ov._px(cfg.overlay_width)
+except tk.TclError as exc:
+    print("SKIP scaling:", exc)
+else:
+    check_collapsed("2x")
+
+# START pressed after a goal stop, with no loop state to read: no mode word is
+# drawn, so nothing pushes the band left off the title buttons on its own.
+state_body = cfg.state_file.read_text(encoding="utf-8")
+cfg.state_file.unlink()
+control.write_control(cfg, control.RUNNING)
+check_collapsed("no-mode", expect_mode=False)
+cfg.state_file.write_text(state_body, encoding="utf-8")
+control.write_control(cfg, control.STOPPED)
+
+# The close button must exit the way Escape does. Destroying synchronously from
+# inside the canvas item binding frees the canvas mid-dispatch and faults tk.
+ov._collapsed = False
+ov._refresh()
+ov.root.update()
+
+# Expanded: the goal row taps and the red stop band must all be on the canvas,
+# and no two texts may overlap now that two rows were added under the footer.
+for tag in ("goal_minus", "goal_plus"):
+    assert ov.canvas.find_withtag(tag), tag
+texts = [t for t, _a, _b in spans()]
+assert any(t.startswith("GOAL ") for t in texts), texts
+assert any(t.startswith("STOPPED: weekly goal") for t in texts), texts
+lowest = max(ov.canvas.bbox(i)[3] for i in ov.canvas.find_all())
+assert lowest <= int(ov.canvas["height"]) + 2, (lowest, ov.canvas["height"])
+
+ids = ov.canvas.find_withtag("close_btn")
+assert ids, "no close button drawn"
+x0, y0, x1, y1 = ov.canvas.bbox(ids[0])
+ov.canvas.event_generate("<ButtonPress-1>",
+                         x=int((x0 + x1) // 2), y=int((y0 + y1) // 2))
+try:
+    ov.root.update()
+    gone = not ov.root.winfo_exists()
+except tk.TclError:
+    gone = True
+assert gone, "close button did not destroy the window"
+print("OK")
+'''
+
+
+def test_overlay_close_button_and_collapsed_bar_render():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="tokdist_tk_"))
+    probe = tmp / "probe.py"
+    probe.write_text(_TK_PROBE, encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(probe), str(ROOT), str(tmp)],
+        capture_output=True, text=True, timeout=180)
+    out = f"rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+    assert proc.returncode == 0, out
+    assert "OK" in proc.stdout or "SKIP" in proc.stdout, out
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

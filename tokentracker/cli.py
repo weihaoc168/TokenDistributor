@@ -7,7 +7,16 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import Config, load_config
+from .control import STOPPED, gate_decision, read_control
 from .dispatch import Dispatcher, DispatchError
+from .goal import (
+    apply_goal_stop,
+    parse_goal,
+    read_goal,
+    read_goal_source,
+    read_stop,
+    write_goal,
+)
 from .models import Decision, TaskSpec, utcnow
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +45,27 @@ def _throttle_sig(cfg: Config) -> float | None:
         return cfg.throttle_file.stat().st_mtime
     except OSError:
         return None
+
+
+def _control_sig(cfg: Config) -> float | None:
+    try:
+        return cfg.control_file.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _goal_sig(cfg: Config) -> float | None:
+    try:
+        return cfg.goal_file.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _wake_sig(cfg: Config) -> tuple[float | None, float | None, float | None]:
+    # Any operator switch (full throttle, start/stop, weekly goal) should cut
+    # the sleep short so a click takes effect within seconds, not a whole poll
+    # period - a goal dragged down under the current weekly stops the loop now.
+    return _throttle_sig(cfg), _control_sig(cfg), _goal_sig(cfg)
 
 
 def _ensure_throttle_task(cfg: Config, dispatcher: Dispatcher) -> None:
@@ -144,6 +174,7 @@ def _tick(
         recent = history.load_recent(hours=max(1.0, cfg.stale_snapshot_minutes / 60))
         if recent and (now - recent[-1].fetched_at).total_seconds() <= cfg.stale_snapshot_minutes * 60:
             snap = recent[-1]
+    control = read_control(cfg)
     if snap is None:
         reason = f"usage fetch failed: {fetch_exc}" if fetch_exc else "no usage snapshot available"
         decision = Decision("blocked", 0, False, reason)
@@ -151,8 +182,10 @@ def _tick(
         # costs no budget either way, so it may still run.
         activity = detect_activity(cfg, own_dirs, now)
         decision.local_concurrency = decide_local(decision, activity, cfg, now)
+        decision = gate_decision(decision, control)
         actions = dispatcher.apply(decision, now)
         _write_state(cfg, {"at": now.isoformat(), "decision": decision.to_dict(),
+                           "dispatch": control,
                            "error": str(fetch_exc) if fetch_exc else reason})
         return decision, actions, fetch_exc, None, False
 
@@ -161,6 +194,14 @@ def _tick(
         for w in (snap.five_hour, snap.seven_day)
     )
     snap = normalize(snap, now)
+
+    # The weekly goal is checked before anything is launched, so the poll that
+    # crosses it is also the poll that stops dispatch. apply_goal_stop may have
+    # just written the control file, hence the re-read.
+    goal = read_goal(cfg)
+    stop, goal_line = apply_goal_stop(cfg, snap.seven_day.utilization, now)
+    if goal_line is not None:
+        control = read_control(cfg)
 
     rates = compute_burn_rates(cfg, history, own_dirs, now)
     activity = detect_activity(cfg, own_dirs, now)
@@ -174,14 +215,29 @@ def _tick(
             "surge", cfg.surge_concurrency, True,
             "Full throttle (manual override): exhausting weekly budget.",
         )
-        _ensure_throttle_task(cfg, dispatcher)
+        if control != STOPPED:
+            _ensure_throttle_task(cfg, dispatcher)
     elif not throttle:
         stale_task = dispatcher.get(THROTTLE_TASK_ID)
         if stale_task is not None and stale_task.status == "pending":
             dispatcher.set_status(THROTTLE_TASK_ID, "killed")
 
     decision.local_concurrency = decide_local(decision, activity, cfg, now)
+    # Operator STOP is the last word: it zeroes both launch budgets, so apply()
+    # reaps and adopts as usual but starts nothing new.
+    decision = gate_decision(decision, control)
     actions = dispatcher.apply(decision, now)
+    if goal_line is not None:
+        actions.insert(0, goal_line)
+
+    decision_payload = decision.to_dict()
+    if stop is not None:
+        # Name the reason whenever the stop record stands. The mode is only
+        # forced while dispatch is actually parked: if the operator pressed
+        # START back over the goal, the state must not claim to be stopped.
+        decision_payload["stop_reason"] = stop.get("reason")
+        if control == STOPPED:
+            decision_payload["mode"] = STOPPED
 
     _write_state(cfg, {
         "at": now.isoformat(),
@@ -194,7 +250,7 @@ def _tick(
             if activity.last_user_activity else None,
             "sessions": activity.active_foreign_sessions,
         },
-        "decision": decision.to_dict(),
+        "decision": decision_payload,
         "queue": dispatcher.queue_stats().__dict__,
         "local": {
             "enabled": cfg.local_enabled,
@@ -205,6 +261,9 @@ def _tick(
         "usage_stale": bool(fetch_exc) or not do_fetch,
         "fetch_error": str(fetch_exc) if fetch_exc else None,
         "throttle": throttle,
+        "dispatch": control,
+        "weekly_goal": goal,
+        "goal_stop": stop,
     })
     return decision, actions, fetch_exc, snap, rolled
 
@@ -219,6 +278,11 @@ def cmd_run(cfg: Config, once: bool) -> int:
     backoff = 0.0
     while True:
         do_fetch = time.monotonic() >= next_fetch_ts
+        # Sampled before the tick, not after: a switch clicked while the tick is
+        # in flight (the usage fetch alone can take seconds) is then still newer
+        # than this signature, so the sleep below breaks out at once instead of
+        # sitting on the click for a whole poll period. One extra tick is cheap.
+        sig = _wake_sig(cfg)
         decision, actions, fetch_exc, snap, rolled = _tick(cfg, dispatcher, history, do_fetch)
         stamp = datetime.now().strftime("%H:%M:%S")
         if rolled and backoff == 0.0:
@@ -254,7 +318,6 @@ def cmd_run(cfg: Config, once: bool) -> int:
                 until = (window.resets_at - utcnow()).total_seconds() + 10.0
                 if until > 0:
                     sleep_s = min(sleep_s, max(10.0, until))
-        sig = _throttle_sig(cfg)
         deadline = time.monotonic() + sleep_s
         try:
             while True:
@@ -262,7 +325,7 @@ def cmd_run(cfg: Config, once: bool) -> int:
                 if remaining <= 0:
                     break
                 time.sleep(min(10.0, remaining))
-                if _throttle_sig(cfg) != sig:
+                if _wake_sig(cfg) != sig:
                     break
         except KeyboardInterrupt:
             print("stopped; running background tasks continue detached")
@@ -277,6 +340,7 @@ def cmd_status(cfg: Config) -> int:
         snap = fetch_usage(cfg)
     except UsageFetchError as exc:
         print(f"live usage unavailable: {exc}")
+        print(f"dispatch: {read_control(cfg)}")
         if cfg.state_file.exists():
             state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
             print(f"last known state from {state.get('at')}:")
@@ -292,6 +356,15 @@ def cmd_status(cfg: Config) -> int:
         print(f"{name:<7} " + _bar(w.utilization))
     print(f"pace: elapsed {p['elapsed_frac']:.1%}, reserve {p['reserve']:.1%}, "
           f"required {p['required_total_pct_per_hr']:.2f}%/h")
+
+    goal = read_goal(cfg)
+    print(f"weekly goal: {goal:.0%} (weekly now {snap.seven_day.utilization:.0%})")
+    stop = read_stop(cfg)
+    if stop is not None:
+        print(f"STOPPED: {stop.get('reason')} - goal {float(stop.get('goal', 0)):.0%}, "
+              f"weekly {float(stop.get('weekly', 0)):.0%} at {stop.get('at')}")
+
+    print(f"dispatch: {read_control(cfg)}")
 
     if cfg.state_file.exists():
         state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
@@ -312,6 +385,26 @@ def cmd_status(cfg: Config) -> int:
         extra += f" err={t.error}" if t.error else ""
         lane = f" [{t.lane}]" if t.lane else ""
         print(f"  {t.id:<24} {t.weight:<6} {t.status:<8} prio={t.priority}{lane}{extra}")
+    return 0
+
+
+def cmd_goal(cfg: Config, value: str | None) -> int:
+    """Print the weekly goal, or set it from 0.85 / 85 / 85%."""
+    if value is None:
+        goal, source = read_goal_source(cfg)
+        print(f"weekly goal: {goal:.0%} (source: {source})")
+        stop = read_stop(cfg)
+        if stop is not None:
+            print(f"stop point active: {stop.get('reason')} "
+                  f"({float(stop.get('weekly', 0)):.0%} weekly at {stop.get('at')})")
+        return 0
+    try:
+        goal = parse_goal(value)
+    except ValueError:
+        print(f"error: cannot read '{value}' as a goal; use 0.85, 85 or 85%")
+        return 1
+    write_goal(cfg, goal)
+    print(f"weekly goal: {goal:.0%} (source: {read_goal_source(cfg)[1]})")
     return 0
 
 
@@ -370,6 +463,10 @@ def main(argv: list[str] | None = None) -> int:
     run_p = sub.add_parser("run", help="start the control loop")
     run_p.add_argument("--once", action="store_true", help="single tick then exit")
     sub.add_parser("status", help="live usage, pacing and queue")
+    goal_p = sub.add_parser(
+        "goal", help="show or set the weekly goal (the loop's stopping point)")
+    goal_p.add_argument("value", nargs="?", default=None,
+                        help="0.85, 85 or 85%% - omit to print the current goal")
     sub.add_parser("list", help="list tasks")
     sub.add_parser("overlay", help="always-on-top panel docked to the Sundial layer")
 
@@ -398,6 +495,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_run(cfg, args.once)
         if args.cmd == "status":
             return cmd_status(cfg)
+        if args.cmd == "goal":
+            return cmd_goal(cfg, args.value)
         if args.cmd == "add":
             return cmd_add(cfg, args)
         if args.cmd == "list":

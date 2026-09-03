@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 TASK_STATUSES = ("pending", "running", "done", "failed", "killed")
-MODES = ("pace", "coast", "yield", "surge", "blocked")
+MODES = ("pace", "coast", "yield", "surge", "blocked", "stopped")
 WEEK_HOURS = 168.0
 
 
