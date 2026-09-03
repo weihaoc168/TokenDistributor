@@ -594,15 +594,20 @@ class Dispatcher:
         """
         if lane == "local":
             return self.cfg.local_model
-        if task.model:
-            return task.model
         tier_model = str(read_graph(self.cfg)[task_tier(task)].get("model") or "")
         if task.id == FORK_TASK_ID:
-            # Never None for the director fork: a model-less launch silently
-            # drops it onto the account default (a Fable model), which is
-            # exactly what this fork exists not to be.
-            return (tier_model or self.cfg.throttle_model
+            # The graph outranks the row's own `model` here, and only here: the
+            # fork row is long-lived (armed, then held behind the cooldown or
+            # the concurrency budget for polls at a time) while the executive
+            # tier is exactly what an operator edits mid-run, and the launch
+            # has to go out on the model in force now.
+            # Never None either: a model-less launch silently drops the fork
+            # onto the account default (a Fable model), which is exactly what
+            # this fork exists not to be.
+            return (tier_model or task.model or self.cfg.throttle_model
                     or self.cfg.worker_model or FORK_FALLBACK_MODEL)
+        if task.model:
+            return task.model
         return tier_model or self.cfg.worker_model or None
 
     def _task_model(self, task: TaskSpec, lane: str) -> str | None:

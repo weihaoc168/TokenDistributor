@@ -37,6 +37,16 @@ START_KEYS = ("task_id", "mode", "model", "parent_session", "started_at",
               "status", "fork_session_id")
 FINISH_KEYS = ("finished_at", "tokens", "cost_usd")
 HANDOVER_KEYS = START_KEYS + FINISH_KEYS
+# state/handover.log: one JSON object per line, appended on every start and
+# every finish. handover.json only ever holds the newest fork; the ledger needs
+# every one of them, because a report window can span several forks and each
+# may have run on a different model (a fallback, or a graph edited between
+# launches). `logged_at` is the only key the log adds to the record.
+LOG_KEY = "logged_at"
+LOG_KEYS = HANDOVER_KEYS + (LOG_KEY,)
+# A run of years of forks is still a small file, but it is append-only, so the
+# reader caps what it will hold in memory.
+LOG_MAX_LINES = 5000
 
 
 def _write_atomic(path, body: str) -> None:
@@ -86,6 +96,9 @@ def write_handover(cfg: Config, *, task_id: str, mode: str, model: str,
         "fork_session_id": fork_session_id,
     }
     _write_atomic(cfg.handover_file, json.dumps(record, indent=2))
+    # Every start and every finish is also appended to the log the ledger reads
+    # for its role stamps; handover.json itself is overwritten by the next fork.
+    append_log(cfg, record)
     return record
 
 
@@ -107,7 +120,70 @@ def finish_handover(cfg: Config, *, status: str, finished_at: str,
     if fork_session_id and not record.get("fork_session_id"):
         record["fork_session_id"] = fork_session_id
     _write_atomic(cfg.handover_file, json.dumps(record, indent=2))
+    append_log(cfg, record)
     return record
+
+
+def append_log(cfg: Config, record: dict) -> dict:
+    """Append one handover record to state/handover.log. Never raises.
+
+    Append-only and one JSON object per line, so a torn write costs the reader
+    one line rather than the file, and two processes writing at once interleave
+    whole lines rather than corrupting each other's.
+    """
+    from .models import utcnow
+
+    entry = {key: record.get(key) for key in HANDOVER_KEYS}
+    entry[LOG_KEY] = utcnow().isoformat()
+    try:
+        cfg.handover_log.parent.mkdir(parents=True, exist_ok=True)
+        with cfg.handover_log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+    return entry
+
+
+def read_log(cfg: Config, limit: int = LOG_MAX_LINES) -> list[dict]:
+    """Every handover record ever written, oldest first. [] when there is none.
+
+    A junk line is skipped rather than raising: this is read by the report,
+    which must never fail because one append was torn.
+    """
+    try:
+        lines = cfg.handover_log.read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError, AttributeError):
+        return []
+    out: list[dict] = []
+    for line in lines[-limit:]:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            out.append(entry)
+    return out
+
+
+def fork_models(cfg: Config) -> dict[str, str]:
+    """{fork session id: the model that fork actually ran on}.
+
+    Built from the log rather than from the graph, which is the whole point:
+    the graph says what the executive tier is configured to be *now*, while a
+    fork that ran two hours ago may have gone out on a fallback, or on the
+    model the operator has since replaced. The later record for a session id
+    wins, because the finish record is the one that knows the id.
+    """
+    models: dict[str, str] = {}
+    for entry in read_log(cfg):
+        sid = entry.get("fork_session_id")
+        model = str(entry.get("model") or "").strip()
+        if isinstance(sid, str) and sid and model:
+            models[sid] = model
+    return models
 
 
 def fork_active(cfg: Config) -> bool:

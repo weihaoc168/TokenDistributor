@@ -357,6 +357,84 @@ def _named_fields(patch: Any) -> dict[str, tuple[str, ...]]:
     return named
 
 
+def pinned_fields(cfg: Config) -> dict[str, tuple[str, ...]]:
+    """{tier: the fields state/graph.json names}, i.e. what config.json cannot set.
+
+    The override wins field by field (`read_graph_source`), so every field it
+    names is one that config.json can be edited forever without effect. That is
+    the single silent failure mode left in the reload path, and this is what
+    lets the loop, the CLI and the panel say so out loud.
+    """
+    return _named_fields(_override_payload(cfg))
+
+
+def pin_notes(cfg: Config, only: Any = None) -> list[str]:
+    """One line per pinned field, naming the value in force and how to undo it.
+
+    `only` restricts the list to an iterable of (tier, field) pairs - the loop
+    passes the fields config.json actually just changed, so a reload logs the
+    pins that ate that edit rather than every pin standing. With `only` left
+    as None every pin is named, which is what startup and `tracker.py graph`
+    print.
+    """
+    pins = pinned_fields(cfg)
+    if not pins:
+        return []
+    effective = read_graph(cfg)
+    wanted = None
+    if only is not None:
+        wanted = {(str(t), str(f)) for t, f in only}
+        if not wanted:
+            return []
+    notes: list[str] = []
+    for tier in TIERS:
+        for fieldname in pins.get(tier, ()):
+            if wanted is not None and (tier, fieldname) not in wanted:
+                continue
+            value = effective[tier].get(fieldname)
+            notes.append(
+                f"note: {SOURCE_OVERRIDE} pins {tier}.{fieldname}={value}; "
+                f"config.json's {tier}.{fieldname} is ignored "
+                f"(tracker.py graph set {tier}.{fieldname}=<value>, or delete "
+                f"that key from {SOURCE_OVERRIDE})")
+    return notes
+
+
+def config_fields(cfg: Config) -> dict[str, dict[str, Any]]:
+    """{tier: {field: value}} exactly as config.json's own graph section names it.
+
+    Raw and unnormalized on purpose: this is the *declaration*, not the graph
+    in force, and it is only ever compared with an earlier copy of itself to
+    tell which fields an edit to config.json actually touched.
+    """
+    raw = getattr(cfg, "graph", None)
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for tier in TIERS:
+        block = raw.get(tier)
+        if not isinstance(block, dict):
+            continue
+        named = {f: block[f] for f in TIER_FIELDS[tier] if f in block}
+        if named:
+            out[tier] = named
+    return out
+
+
+def changed_fields(before: Any, after: Any) -> list[tuple[str, str]]:
+    """The (tier, field) pairs whose config.json declaration changed."""
+    pairs: list[tuple[str, str]] = []
+    before = before if isinstance(before, dict) else {}
+    after = after if isinstance(after, dict) else {}
+    for tier in TIERS:
+        was = before.get(tier) if isinstance(before.get(tier), dict) else {}
+        now = after.get(tier) if isinstance(after.get(tier), dict) else {}
+        for fieldname in TIER_FIELDS[tier]:
+            if was.get(fieldname, _MISSING) != now.get(fieldname, _MISSING):
+                pairs.append((tier, fieldname))
+    return pairs
+
+
 def write_graph(cfg: Config, patch: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Persist ONLY the fields `patch` names, merged into the standing override.
 
@@ -731,6 +809,133 @@ def clear_limited(cfg: Config, model: Any = None) -> bool:
     except OSError:
         return False
     return True
+
+
+# ------------------------------------------------- the graph actually in use
+
+# Per tier: what is running now, what config asks for, whether they differ, and
+# whether state/graph.json pins the tier's model (config.json cannot move it).
+ACTIVE_FIELDS = ("model", "models", "configured", "fallback", "differs",
+                 "pinned")
+
+
+def _running_models(cfg: Config) -> list[str]:
+    """The distinct models the running worker rows actually launched on.
+
+    `model_used` is stamped by `Dispatcher.launch`, so it is the truth even
+    when the graph moved under the row - which is the whole point of asking
+    the rows rather than the config. The director fork's own row is skipped:
+    it is the executive tier, and the handover record answers for it.
+    """
+    from .handover import FORK_TASK_ID
+
+    try:
+        data = json.loads(cfg.tasks_file.read_text(encoding="utf-8"))
+        rows = data.get("tasks", []) if isinstance(data, dict) else []
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+    models: list[str] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or row.get("status") != "running":
+            continue
+        if row.get("id") == FORK_TASK_ID:
+            continue
+        model = str(row.get("model_used") or "").strip()
+        if model and model not in models:
+            models.append(model)
+    return models
+
+
+def configured_active(cfg: Config, block: dict[str, Any],
+                      limited: str | None) -> str:
+    """The model a tier would launch on right now with nothing running.
+
+    Its primary, or its fallback while state/limited.json names that primary -
+    the same rule `Dispatcher._while_limited` launches by, so the panel shows
+    what the next launch would pick rather than what the file declares.
+    """
+    primary = str(block.get("model") or "")
+    fallback = block.get("fallback")
+    if (primary and limited and limited == primary
+            and may_fall_back(primary, fallback, cfg)):
+        return str(fallback)
+    return primary
+
+
+def active_graph(cfg: Config, graph: dict[str, dict[str, Any]] | None = None,
+                 now: Any = None) -> dict[str, dict[str, Any]]:
+    """What each tier is running on RIGHT NOW, beside what the config asks for.
+
+    Read fresh, never cached, because every part of it moves on its own:
+
+        executive   the handover record's model while the fork is `started`
+                    (the fork may have been launched on a fallback, or before
+                    the operator edited the graph), else the configured model
+        workers     the distinct `model_used` of the running task rows, else
+                    the configured model
+        advisory    the configured model; the review lenses run inside the
+                    fork's own workflows, so no row here ever names them
+
+    "The configured model" always means `configured_active`: the primary, or
+    the tier's fallback while the primary is marked limited.
+
+    Each tier comes back as {model, models, configured, fallback, differs,
+    pinned}. `model` is the one to label the rung with, `models` every distinct
+    model behind it (a worker tier can be running two at once), `differs` says
+    the panel must also show the configured id - which is the only way an
+    operator can see that the fork is not on the model they just set - and
+    `pinned` says state/graph.json names that tier's model, so the "configured"
+    id is the override's and config.json's own is dead.
+    """
+    from .handover import STATUS_STARTED, read_handover
+
+    graph = read_graph(cfg) if graph is None else graph
+    limited = limited_model(cfg, now)
+    pins = pinned_fields(cfg)
+    blocks = dict(zip(TIERS, tiers_of(graph)))
+    out: dict[str, dict[str, Any]] = {}
+    record = read_handover(cfg)
+    fork_model = ""
+    if isinstance(record, dict) and record.get("status") == STATUS_STARTED:
+        fork_model = str(record.get("model") or "").strip()
+    running = _running_models(cfg)
+    for tier in TIERS:
+        block = blocks[tier]
+        configured = str(block.get("model") or "")
+        if tier == EXECUTIVE and fork_model:
+            models = [fork_model]
+        elif tier == WORKERS and running:
+            models = list(running)
+        else:
+            models = [configured_active(cfg, block, limited)]
+        out[tier] = {
+            "model": models[0],
+            "models": models,
+            # The primary the graph declares, never its fallback: a tier put on
+            # its fallback by a limit is exactly the case the panel has to make
+            # visible, not one it should hide by moving the goalposts.
+            "configured": configured,
+            "fallback": block.get("fallback"),
+            "differs": models[0] != configured,
+            # Only the model fields: a pinned worker *count* is the ordinary
+            # result of a tap on the panel's -/+ and marking every rung for it
+            # would say nothing. A pinned model is the one that makes an edit
+            # to config.json do nothing at all.
+            "pinned": bool(set(pins.get(tier, ())) & set(MODEL_FIELDS)),
+        }
+    return out
+
+
+def active_label(active: dict[str, dict[str, Any]]) -> str:
+    """One line naming every tier whose live model is not the configured one."""
+    parts = []
+    for tier in TIERS:
+        row = active.get(tier) if isinstance(active, dict) else None
+        if not isinstance(row, dict) or not row.get("differs"):
+            continue
+        parts.append(f"{tier} {short_model(row.get('model'))} "
+                     f"(cfg {short_model(row.get('configured'))})")
+    return "; ".join(parts)
 
 
 def migrate_config_file(cfg: Config) -> bool:

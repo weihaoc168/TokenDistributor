@@ -87,6 +87,73 @@ def _fork_prompt(cfg: Config) -> str:
     return text
 
 
+def _fork_model(cfg: Config) -> str | None:
+    """The executive tier's model, which is what the director fork runs on.
+
+    The graph first and `throttle_model` only under it: `apply_graph` derives
+    the scalar from the graph every poll, but a bare CLI Config never runs that
+    derivation, and the graph is the thing an operator edits.
+    """
+    from .graph import EXECUTIVE, read_graph
+
+    tier = str(read_graph(cfg)[EXECUTIVE].get("model") or "")
+    return tier or (cfg.throttle_model or None)
+
+
+def _refresh_fork_spec(cfg: Config, task: TaskSpec) -> bool:
+    """Point the fork row at the graph, brief and session in force right now.
+
+    Returns True when anything changed. Run before every launch, not only on a
+    re-arm: the row can sit `pending` for polls behind the concurrency budget
+    or the cooldown, config.json is re-read on every one of those polls, and a
+    row armed on the old executive model would otherwise launch on it. That is
+    the failure of 2026-09-03 19:48 UTC, one layer down from the reload.
+    """
+    before = (task.model, task.prompt, task.resume_session)
+    task.model = _fork_model(cfg)
+    task.prompt = _fork_prompt(cfg)
+    task.resume_session = cfg.main_session_ids[0]
+    return before != (task.model, task.prompt, task.resume_session)
+
+
+def _reload_config(cfg: Config) -> list[str]:
+    """Re-read config.json when it changed on disk; returns what to log.
+
+    Called at the top of every tick, so an edit to the agentic graph takes
+    effect on the next poll instead of at the next restart. The graph is named
+    before and after because that is the change that actually matters: the
+    override in state/graph.json carries only the fields it was given (usually
+    the worker count), so config.json is where the models come from.
+
+    Except for the fields the override *does* name. state/graph.json wins field
+    by field, so an executive model edited in config.json while the override
+    pins that field is read, applied to `cfg.graph`, and then ignored by every
+    reader - and the "graph changed" line above compares the merged graph with
+    itself, so it says nothing. Those pins are named here, once per reload that
+    touched one, because a reload that changes nothing is otherwise silent.
+    """
+    from .config import reload_config
+    from .graph import (
+        changed_fields,
+        config_fields,
+        overlay_label,
+        pin_notes,
+        read_graph,
+    )
+
+    before = overlay_label(read_graph(cfg))
+    declared = config_fields(cfg)
+    changed = reload_config(cfg)
+    if changed is None:
+        return []
+    lines = [f"config reloaded: {', '.join(changed) or 'no field changed'}"]
+    after = overlay_label(read_graph(cfg))
+    if after != before:
+        lines.append(f"graph changed: {before} -> {after}")
+    lines += pin_notes(cfg, changed_fields(declared, config_fields(cfg)))
+    return lines
+
+
 def _fork_cooldown(cfg: Config) -> float:
     try:
         return max(0.0, float(getattr(cfg, "fork_cooldown_seconds",
@@ -163,7 +230,7 @@ def _ensure_throttle_task(cfg: Config, dispatcher: Dispatcher, now=None) -> None
             prompt=_fork_prompt(cfg),
             cwd=str(Path.home()),
             weight="heavy",
-            model=cfg.throttle_model or None,
+            model=_fork_model(cfg),
             priority=100,
             max_minutes=240,
             resume_session=cfg.main_session_ids[0],
@@ -174,11 +241,13 @@ def _ensure_throttle_task(cfg: Config, dispatcher: Dispatcher, now=None) -> None
         # The stored spec may predate a config change (main session handover,
         # executive model directive, a rewritten brief); refresh it before
         # every relaunch.
-        task.model = cfg.throttle_model or None
-        task.prompt = _fork_prompt(cfg)
-        task.resume_session = cfg.main_session_ids[0]
+        _refresh_fork_spec(cfg, task)
         dispatcher.set_status(THROTTLE_TASK_ID, "pending")
-    # pending or running: the handover already stands, nothing to re-arm.
+    elif task.status == "pending" and _refresh_fork_spec(cfg, task):
+        # Armed on an earlier tick and still waiting to start: config.json may
+        # have been edited since, and this tick's launch batch is about to run.
+        dispatcher.save()
+    # running: the handover already stands, nothing to re-arm.
 
 
 def _bar(frac: float) -> str:
@@ -239,7 +308,7 @@ def _tick(
 ) -> tuple[Decision, list[str], Exception | None, "object | None", bool]:
     from .activity import detect_activity
     from .graph import apply_graph
-    from .ledger import maybe_report
+    from .ledger import maybe_refresh_tiers, maybe_report
     from .scheduler import decide, decide_local, normalize, pacing
     from .usage import (
         UsageFetchError,
@@ -250,10 +319,16 @@ def _tick(
     )
 
     now = utcnow()
-    # The graph is re-derived every poll, not once at startup: the overlay's
-    # worker -/+ writes state/graph.json, and this is what turns that click
-    # into the concurrency the scheduler reads a few lines below.
+    # config.json is re-read every poll, before anything reads a value off the
+    # Config: an edited graph must reach this tick's fork launch, not the next
+    # restart. The graph is then re-derived (the overlay's worker -/+ writes
+    # state/graph.json) into the concurrency the scheduler reads below.
+    notes = _reload_config(cfg)
     apply_graph(cfg)
+    # The panel's token-share bars, rebuilt off-thread when they are due.
+    tiers_note = maybe_refresh_tiers(cfg, now)
+    if tiers_note is not None:
+        notes.append(tiers_note)
     own_dirs = dispatcher.own_project_dirs()
     # The fork's status before this tick's reap; a running -> done transition
     # is what the milestone trigger watches for.
@@ -281,7 +356,7 @@ def _tick(
         activity = detect_activity(cfg, own_dirs, now)
         decision.local_concurrency = decide_local(decision, activity, cfg, now)
         decision = gate_decision(decision, control)
-        actions = dispatcher.apply(decision, now)
+        actions = notes + dispatcher.apply(decision, now)
         report_line = maybe_report(cfg, dispatcher, before=fork_state,
                                    control=control, stop=read_stop(cfg), now=now)
         if report_line is not None:
@@ -336,7 +411,7 @@ def _tick(
     # Operator STOP is the last word: it zeroes both launch budgets, so apply()
     # reaps and adopts as usual but starts nothing new.
     decision = gate_decision(decision, control)
-    actions = dispatcher.apply(decision, now)
+    actions = notes + dispatcher.apply(decision, now)
     if goal_line is not None:
         actions.insert(0, goal_line)
     # Report triggers run after the reap, so a fork that finished on this very
@@ -410,6 +485,7 @@ def _run_loop(cfg: Config, once: bool) -> int:
         known_models,
         override_warning,
         overlay_label,
+        pin_notes,
         read_graph_source,
         validate_graph,
     )
@@ -424,6 +500,11 @@ def _run_loop(cfg: Config, once: bool) -> int:
     ignored = override_warning(cfg)
     if ignored:
         print(ignored)
+    # Every field the override pins, named at startup: those are the fields an
+    # edit to config.json can never move, and the config re-read below would
+    # otherwise report "config reloaded: graph" for an edit that did nothing.
+    for note in pin_notes(cfg):
+        print(note)
     # A warning, not a refusal: an unknown id is usually a new model, and a
     # graph that breaks the superiority rule still has to run.
     for warning in validate_graph(graph, known_models(cfg), cfg):
@@ -485,7 +566,8 @@ def _run_loop(cfg: Config, once: bool) -> int:
 
 
 def cmd_status(cfg: Config) -> int:
-    from .ledger import report_status_line
+    from .graph import active_graph, active_label
+    from .ledger import report_status_line, tiers_status_line
     from .scheduler import pacing
     from .usage import UsageFetchError, fetch_usage
 
@@ -498,6 +580,7 @@ def cmd_status(cfg: Config) -> int:
         if fork_line is not None:
             print(fork_line)
         print(report_status_line(cfg))
+        print(tiers_status_line(cfg))
         if cfg.state_file.exists():
             state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
             print(f"last known state from {state.get('at')}:")
@@ -530,6 +613,14 @@ def cmd_status(cfg: Config) -> int:
     # The work-distribution report the overlay's VIEW REPORT button opens; the
     # monitor session reads its freshness and trigger from here.
     print(report_status_line(cfg))
+    # The same split the panel's ladder bars draw: where the window's input and
+    # output tokens went, per tier of the agentic graph.
+    print(tiers_status_line(cfg))
+    # What each tier is running on right now against what config.json asks for;
+    # printed only when they differ, which is the only time it is news.
+    active = active_label(active_graph(cfg))
+    if active:
+        print(f"active vs configured: {active}")
 
     if cfg.state_file.exists():
         state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
@@ -616,6 +707,7 @@ def cmd_graph(cfg: Config, assignments: list[str] | None,
         order_warnings,
         override_warning,
         parse_assignments,
+        pin_notes,
         read_graph_source,
         validate_graph,
         write_graph,
@@ -655,6 +747,11 @@ def cmd_graph(cfg: Config, assignments: list[str] | None,
         print(ignored)
     for line in format_tiers(graph):
         print(line)
+    # Which of those numbers config.json no longer answers for. Printed on the
+    # read path as well as after a `set`, because "I edited config.json and
+    # nothing happened" is answered here or nowhere.
+    for note in pin_notes(cfg):
+        print(note)
     for warning in validate_graph(graph, known_models(cfg), cfg):
         print(warning)
     print(f"fork prompt line: {graph_line(graph)}")

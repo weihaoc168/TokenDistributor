@@ -389,6 +389,12 @@
     </div>
   </section>
 
+  <section class="band" aria-labelledby="roles-h">
+    <h2 id="roles-h">Roles</h2>
+    <p class="sub">Every turn on this page carries the role of the transcript that produced it &mdash; the main session, a forked director session, or a Workflow agent &mdash; and the model it actually ran on. Tiers follow that role, not the model id: a fork that ran on a model now sitting at the worker tier was still the director while it ran, and is flagged <strong class="kicker">role-tiered</strong> where it appears.</p>
+    <div class="scroll-x" id="roles-table"></div>
+  </section>
+
   <section class="band" aria-labelledby="cost-h">
     <h2 id="cost-h">What it cost</h2>
     <p class="sub">The same turns, billed at the models' published list prices instead of the weighted proxy. Every figure below comes from the transcripts' own usage records multiplied by a price with a source and a date behind it; a model nothing prices is shown as <span class="tag-unpriced">unpriced</span> rather than billed at a guess.</p>
@@ -538,6 +544,12 @@
         <p style="padding-top:8px">USD per 1M tokens, per model, with the source each figure was read from and the date it was read. Five figures per model, because the two cache-write durations are two published prices. Nothing here is inferred from a neighbouring model: a model missing any of the five is billed at nothing and reported as unpriced.</p>
         <div class="price-list" id="pricing-used" style="padding-top:12px"></div>
       </div>
+      <div>
+        <h3>Graph in force</h3>
+        <p style="padding-top:8px">The agentic graph exactly as it stood when this page was generated: the model, the fallback under it and the headcount at each tier. It is recorded here because the graph moves &mdash; a page read next week must not be reinterpreted against next week's tiers.</p>
+        <ul class="list" id="graph-in-force" style="padding-top:10px"></ul>
+      </div>
+
       <div>
         <h3>Sources</h3>
         <ul class="list" id="sources" style="padding-top:10px">
@@ -817,7 +829,9 @@ const DATA = __DATA__;
     return raw.map(function (r) {
       if (!r || typeof r !== "object") return null;
       return {
-        source: pick(r, ["source", "src", "origin"]),
+        role: pick(r, ["role", "source", "src", "origin"]),
+        role_tiered: r.role_tiered === true,
+        model: pick(r, ["model"]),
         id: pick(r, ["id_or_label", "id", "label", "name"]),
         what: pick(r, ["what", "description", "detail", "note"]),
         output: pickNum(r, ["fable_output", "output", "output_tokens"]),
@@ -1736,6 +1750,77 @@ const DATA = __DATA__;
     host.appendChild(tbl);
   }
 
+  /* ---------------------------------------------------------- roles table */
+
+  function drawRoles() {
+    var rows = Array.isArray(D.by_role) ? D.by_role : [];
+    var host = byId("roles-table");
+    if (!rows.length) {
+      host.appendChild(el("p", "caption", "n/a — no by_role in the source file."));
+      return;
+    }
+    var tbl = el("table");
+    var thead = el("thead"), hr = el("tr");
+    [["Role", null], ["Model", null], ["Turns", "n"], ["Output M", "n"],
+     ["Weighted M", "n"], ["Cost", "n"]]
+      .forEach(function (c) { hr.appendChild(el("th", c[1], c[0])); });
+    thead.appendChild(hr); tbl.appendChild(thead);
+    var tb = el("tbody");
+    var turns = 0, out = 0, usd = 0;
+    rows.forEach(function (r) {
+      if (!r || typeof r !== "object") return;
+      var tr = el("tr");
+      tr.appendChild(el("td", null, txt(r.role)));
+      var tdm = el("td", "id");
+      var dot = el("span", "pill pill--sm");
+      dot.style.borderColor = modelColor(r.model);
+      dot.appendChild(el("span", "dot"));
+      dot.appendChild(document.createTextNode(txt(r.model)));
+      tdm.appendChild(dot);
+      tr.appendChild(tdm);
+      var t = num(r.turns), o = num(r.output), w = num(r.weighted), c = num(r.cost_usd);
+      if (t !== null) turns += t;
+      if (o !== null) out += o;
+      if (c !== null) usd += c;
+      tr.appendChild(el("td", "n", t === null ? "n/a" : fmtInt(t)));
+      tr.appendChild(el("td", "n", o === null ? "n/a" : fmtTok(o)));
+      tr.appendChild(el("td", "n", w === null ? "n/a" : fmtTok(w)));
+      var tdc = el("td", "n");
+      if (c === null) { tdc.appendChild(el("span", "tag-unpriced", UNPRICED)); }
+      else { tdc.textContent = fmtUsd(c); }
+      tr.appendChild(tdc);
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    tbl.appendChild(el("caption", null,
+      rows.length + " role/model pair(s): " + fmtInt(turns) + " turns, "
+      + fmtTok(out) + " output tokens, " + fmtUsd(usd) + " priced."));
+    host.appendChild(tbl);
+  }
+
+  function drawGraphInForce() {
+    var host = byId("graph-in-force");
+    var graph = D.graph_in_force;
+    if (!graph || typeof graph !== "object") {
+      host.appendChild(el("li", null, "n/a — no graph_in_force in the source file."));
+      return;
+    }
+    ["executive", "advisory", "workers"].forEach(function (tier, i) {
+      var block = graph[tier];
+      if (!block || typeof block !== "object") return;
+      var li = el("li");
+      li.appendChild(el("span", "marker", String(i + 1)));
+      var count = num(block.count);
+      var surge = num(block.surge_count);
+      var text = tier + ": " + txt(block.model)
+        + (block.fallback ? " (fallback " + block.fallback + ")" : " (no fallback)")
+        + (count === null ? "" : " ×" + count)
+        + (surge === null ? "" : ", surge ×" + surge);
+      li.appendChild(el("span", null, text));
+      host.appendChild(li);
+    });
+  }
+
   /* --------------------------------------------------------- ledger table */
 
   function drawLedger() {
@@ -1747,7 +1832,7 @@ const DATA = __DATA__;
     }
     var tbl = el("table");
     var thead = el("thead"), hr = el("tr");
-    [["#", "n"], ["Source", null], ["ID / label", null], ["What", null],
+    [["#", "n"], ["Role", null], ["ID / label", null], ["What", null],
      ["Output M", "n"], ["Cache read M", "n"], ["Weighted M", "n"], ["Verdict", null]]
       .forEach(function (c) { hr.appendChild(el("th", c[1], c[0])); });
     thead.appendChild(hr); tbl.appendChild(thead);
@@ -1755,7 +1840,12 @@ const DATA = __DATA__;
     rows.forEach(function (r, i) {
       var tr = el("tr");
       tr.appendChild(el("td", "n", String(i + 1)));
-      tr.appendChild(el("td", null, txt(r.source)));
+      var tdr = el("td", null, txt(r.role));
+      if (r.role_tiered) {
+        tdr.appendChild(document.createTextNode(" "));
+        tdr.appendChild(el("span", "tag-unpriced", "role-tiered"));
+      }
+      tr.appendChild(tdr);
       tr.appendChild(el("td", "id", txt(r.id)));
       tr.appendChild(el("td", "what", txt(r.what)));
       tr.appendChild(el("td", "n", r.output === null ? "n/a" : fmtTok(r.output)));
@@ -1943,6 +2033,8 @@ const DATA = __DATA__;
     });
   }
 
+  try { drawRoles(); } catch (e) { console.error("roles", e); }
+  try { drawGraphInForce(); } catch (e) { console.error("graph in force", e); }
   try { drawCost(); } catch (e) { console.error("cost section", e); }
   try { drawUtil(); } catch (e) { console.error("util chart", e); }
   try { drawTiers(); } catch (e) { console.error("tier chart", e); try { drawTotals(); } catch (e2) {} }

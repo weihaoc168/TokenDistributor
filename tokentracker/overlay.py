@@ -8,7 +8,7 @@ import tkinter.font as tkfont
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import Config
+from .config import Config, reload_config
 from .control import RUNNING as CONTROL_RUNNING
 from .control import STOPPED as CONTROL_STOPPED
 from .control import read_control, write_control
@@ -18,6 +18,7 @@ from .graph import (
     COUNT_MIN,
     TIERS,
     WORKERS,
+    active_graph,
     limited_model,
     read_graph,
     short_model,
@@ -25,7 +26,14 @@ from .graph import (
     write_graph,
 )
 from .handover import fork_active
-from .ledger import generate_async, latest_report, open_report, report_age
+from .ledger import (
+    generate_async,
+    latest_report,
+    open_report,
+    read_tiers,
+    report_age,
+    tier_shares,
+)
 from .models import parse_iso, utcnow
 
 TRANSPARENT = "#010203"
@@ -48,6 +56,10 @@ FONT_BIG = ("Segoe UI", 11, "bold")
 FONT = ("Segoe UI", 9)
 FONT_BOLD = ("Segoe UI", 9, "bold")
 FONT_SMALL = ("Segoe UI", 8)
+# The ladder's share labels ("in 62%", "out 9%"): monospaced, so the digits sit
+# in the same column down all six of them and the percentages can be compared
+# by eye rather than read one at a time.
+FONT_MONO = ("Consolas", 7)
 FABLE_HINTS = ("fable", "mythos")
 WEEK_HOURS_F = 168.0
 FIVE_HOURS_F = 5.0
@@ -78,31 +90,55 @@ CTL_BTN_GAP = 8
 GOAL_ROW_H = 24
 GOAL_STEP_BTN_W = 26
 # AGENTIC GRAPH ladder: one rung per tier, top to bottom (executive, advisory,
-# workers), each a bar whose width is that tier's headcount, hung off a thin
-# spine on the left - so the shape itself says "narrow at the top, widest at
-# the workers". It replaces the old one-line GRAPH row, which said the same
-# three model ids and counts in text and clipped them to fit.
+# workers), hung off a thin spine on the left. Each rung is a text line - tier,
+# the model ACTUALLY in use, the headcount - over two thin bars carrying that
+# tier's share of the window's input and output tokens.
+#
+# The bars used to be the headcount, which the "xN" column already says; what
+# they say now is the thing no column could, namely where the tokens actually
+# went. The data comes from state/tiers.json, written by the loop, so a refresh
+# draws a frame without parsing a transcript.
 LADDER_LABEL_H = 15
-LADDER_RUNG_H = 20
+LADDER_RUNG_H = 36
 LADDER_RUNG_GAP = 3
 LADDER_SPINE_X = 1
 LADDER_SPINE_W = 2
 LADDER_BAR_X = 4
-# The bar is a thin band *under* each rung's text rather than a block behind
+# The bars are thin bands *under* each rung's text rather than blocks behind
 # it: a block wide enough to mean something has its right edge somewhere in
 # the middle of the row, and that edge cuts the tier name in half.
 LADDER_TEXT_H = 12
-LADDER_BAND_Y = 13
+# First band's top, then the centre-to-centre step down to the second. Both are
+# set by the share labels beside them, not by the bands: a label is three times
+# the height of the 4px band it annotates, and two of them plus the bold "xN"
+# above have to clear each other at every DPI.
+LADDER_BAND_Y = 17
+LADDER_BAND_ROW = 10
 LADDER_BAND_H = 4
-# A tier of one must still be a bar, not a hairline.
-LADDER_BAR_MIN = 10
 LADDER_BAR_RADIUS = 2
 LADDER_TEXT_PAD = 6
-# The dimmed "->fallback" after a rung's model, and the red LIMITED tag beside
-# its count, both live inside the rung's existing text line - the ladder's
-# height is unchanged. Narrower than this and the fallback label is dropped
-# rather than ellipsised.
-LADDER_FALLBACK_MIN_W = 26
+# A share bar's track must stay a bar even in the narrowest card.
+LADDER_BAR_MIN = 10
+# The "active vs configured" line under the ladder, drawn only while some tier
+# is running on something other than the model config.json names.
+LADDER_NOTE_H = 14
+# The dimmed "->fallback" (or "cfg <model>") after a rung's model, and the red
+# limited tag beside its count, both live inside the rung's existing text line -
+# the ladder's height is unchanged. Neither suffix is ever ellipsised: it is
+# drawn whole or not at all, because "cfg fab..." names no model. When the tag
+# and a cfg suffix cannot both fit, the model column slides left and then the
+# tag shortens to LIMITED_SHORT; the suffix is the last thing to go.
+LIMITED_TAG = "LIMITED"
+LIMITED_SHORT = "LIM"
+# The narrowest form of the tag: a red dot beside the count, worth about a
+# fifth of the word. Drawn only when the word and "LIM" would both cost the
+# configured id its place on the rung.
+LIMITED_DOT = "dot"
+LADDER_LIMIT_DOT_R = 2.5
+# The dot marking a rung whose model state/graph.json pins, and the width it
+# takes out of the model column.
+LADDER_PIN_W = 7
+LADDER_PIN_R = 2.0
 # The -/+ taps on the worker count, in a gutter every rung reserves so the
 # "xN" column lands on the same x down all three.
 LADDER_STEP_W = 17
@@ -439,6 +475,8 @@ class Overlay:
         self._stop = read_stop(cfg)
         self._fork = fork_active(cfg)
         self._graph = read_graph(cfg)
+        self._active = active_graph(cfg, self._graph)
+        self._shares = tier_shares(read_tiers(cfg))
         self._limited = limited_model(cfg)
         self._report = latest_report(cfg)
         self._report_age = report_age(cfg)
@@ -484,6 +522,10 @@ class Overlay:
         self._font = tkfont.Font(family="Segoe UI", size=9)
         self._font_bold = tkfont.Font(family="Segoe UI", size=9, weight="bold")
         self._font_small = tkfont.Font(family="Segoe UI", size=8)
+        # Measured, not assumed: the share labels reserve their own column out
+        # of the bar span, and a proportional font would make that column a
+        # different width on every rung.
+        self._font_mono = tkfont.Font(family=FONT_MONO[0], size=FONT_MONO[1])
 
         for widget in (self.root, self.canvas):
             widget.bind("<ButtonPress-1>", self._drag_start)
@@ -846,58 +888,146 @@ class Overlay:
     def _click_graph_plus(self, _event: tk.Event) -> str:
         return self._step_workers(1)
 
+    def _active_note(self) -> str | None:
+        """"active vs configured: ..." while a tier is off its configured model.
+
+        None the rest of the time: when every tier is running what config.json
+        says, the note is noise, and the rungs already carry the models.
+        """
+        parts = []
+        for tier in TIERS:
+            row = self._active.get(tier) if isinstance(self._active, dict) else None
+            if not isinstance(row, dict) or not row.get("differs"):
+                continue
+            parts.append(f"{tier} {short_model(row.get('model'))} "
+                         f"(cfg {short_model(row.get('configured'))})")
+        return "active vs configured: " + "; ".join(parts) if parts else None
+
     def _ladder_height(self) -> int:
         """What `_draw_graph_ladder` will occupy, so the card can grow for it."""
         P = self._px
-        return (P(LADDER_LABEL_H) + 3 * P(LADDER_RUNG_H)
-                + 2 * P(LADDER_RUNG_GAP))
+        note = (self._text_row(LADDER_NOTE_H, self._font_small)
+                if self._active_note() else 0)
+        rung = max(P(LADDER_RUNG_H), self._share_geometry()[2])
+        return (self._text_row(LADDER_LABEL_H, self._font_small) + 3 * rung
+                + 2 * P(LADDER_RUNG_GAP) + note)
 
-    def _draw_graph_ladder(self, x0: float, y0: float, x1: float) -> None:
-        """The AGENTIC GRAPH ladder chart: a rung per tier, widest at workers.
+    def _text_row(self, design: float, font: tkfont.Font) -> int:
+        """A row at least one line of `font` tall, whatever the DPI.
 
-        Each rung is a label line - tier name left, short model id centred,
-        "xN" right-aligned - with a thin bar under it whose width is that
-        tier's headcount, and all three bars hang off one spine on the left,
-        so the configured graph reads as a shape before it reads as numbers.
-        The worker rung is the emphasis (it is the only count the panel can
-        change) and carries its surge budget as a ghost extension behind the
-        solid bar, out to `surge_count`.
+        Design pixels scale by the DPI factor and text by the font's own
+        scaling, and past about 1.5x the second outgrows the first: a row
+        sized only in design pixels starts printing over its neighbour.
+        """
+        return max(self._px(design), font.metrics("linespace") + self._px(2))
 
-        The bar is under the text rather than behind it on purpose: a bar wide
-        enough to mean anything ends somewhere in the middle of the row, and
-        that edge lands in the middle of a word.
+    def _share_geometry(self) -> tuple[float, float, int]:
+        """(centre of the input bar, centre of the output bar, rung height).
 
-        The three "xN" share one right edge, which is what lets the counts be
-        compared down the rungs instead of read one at a time.
-
-        Replaces the old textual GRAPH row - it carried the same three ids and
-        counts in one clipped line - and keeps its -/+ taps, now sitting on
-        the worker rung itself.
+        Offsets from the top of a rung, measured from the fonts rather than
+        assumed. The share labels are the tallest things in a rung - three
+        times the height of the 4px band each annotates - and text grows with
+        the display's DPI faster than design pixels do, so fixed offsets let
+        the two labels touch at 1.5x and print over the bold "xN" at 2x.
         """
         P = self._px
-        rung_h = P(LADDER_RUNG_H)
+        mono = self._font_mono.metrics("linespace")
+        text_row = self._text_row(LADDER_TEXT_H, self._font_bold)
+        first = max(P(LADDER_BAND_Y) + P(LADDER_BAND_H) / 2,
+                    text_row + mono / 2)
+        second = first + max(P(LADDER_BAND_ROW), mono + P(2))
+        return first, second, max(P(LADDER_RUNG_H),
+                                  int(second + mono / 2 + P(2)))
+
+    def _draw_share_bars(self, tier: str, bar_x: float, ry0: float,
+                         right: float, emphasis: bool) -> None:
+        """The two token-share bars under one rung: input, then output.
+
+        Width is the tier's share of the window's tokens, not its headcount -
+        the "xN" column already says the headcount, and it was never the
+        question anyone brought to this panel. Input is everything the tier
+        read (input + cache creation + cache read) in blue, output what it
+        produced in green, each labelled with its own percentage in a
+        monospaced right-aligned column so the six figures line up.
+
+        Every bar draws its track first, so an empty window is three pairs of
+        visible 0% bars rather than three blank rows.
+        """
+        P = self._px
+        band_h = max(2, P(LADDER_BAND_H))
+        radius = self._pxf(LADDER_BAR_RADIUS)
+        share = self._shares.get(tier, {})
+        label_w = self._font_mono.measure("out 100%")
+        span = max(right - P(LADDER_TEXT_PAD) - label_w - bar_x,
+                   P(LADDER_BAR_MIN))
+        centres = self._share_geometry()[:2]
+        for centre, (kind, key, color) in zip(
+                centres,
+                (("in", "input_share", BLUE), ("out", "output_share", GREEN))):
+            value = float(share.get(key, 0.0) or 0.0)
+            value = min(max(value, 0.0), 1.0)
+            top = ry0 + centre - band_h / 2
+            self._round_rect(bar_x, top, bar_x + span, top + band_h, radius,
+                             fill=TRACK, outline="",
+                             tags=("ladder", f"track_{kind}_{tier}"))
+            if value > 0:
+                self._round_rect(bar_x, top, bar_x + span * value,
+                                 top + band_h, radius, fill=color, outline="",
+                                 tags=("ladder", f"rung_{kind}_{tier}"))
+            self.canvas.create_text(
+                right, ry0 + centre, text=f"{kind} {value:.0%}",
+                font=FONT_MONO, anchor="e", fill=color if emphasis else DIM,
+                tags=("ladder", f"share_{kind}_{tier}"))
+
+    def _draw_graph_ladder(self, x0: float, y0: float, x1: float) -> None:
+        """The AGENTIC GRAPH ladder chart: a rung per tier, top to bottom.
+
+        Each rung is a label line - tier name left, the model that tier is
+        ACTUALLY running on next to it, "xN" right-aligned - over two thin
+        bars carrying that tier's share of the window's input and output
+        tokens, and all three hang off one spine on the left.
+
+        The model shown is the live one, re-derived every refresh: the fork's
+        handover record for the executive, the running rows' `model_used` for
+        the workers, the configured model (or its fallback while limited) for
+        the advisory lenses. When it is not what config.json asks for, the
+        configured id follows it dimmed as "cfg <model>" and the ladder grows
+        a one-line note - which is the only way to see, from the panel, that
+        the fork is still running on yesterday's executive model. A dot in
+        front of the model id marks a tier whose model state/graph.json pins,
+        i.e. one config.json can be edited for without any effect at all.
+
+        The bars are under the text rather than behind it on purpose: a bar
+        wide enough to mean anything ends somewhere in the middle of the row,
+        and that edge lands in the middle of a word.
+
+        The three "xN" share one right edge, and so do the six share labels,
+        which is what lets them be compared down the rungs instead of read one
+        at a time.
+        """
+        P = self._px
+        rung_h = max(P(LADDER_RUNG_H), self._share_geometry()[2])
         gap = P(LADDER_RUNG_GAP)
-        top = y0 + P(LADDER_LABEL_H)
+        label_h = self._text_row(LADDER_LABEL_H, self._font_small)
+        # The rung's own text line, sized to the tallest font on it (the bold
+        # "xN"), so a tier name can never overhang the rung above.
+        text_row = self._text_row(LADDER_TEXT_H, self._font_bold)
+        top = y0 + label_h
         bar_x = x0 + P(LADDER_BAR_X)
         step_w = P(LADDER_STEP_W)
         gutter = 2 * step_w + P(LADDER_STEP_GAP)
         num_x = x1 - gutter - P(LADDER_TEXT_PAD)
-        span = max(num_x - bar_x, P(LADDER_BAR_MIN))
-        band_h = max(2, P(LADDER_BAND_H))
         blocks = dict(zip(TIERS, tiers_of(self._graph)))
         workers = blocks[WORKERS]
         surge = int(workers.get("surge_count", workers["count"]))
-        # One scale for all three rungs, taking the surge in: the ghost is the
-        # widest thing drawn, so it is what has to fit inside `span`.
-        scale = max(surge, *(int(b["count"]) for b in blocks.values()), 1)
 
-        self.canvas.create_text(x0, y0 + P(LADDER_LABEL_H) / 2,
+        self.canvas.create_text(x0, y0 + label_h / 2,
                                 text="AGENTIC GRAPH", font=FONT_SMALL,
                                 fill=DIM, anchor="w", tags="ladder")
         if surge > int(workers["count"]):
             # The surge budget has no column of its own (a second number would
-            # break the xN alignment); the ghost bar shows it, this names it.
-            self.canvas.create_text(x1, y0 + P(LADDER_LABEL_H) / 2,
+            # break the xN alignment), so the label names it.
+            self.canvas.create_text(x1, y0 + label_h / 2,
                                     text=f"surge x{surge}", font=FONT_SMALL,
                                     fill=DIM, anchor="e", tags="ladder")
 
@@ -907,8 +1037,7 @@ class Overlay:
             is_workers = tier == WORKERS
             ry0 = top + i * (rung_h + gap)
             ry1 = ry0 + rung_h
-            mid = ry0 + P(LADDER_TEXT_H) / 2
-            band_y = ry0 + P(LADDER_BAND_Y)
+            mid = ry0 + text_row / 2
             # The spine, drawn a segment at a time so the worker tier's own
             # stretch of it can carry the emphasis colour.
             spine_x = x0 + P(LADDER_SPINE_X)
@@ -918,17 +1047,7 @@ class Overlay:
                 fill=BLUE if is_workers else BORDER, outline="",
                 tags="ladder_spine")
 
-            solid_w = max(P(LADDER_BAR_MIN), span * count / scale)
-            if is_workers and surge > count:
-                ghost_w = max(solid_w, span * surge / scale)
-                self._round_rect(bar_x, band_y, bar_x + ghost_w,
-                                 band_y + band_h,
-                                 self._pxf(LADDER_BAR_RADIUS), fill=BORDER,
-                                 outline="", tags=("ladder", "ladder_ghost"))
-            self._round_rect(bar_x, band_y, bar_x + solid_w, band_y + band_h,
-                             self._pxf(LADDER_BAR_RADIUS),
-                             fill=BLUE if is_workers else DIM, outline="",
-                             tags=("ladder", f"rung_{tier}"))
+            self._draw_share_bars(tier, bar_x, ry0, num_x, is_workers)
 
             name = tier.upper()
             name_x = bar_x + P(LADDER_TEXT_PAD)
@@ -943,56 +1062,142 @@ class Overlay:
             # up down the rungs the way the counts do - but never left of the
             # tier name, which is wider at some DPIs than at others.
             left = name_x + self._font_small.measure(name)
-            right = num_x - self._font_bold.measure(counts)
-            # "LIMITED" takes its space out of the model column rather than
-            # overprinting it: the model label below is fitted to what is left.
+            count_left = num_x - self._font_bold.measure(counts)
+            # Whether THIS rung's own primary is the model marked limited; the
+            # tag it draws takes its width out of the model column below rather
+            # than overprinting it.
             limited = bool(self._limited and self._limited == block["model"])
-            if limited:
-                tag = "LIMITED"
-                self.canvas.create_text(right - P(4), mid, text=tag,
-                                        font=FONT_SMALL, fill=RED, anchor="e",
-                                        tags=("ladder", f"limited_{tier}"))
-                right -= self._font_small.measure(tag) + P(6)
             # One shared column for all three model ids, so they can be read
             # down the rungs the way the counts are - placed as far left as the
             # longest tier name allows rather than at mid-span, because the
             # dimmed "->fallback" that follows needs the width that buys.
             label_w = max(self._font_small.measure(t.upper()) for t in TIERS)
+            floor_x = left + P(LADDER_TEXT_PAD)
             model_x = min(bar_x + (num_x - bar_x) / 2,
                           name_x + label_w + P(LADDER_TEXT_PAD))
-            model_x = max(model_x, left + P(LADDER_TEXT_PAD))
-            model = self._fit(short_model(block["model"]), self._font_small,
-                              (right - model_x) - P(LADDER_TEXT_PAD))
+            model_x = max(model_x, floor_x)
+            # The model in use, not the model configured. They are the same
+            # thing most of the time and the difference is exactly what an
+            # operator needs to see when they are not.
+            active = self._active.get(tier) if isinstance(self._active, dict) else None
+            active = active if isinstance(active, dict) else {}
+            running = active.get("models") or [block["model"]]
+            text = short_model(active.get("model") or block["model"])
+            if len(running) > 1:
+                # Two models running in one tier: the rung names the first and
+                # counts the rest rather than clipping a list nobody can read.
+                text += f" +{len(running) - 1}"
+            # After the model, dimmed: the configured id when the live one is
+            # not it ("opus-5  cfg fable-5-1"), otherwise the tier's fallback,
+            # which is where this rung goes when its model is limited
+            # ("fable-5-1 ->fable-5"). One suffix, because two would not fit
+            # and the first is always the more urgent of the two.
+            fallback = block.get("fallback")
+            differs = bool(active.get("differs"))
+            suffix = (f"cfg {short_model(active.get('configured'))}" if differs
+                      else (f"->{short_model(fallback)}" if fallback else ""))
+            # A dot before the model id when state/graph.json pins that tier's
+            # model: config.json's own model for it is dead, and the panel is
+            # where an operator looks first.
+            pinned = bool(active.get("pinned"))
+            pin_w = P(LADDER_PIN_W) if pinned else 0
+
+            # The rung's text line is laid out from the right: the count column
+            # is fixed, the red limited tag sits beside it, the dimmed suffix
+            # follows the model id, and the model id takes what is left. The
+            # suffix is never ellipsised - "cfg fab..." names no model, which is
+            # the one thing it exists to do - so the width comes out of the tag
+            # instead: the model column slides left, then the tag shortens to
+            # "LIM", then it becomes a red dot beside the count. A tier on a
+            # fallback because its primary is limited is exactly the state the
+            # cfg label was added to show, so showing the tag and hiding the
+            # configured id would be the wrong trade at every DPI.
+            gap = P(4)
+            pad = P(LADDER_TEXT_PAD)
+            dot_w = 2 * self._px(LADDER_LIMIT_DOT_R) + P(6)
+            suffix_w = self._font_small.measure(suffix) if suffix else 0
+            want = self._font_small.measure(text) + gap + suffix_w
+
+            def tag_w(form: str) -> float:
+                if not form:
+                    return 0
+                if form == LIMITED_DOT:
+                    return dot_w
+                return self._font_small.measure(form) + P(6)
+
+            def room(form: str, mx: float) -> float:
+                return count_left - tag_w(form) - (mx + pin_w) - pad
+
+            tag = LIMITED_TAG if limited else ""
+            if suffix:
+                options = [(tag, model_x)]
+                if differs:
+                    # Only for the configured id: a "->fallback" that does not
+                    # fit is worth no rearrangement, and dropping it costs an
+                    # operator nothing they cannot read off `tracker.py graph`.
+                    forms = ([LIMITED_TAG, LIMITED_SHORT, LIMITED_DOT]
+                             if limited else [""])
+                    options = [(f, mx) for f in forms
+                               for mx in (model_x, floor_x)]
+                for cand_tag, cand_x in options:
+                    if room(cand_tag, cand_x) >= want:
+                        tag, model_x = cand_tag, cand_x
+                        break
+                else:
+                    suffix = ""
+            right = count_left - tag_w(tag)
+            if tag == LIMITED_DOT:
+                r = self._pxf(LADDER_LIMIT_DOT_R)
+                cx = count_left - P(4) - r
+                self.canvas.create_oval(cx - r, mid - r, cx + r, mid + r,
+                                        fill=RED, outline="",
+                                        tags=("ladder", f"limited_{tier}"))
+            elif tag:
+                self.canvas.create_text(count_left - P(4), mid, text=tag,
+                                        font=FONT_SMALL, fill=RED, anchor="e",
+                                        tags=("ladder", f"limited_{tier}"))
+            if pinned:
+                # A dot rather than a word: the rung has no room for one, and
+                # the wording is in the loop's startup log and `tracker.py
+                # graph` ("state/graph.json pins executive.model=...").
+                r = self._pxf(LADDER_PIN_R)
+                cx = model_x + pin_w / 2
+                self.canvas.create_oval(cx - r, mid - r, cx + r, mid + r,
+                                        fill=DIM, outline="",
+                                        tags=("ladder", f"pinned_{tier}"))
+            model_x += pin_w
+            model = self._fit(text, self._font_small, (right - model_x) - pad)
             self.canvas.create_text(model_x, mid, text=model, anchor="w",
                                     font=FONT_SMALL,
                                     fill=SILVER if is_workers else DIM,
-                                    tags="ladder")
-            # The tier's fallback, dimmed, immediately after the primary: where
-            # this rung goes when its model is limited ("fable-5-1 ->fable-5").
-            fallback = block.get("fallback")
-            fb_x = model_x + self._font_small.measure(model) + P(4)
-            fb_room = right - fb_x - P(LADDER_TEXT_PAD)
-            # Dropped entirely rather than drawn as an ellipsis: a rung reading
-            # "fable-5-1 ->..." says less than one reading "fable-5-1". The
-            # threshold is measured, not assumed, so it holds at any DPI.
-            fb_min = max(self._font_small.measure("->xxxx"),
-                         P(LADDER_FALLBACK_MIN_W))
-            if fallback and fb_room >= fb_min:
-                fb = self._fit(f"->{short_model(fallback)}", self._font_small,
-                               fb_room)
-                self.canvas.create_text(fb_x, mid, text=fb, anchor="w",
-                                        font=FONT_SMALL, fill=DIM,
-                                        tags=("ladder", f"fallback_{tier}"))
+                                    tags=("ladder", f"model_{tier}"))
+            fb_x = model_x + self._font_small.measure(model) + gap
+            if suffix and right - fb_x - pad >= suffix_w:
+                self.canvas.create_text(
+                    fb_x, mid, text=suffix, anchor="w", font=FONT_SMALL,
+                    fill=DIM,
+                    tags=("ladder",
+                          f"cfg_{tier}" if differs else f"fallback_{tier}"))
 
             if is_workers:
                 for tag, label, bx0 in (("graph_minus", "-", x1 - gutter),
                                         ("graph_plus", "+", x1 - step_w)):
-                    self._round_rect(bx0, ry0, bx0 + step_w,
-                                     ry0 + P(LADDER_TEXT_H) + P(2),
+                    self._round_rect(bx0, ry0, bx0 + step_w, ry0 + text_row,
                                      self._pxf(6), fill=CARD_BG, outline=BLUE,
                                      width=1, tags=tag)
                     self.canvas.create_text(bx0 + step_w / 2, mid, text=label,
                                             font=FONT_BOLD, fill=BLUE, tags=tag)
+
+        note = self._active_note()
+        if note:
+            # Under the last rung, in the amber the panel uses for "something
+            # is not what you set it to". `_ladder_height` reserved the row.
+            note_y = (top + 3 * rung_h + 2 * gap
+                      + self._text_row(LADDER_NOTE_H, self._font_small) / 2)
+            self.canvas.create_text(
+                x0, note_y, text=self._fit(note, self._font_small, x1 - x0),
+                font=FONT_SMALL, fill=AMBER, anchor="w",
+                tags=("ladder", "ladder_note"))
 
     def _click_view_report(self, _event: tk.Event) -> str:
         # Dead until there is a page: a click with no report must not launch
@@ -1156,12 +1361,22 @@ class Overlay:
         # The handover file is written by the loop when it launches the forked
         # director and updated when it ends, so it is re-read here too.
         self._fork = fork_active(self.cfg)
+        # config.json itself is re-read here, by mtime: the graph an operator
+        # edits lives in that file, and the panel showing yesterday's models
+        # until someone restarts the overlay is exactly the bug this closes.
+        reload_config(self.cfg)
         # The graph and the last report are both files another process writes
         # (the CLI, the loop's report thread), so they are re-read every pass.
         self._graph = read_graph(self.cfg)
         # Which model the dispatcher has marked limited, if any: it expires on
         # its own (fallback_minutes), so it is re-read rather than remembered.
         self._limited = limited_model(self.cfg)
+        # What each tier is running on right now (the handover record, the
+        # running rows) against what the graph configures, and the tier token
+        # shares the loop last wrote. Both are files, both are re-read every
+        # refresh, and neither is ever cached across one.
+        self._active = active_graph(self.cfg, self._graph)
+        self._shares = tier_shares(read_tiers(self.cfg))
         self._report = latest_report(self.cfg)
         self._report_age = report_age(self.cfg)
         self.canvas.delete("all")

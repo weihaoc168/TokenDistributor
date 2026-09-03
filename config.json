@@ -120,6 +120,7 @@
   "report_on_milestone": true,
   "report_on_stop": true,
   "report_window_hours": 24,
+  "tiers_refresh_seconds": 300,
   "throttle_fork_enabled": true,
   "fork_in_pace": true,
   "fork_cooldown_seconds": 120,

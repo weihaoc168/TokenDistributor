@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 DEFAULT_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
+CONFIG_NAME = "config.json"
 
 
 @dataclass
@@ -93,6 +95,15 @@ class Config:
     overlay_offset_y: int = 430
     overlay_width: int = 300
     overlay_refresh_seconds: int = 5
+    # How often the loop rebuilds state/tiers.json, the per-tier token shares
+    # the overlay's ladder bars read (tokentracker/ledger.py).
+    tiers_refresh_seconds: int = 300
+    # Bookkeeping for the config re-read, never read from config.json itself:
+    # the raw payload of the last read and the (mtime, size) it was read at, so
+    # `reload_config` can tell a real edit from a re-stat and name the keys that
+    # actually changed rather than the ones the graph derived.
+    config_raw: dict[str, Any] = field(default_factory=dict, repr=False)
+    config_sig: tuple[float, int] | None = field(default=None, repr=False)
 
     @property
     def history_file(self) -> Path:
@@ -145,6 +156,35 @@ class Config:
         return self.state_dir / "limited.json"
 
     @property
+    def handover_log(self) -> Path:
+        """Append-only history of every handover record the dispatcher wrote.
+
+        state/handover.json holds only the newest fork; this file keeps them
+        all, one JSON object per line, which is how the ledger learns which
+        model each fork session actually ran on (`role` stamps).
+        """
+        return self.state_dir / "handover.log"
+
+    @property
+    def tiers_file(self) -> Path:
+        """Per-tier input/output token totals over the report window.
+
+        Written by the loop every `tiers_refresh_seconds`; the overlay's ladder
+        bars read this and nothing else, so drawing a frame never parses a
+        transcript.
+        """
+        return self.state_dir / "tiers.json"
+
+    @property
+    def ledger_cache_file(self) -> Path:
+        """Per-transcript tallies keyed by path + mtime + size.
+
+        A fork's transcript only ever grows, so an unchanged file is re-read
+        from here instead of from disk; see ledger.build_tiers.
+        """
+        return self.state_dir / "ledger_cache.json"
+
+    @property
     def pricing_file(self) -> Path:
         """Per-user price override; wins over config.json like goal/graph.json."""
         return self.state_dir / "pricing.json"
@@ -164,6 +204,124 @@ _PATH_KEYS = (
     "credentials_path", "projects_dir", "sessions_dir", "state_dir", "logs_dir",
     "tasks_file", "sundial_shell_path", "local_ft_bin",
 )
+# Fields the process keeps for itself; a config.json naming one is ignored.
+RUNTIME_KEYS = ("config_raw", "config_sig")
+
+
+def config_file(cfg: Config) -> Path:
+    return cfg.root / CONFIG_NAME
+
+
+def config_signature(cfg: Config) -> tuple[float, int] | None:
+    """(mtime, size) of config.json, or None when it cannot be stat'd.
+
+    Size rides along with the mtime because a file rewritten inside one
+    filesystem timestamp tick - an editor saving twice in the same second -
+    keeps the mtime it had, and the loop would then hold the stale graph for
+    as long as nothing else touched the file.
+    """
+    try:
+        stat = config_file(cfg).stat()
+    except (OSError, AttributeError, TypeError):
+        return None
+    return (stat.st_mtime, stat.st_size)
+
+
+def read_config_raw(cfg: Config) -> dict[str, Any] | None:
+    """config.json as a dict, or None when it is missing or unreadable."""
+    try:
+        raw = json.loads(config_file(cfg).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        # ValueError covers JSONDecodeError and the UnicodeDecodeError a
+        # half-written file gives back.
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _field_default(name: str) -> Any:
+    for f in fields(Config):
+        if f.name != name:
+            continue
+        if f.default is not MISSING:
+            return f.default
+        if f.default_factory is not MISSING:  # type: ignore[misc]
+            return f.default_factory()  # type: ignore[misc]
+    return None
+
+
+def reloadable_keys() -> set[str]:
+    """The config.json keys a live reload may set on a running Config.
+
+    Paths are deliberately excluded: `state_dir`, `tasks_file` and friends are
+    resolved once at load, and the dispatcher, the history file, the overlay
+    and the loop all hold objects built from them. Moving one under a running
+    loop would split its state across two directories.
+    """
+    return ({f.name for f in fields(Config)} - {"root"}
+            - set(RUNTIME_KEYS) - set(_PATH_KEYS))
+
+
+def apply_raw(cfg: Config, raw: dict[str, Any]) -> list[str]:
+    """Set every reloadable field `raw` names onto `cfg`; returns what changed.
+
+    "Changed" is measured against the previous *raw payload*, not against the
+    live attributes, because several attributes are derived rather than read:
+    `apply_graph` writes the graph's worker count onto `max_concurrency`, so a
+    Config running a state/graph.json override would otherwise report
+    `max_concurrency` changed on every single reload.
+    """
+    valid = reloadable_keys()
+    previous = cfg.config_raw if isinstance(cfg.config_raw, dict) else {}
+    changed: list[str] = []
+    for key in sorted(valid):
+        if key not in raw:
+            continue
+        before = previous.get(key) if previous else getattr(cfg, key, None)
+        if raw[key] != before:
+            changed.append(key)
+        setattr(cfg, key, raw[key])
+    for key in sorted((set(previous) & valid) - set(raw)):
+        # A key deleted from the file goes back to the dataclass default rather
+        # than keeping the value the deleted line used to set.
+        changed.append(key)
+        setattr(cfg, key, _field_default(key))
+    # Deep-copied: `cfg.graph` is handed out of this dict, and a snapshot that
+    # aliased it would compare a value against itself the next time round.
+    cfg.config_raw = copy.deepcopy(raw)
+    return changed
+
+
+def reload_config(cfg: Config) -> list[str] | None:
+    """Re-read config.json onto the live Config when the file changed on disk.
+
+    Returns the keys whose value changed (possibly an empty list), or None when
+    there was nothing to do: same (mtime, size) as the last read, or a file
+    that cannot be read at all.
+
+    This is what makes a `graph` edited while the loop runs take effect on the
+    next poll. Before it existed the loop kept the graph it was started with,
+    the state/graph.json override carried only the worker count, and the next
+    fork launched on the stale in-memory executive model - a real failure, on
+    2026-09-03 19:48 UTC.
+
+    Never raises: it runs inside the poll and inside every overlay refresh, so
+    a half-written config.json has to degrade to the values already in memory.
+    The signature is recorded even for an unreadable file, so a broken config
+    is parsed once rather than on every poll until it is fixed.
+    """
+    signature = config_signature(cfg)
+    if signature is None or signature == cfg.config_sig:
+        return None
+    cfg.config_sig = signature
+    raw = read_config_raw(cfg)
+    if raw is None:
+        return None
+    changed = apply_raw(cfg, raw)
+    from .graph import apply_graph, default_graph
+    if not isinstance(cfg.graph, dict) or not cfg.graph:
+        cfg.graph = default_graph(cfg)
+    apply_graph(cfg)
+    return changed
 
 
 def load_config(root: str | Path) -> Config:
@@ -184,7 +342,7 @@ def load_config(root: str | Path) -> Config:
         "tasks_file": root / "tasks.json",
         "sundial_shell_path": Path(appdata) / "Sundial" / "shell.json",
     }
-    valid = {f.name for f in fields(Config)} - {"root"}
+    valid = {f.name for f in fields(Config)} - {"root"} - set(RUNTIME_KEYS)
     kwargs: dict[str, Any] = dict(defaults)
     for key, value in raw.items():
         if key not in valid:
@@ -196,6 +354,10 @@ def load_config(root: str | Path) -> Config:
             kwargs[key] = value
 
     cfg = Config(root=root, **kwargs)
+    # What was on disk, and when: `reload_config` compares against both, so the
+    # loop can pick up an edit to config.json without being restarted.
+    cfg.config_raw = copy.deepcopy(raw)
+    cfg.config_sig = config_signature(cfg)
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
     # The agentic graph is authoritative over the legacy scalar keys, so it is

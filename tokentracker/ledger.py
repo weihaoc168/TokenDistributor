@@ -108,6 +108,31 @@ FORK_SOURCE = "fork_session"
 AGENT_SOURCE = "workflow_agent"
 SOURCE_TIERS = {MAIN_SOURCE: EXEC_TIER, FORK_SOURCE: EXEC_TIER,
                 AGENT_SOURCE: WORK_TIER}
+# The role every session and agent row is stamped with. It is the identity of
+# the transcript, not of the model: which hat was being worn.
+ROLE_STAMPS = (MAIN_SOURCE, FORK_SOURCE, AGENT_SOURCE)
+# The panel's three tiers (state/tiers.json), which are the agentic graph's,
+# not the report's two. The advisory tier has no transcript of its own: the
+# review lenses are Workflow agents whose brief names them, so they are split
+# out of the worker lanes by the lane role their own brief declares.
+PANEL_EXEC = "executive"
+PANEL_ADVISORY = "advisory"
+PANEL_WORKERS = "workers"
+PANEL_TIERS = (PANEL_EXEC, PANEL_ADVISORY, PANEL_WORKERS)
+ADVISORY_ROLES = ("reviewer", "judge", "synthesis")
+# state/tiers.json + state/ledger_cache.json.
+TIERS_KEYS = ("window", "tiers", "generated_at")
+TIER_FIELDS = ("input", "output", "sessions")
+TIERS_REFRESH_SECONDS = 300
+# The input side of the panel's bars is everything that was read: fresh input,
+# what was written into the cache, and what was read back out of it.
+INPUT_KEYS = ("input_tokens", CREATION_KEY, "cache_read_input_tokens")
+CACHE_VERSION = 1
+# A transcript with more turns than this is tallied but not cached: the cache
+# entry carries the message ids it counted (that is what keeps the cross-file
+# dedup exact when an entry is reused), and there is a size past which keeping
+# them costs more than re-reading the file.
+CACHE_MAX_IDS = 20000
 SERIES_MAX_POINTS = 60
 LEDGER_ROWS = 12
 COST_ROWS = 12
@@ -160,6 +185,9 @@ REPORT_KEYS = ("last_report", "last_reason", "generated_at", "window",
                "last_stop_key")
 
 _BUSY = threading.Lock()
+# Separate from _BUSY: the tier-share refresh and a report are two different
+# jobs, and one running must not silently skip the other.
+_TIERS_BUSY = threading.Lock()
 
 
 # --------------------------------------------------------------- primitives
@@ -677,8 +705,42 @@ def fork_session_ids(cfg: Config) -> list[str]:
     return ids
 
 
+def fork_models(cfg: Config) -> dict[str, str]:
+    """{fork session id: the model that fork actually ran on}.
+
+    Two records say it and they are merged rather than ranked: the task row
+    (`model_used`, stamped at launch) and state/handover.log (every start and
+    finish the dispatcher ever wrote). Neither is complete on its own - a row
+    can be deleted, and the log only learns the session id at the finish - and
+    both are the model that RAN, which is what a role stamp has to carry: the
+    graph's executive model today says nothing about a fork from this morning.
+    """
+    from .handover import fork_models as logged_fork_models
+
+    models: dict[str, str] = {}
+    try:
+        data = json.loads(cfg.tasks_file.read_text(encoding="utf-8"))
+        rows = data.get("tasks", []) if isinstance(data, dict) else []
+    except (OSError, ValueError, TypeError, AttributeError):
+        rows = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        sid = row.get("fork_session_id")
+        model = str(row.get("model_used") or row.get("model") or "").strip()
+        if isinstance(sid, str) and sid and model:
+            models[sid] = model
+    models.update(logged_fork_models(cfg))
+    return models
+
+
 def discover_sessions(cfg: Config, start: datetime, end: datetime) -> list[dict]:
-    """[{sid, path, role}] for the main session(s) and every fork in the window.
+    """[{sid, path, role, model}] for the main session and every fork.
+
+    `role` is the stamp every downstream figure is grouped by: `main_session`
+    or `fork_session` here, `workflow_agent` on the subagent transcripts filed
+    under each of them. `model` is the model a fork actually ran on (from
+    `fork_models`), empty when nothing recorded it.
 
     Forks are found by the session id `_finalize_record` captured; a fork whose
     id was never recorded (killed, still running, an older row) is picked up by
@@ -686,17 +748,19 @@ def discover_sessions(cfg: Config, start: datetime, end: datetime) -> list[dict]
     """
     sessions: list[dict] = []
     seen: set[str] = set()
+    models = fork_models(cfg)
 
     def add(sid: str, path: Path | None, role: str) -> None:
         if not sid or sid in seen or path is None:
             return
         seen.add(sid)
-        sessions.append({"sid": sid, "path": path, "role": role})
+        sessions.append({"sid": sid, "path": path, "role": role,
+                         "model": models.get(sid, "")})
 
     for sid in cfg.main_session_ids:
-        add(str(sid), find_transcript(cfg, str(sid)), "main")
+        add(str(sid), find_transcript(cfg, str(sid)), MAIN_SOURCE)
     for sid in fork_session_ids(cfg):
-        add(sid, find_transcript(cfg, sid), "fork")
+        add(sid, find_transcript(cfg, sid), FORK_SOURCE)
 
     probe = _fork_probe(getattr(cfg, "throttle_prompt", ""))
     if not probe:
@@ -722,8 +786,13 @@ def discover_sessions(cfg: Config, start: datetime, end: datetime) -> list[dict]
             if mtime < lo or mtime > hi + 3600:
                 continue
             if carries_fork_prompt(path, probe):
-                add(sid, path, "fork")
+                add(sid, path, FORK_SOURCE)
     return sessions
+
+
+def role_word(role: str) -> str:
+    """`fork_session` -> `fork`: the stamp in prose, for a sentence or a label."""
+    return str(role or "").split("_")[0] or "?"
 
 
 # --------------------------------------------------------------- utilization
@@ -887,28 +956,28 @@ def graph_separates_tiers(graph: dict) -> bool:
 
 
 def tier_of(model: str, graph: dict, source: str | None = None) -> str:
-    """Which tier a turn belongs to: by model id, or by role when ids collide.
+    """Which tier a turn belongs to: by role when there is one, else by model.
 
-    Two readings of the same question - did the model wearing the director's
+    One question, two ways of asking it - did the model wearing the director's
     hat also do the building?
 
-    * The graph names different models for the executive and the workers: the
-      model id answers it, executive/advisory membership winning a tie so a
-      model named twice is still counted once.
-    * The graph names ONE model at both ends (the shipped default is opus
-      everywhere): the id cannot answer it at all, and keying on it puts every
-      worker lane in the executive tier and drops the actual director - running
-      whatever model it happens to run - into the worker tier, inverting the
-      verdict. So the transcript's own role decides: main and fork sessions are
-      the executive tier, Workflow subagents are the workers.
+    * The turn came from a transcript with a ROLE stamp (`main_session`,
+      `fork_session`, `workflow_agent`): the role answers it outright. Main and
+      fork sessions are the executive tier and Workflow subagents the workers,
+      whatever model each happened to run on. That holds across a graph change
+      too: a fork launched two hours ago on a model that now sits at the worker
+      tier was still the director while it ran (`role_tiered` flags it).
+    * No role - a per-model label with no single transcript behind it: the
+      model id decides, executive/advisory membership winning a tie so a model
+      named at two tiers is still counted once.
 
-    `source` is the role (`main_session`, `fork_session`, `workflow_agent`).
-    Without one - a per-model label with no single role behind it - the model
-    rule is used, as before.
+    Keying a stamped turn on its model id is what inverts the verdict when one
+    model serves every tier: every worker lane lands in the executive tier and
+    the director drops into the worker tier.
     """
     from .graph import ADVISORY, EXECUTIVE, WORKERS
 
-    if source is not None and not graph_separates_tiers(graph):
+    if source is not None:
         return SOURCE_TIERS.get(source, WORK_TIER)
     name = str(model or "")
     exec_models = {str(graph.get(EXECUTIVE, {}).get("model", "")),
@@ -918,6 +987,38 @@ def tier_of(model: str, graph: dict, source: str | None = None) -> str:
     if name == str(graph.get(WORKERS, {}).get("model", "")):
         return WORK_TIER
     return WORK_TIER
+
+
+def role_tiered(model: str, graph: dict, source: str | None) -> bool:
+    """True when this row is in the executive tier by ROLE against its model.
+
+    The transition case: the graph named Fable at the executive tier when a
+    fork launched, the operator has since moved the executive to Opus - or the
+    fork fell back - and the model that fork ran on is now the *workers'*
+    model. The turn is still the director's, so it stays in the executive tier
+    and carries this flag, which is what the page's caveat explains rather than
+    letting the reader assume a worker lane was miscounted.
+    """
+    from .graph import WORKERS
+
+    if source not in (MAIN_SOURCE, FORK_SOURCE):
+        return False
+    if not graph_separates_tiers(graph):
+        return False
+    return str(model or "") == str(graph.get(WORKERS, {}).get("model", ""))
+
+
+def panel_tier(source: str, lane_role: str | None = None) -> str:
+    """Which of the graph's three tiers a transcript's tokens belong to.
+
+    Sessions are the executive. A Workflow agent is an advisory lens when its
+    own brief says so (reviewer / judge / synthesis) and a worker otherwise,
+    which is the only place the advisory tier's tokens can come from: the
+    lenses run inside the fork's workflows and have no session of their own.
+    """
+    if source in (MAIN_SOURCE, FORK_SOURCE):
+        return PANEL_EXEC
+    return PANEL_ADVISORY if lane_role in ADVISORY_ROLES else PANEL_WORKERS
 
 
 def _breakdown(tally: Tally) -> dict[str, dict[str, float]]:
@@ -959,9 +1060,26 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
     model_tiers: dict[str, set[str]] = {}
     sinks: list[dict] = []
     cost_sinks: list[dict] = []
+    # Sessions whose tier came from their role against their model id; named in
+    # a caveat, so a reader never has to guess why a row is where it is.
+    role_tiered_rows: list[str] = []
     by_source_usd = {MAIN_SOURCE: 0.0, FORK_SOURCE: 0.0, AGENT_SOURCE: 0.0}
     by_role_usd = {role: 0.0 for role in ROLES}
+    # (role stamp, model) -> turns / output / weighted / USD. The role is the
+    # transcript's, so this is the one cut that survives a graph change: it
+    # says what each hat cost, on whichever model it was wearing at the time.
+    by_role_model: dict[tuple[str, str], dict[str, Any]] = {}
     agent_files = 0
+
+    def stamp_role(role: str, model: str, row: dict) -> None:
+        cell = by_role_model.setdefault((role, model), {
+            "role": role, "model": model, "turns": 0, "output": 0,
+            "weighted": 0.0, "cost_usd": 0.0, "unpriced": False})
+        cell["turns"] += row["messages"]
+        cell["output"] += row["usage"]["output_tokens"]
+        cell["weighted"] += row["weighted"]
+        cell["unpriced"] = cell["unpriced"] or bool(row.get("unpriced"))
+        cell["cost_usd"] = _add_usd(cell["cost_usd"], row.get("cost_usd"))
     # One dedup set for the whole report: a resumed fork's transcript repeats
     # the parent's turns verbatim, and discover_sessions yields the main
     # session first, so the parent keeps its own turns and each fork keeps only
@@ -986,6 +1104,7 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
                   row: dict) -> None:
         cost_sinks.append({
             "source": source,
+            "role": source,
             "id_or_label": label,
             "what": what,
             "model": model,
@@ -995,30 +1114,44 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
         })
 
     for session in sessions:
-        source = MAIN_SOURCE if session["role"] == "main" else FORK_SOURCE
+        source = session["role"]
+        word = role_word(source)
         tally = parse_transcript(session["path"], start, end, seen_turns,
                                  prices, fallback_price)
         fold(tally, source)
-        session_role = role_of(f"{session['role']} session", source)
+        session_role = role_of(f"{word} session", source)
         by_role_usd[session_role] = by_role_usd.get(session_role, 0.0) + tally.usd()
         for model, row in tally.by_model.items():
+            stamp_role(source, model, row)
             cats = {c: cell["messages"] for c, cell in row["cats"].items()}
             hands = sum(row["cats"].get(c, {}).get("weighted", 0.0)
                         for c in HANDS_ON_CATS)
             share = hands / row["weighted"] if row["weighted"] else 0.0
-            what = (f"{session['role']} session on {model}: "
+            # A fork that ran on the model now sitting at the worker tier is
+            # still the director: it is tiered by its role, and says so.
+            tiered_by_role = role_tiered(model, graph, source)
+            what = (f"{word} session on {model}: "
                     f"{cats.get('OPS', 0)} OPS, {cats.get('AUTHOR', 0)} AUTHOR, "
                     f"{cats.get('DECIDE', 0)} DECIDE turns")
+            if tiered_by_role:
+                what += (f" (role-tiered: {model} is the graph's worker model "
+                         "now, this transcript was the director)")
+                role_tiered_rows.append(f"{session['sid'][:8]} {word} on {model}")
             sinks.append({
                 "source": source,
-                "id_or_label": f"{session['sid'][:8]} {session['role']} / {model}",
+                # The stamp, carried on the row itself: the page's ledger table
+                # shows it, and a row's tier follows it rather than its model.
+                "role": source,
+                "model": model,
+                "role_tiered": tiered_by_role,
+                "id_or_label": f"{session['sid'][:8]} {word} / {model}",
                 "what": what,
                 "fable_output": row["usage"]["output_tokens"],
                 "fable_cache_read": row["usage"]["cache_read_input_tokens"],
                 "weighted_cost": _round(row["weighted"]),
                 "verdict": "hands-on" if share > HANDS_ON_LIMIT else "executive",
             })
-            cost_sink(source, f"{session['sid'][:8]} {session['role']} ({session_role})",
+            cost_sink(source, f"{session['sid'][:8]} {word} ({session_role})",
                       what, model, row)
         agents = Tally(prices, fallback_price)
         for path in agent_transcripts(cfg, session["sid"]):
@@ -1044,9 +1177,13 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
         if agents.by_model:
             fold(agents, AGENT_SOURCE)
             for model, row in agents.by_model.items():
+                stamp_role(AGENT_SOURCE, model, row)
                 cats = {c: cell["messages"] for c, cell in row["cats"].items()}
                 sinks.append({
                     "source": AGENT_SOURCE,
+                    "role": AGENT_SOURCE,
+                    "model": model,
+                    "role_tiered": False,
                     "id_or_label": f"{session['sid'][:8]} workflow agents / {model}",
                     "what": (f"Workflow subagents under {session['sid'][:8]} on "
                              f"{model}: {cats.get('OPS', 0)} OPS, "
@@ -1171,7 +1308,7 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
         f"{work_out:,} output tokens over "
         f"{sum(r['messages'] for r in tiers[WORK_TIER].by_model.values())} turns.",
         f"Sources parsed: {len(sessions)} session transcript(s) "
-        f"({sum(1 for s in sessions if s['role'] == 'fork')} fork), "
+        f"({sum(1 for s in sessions if s['role'] == FORK_SOURCE)} fork), "
         f"{agent_files} workflow agent transcript(s).",
         f"List-price cost of the window ${cost_block['total_usd']:,.2f}: "
         f"${cost_block['by_tier']['executive']:,.2f} executive tier, "
@@ -1182,11 +1319,12 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
         f"x{graph[EXECUTIVE]['count']}, advisory {graph[ADVISORY]['model']} "
         f"x{graph[ADVISORY]['count']}, workers {graph[WORKERS]['model']} "
         f"x{graph[WORKERS]['count']} (surge {graph[WORKERS]['surge_count']}).",
-        ("Tiers split by model id, which the graph names differently at the "
-         "executive and worker tiers." if by_model_split else
-         "Tiers split by transcript role (main and fork sessions are the "
-         "executive tier, Workflow subagents the workers): the graph names one "
-         "model at both ends, so the model id cannot tell them apart."),
+        ("Tiers split by transcript role: main and fork sessions are the "
+         "executive tier, Workflow subagents the workers, whatever model each "
+         "ran on." + (f" {len(role_tiered_rows)} session(s) ran on the graph's "
+                      "current worker model and are tiered by role: "
+                      + ", ".join(role_tiered_rows) + "."
+                      if role_tiered_rows else "")),
     ]
 
     root_causes = ([] if exec_only else [
@@ -1207,14 +1345,34 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
         "same line, so the graph is what the director is told to build.",
     ]
 
+    # The graph exactly as it stood when this page was built, so a page read
+    # next week is not silently reinterpreted against next week's graph.
+    graph_in_force = {
+        tier: {"model": graph[tier]["model"],
+               "fallback": graph[tier].get("fallback"),
+               "count": graph[tier]["count"],
+               **({"surge_count": graph[tier]["surge_count"]}
+                  if tier == WORKERS else {})}
+        for tier in (EXECUTIVE, ADVISORY, WORKERS)}
+    by_role_rows = sorted(
+        ({**cell,
+          "weighted": _round(cell["weighted"]),
+          "cost_usd": _round_usd(cell["cost_usd"])}
+         for cell in by_role_model.values()),
+        key=lambda r: (ROLE_STAMPS.index(r["role"])
+                       if r["role"] in ROLE_STAMPS else len(ROLE_STAMPS),
+                       -r["weighted"]))
+
     return {
         "generated_at": utcnow().isoformat(),
         "reason": reason,
+        "graph_in_force": graph_in_force,
+        "by_role": by_role_rows,
         "sources": {
             "main_session": ", ".join(
-                s["sid"] for s in sessions if s["role"] == "main") or "none",
+                s["sid"] for s in sessions if s["role"] == MAIN_SOURCE) or "none",
             "fork_sessions": ", ".join(
-                s["sid"] for s in sessions if s["role"] == "fork") or "none",
+                s["sid"] for s in sessions if s["role"] == FORK_SOURCE) or "none",
             "workflow_agents": f"{agent_files} subagent transcript(s)",
             "tokendistributor": str(cfg.root),
         },
@@ -1306,20 +1464,299 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
             "every token figure on this page and in none of the USD ones, which "
             f"is why the priced share is {cost_block['priced_share']:.1%}.",
         ] if unpriced else []) + [
-            ("Tiers come from the agentic graph. It names different models at "
-             "the executive and worker tiers, so each turn is tiered by its "
-             "model id, executive winning a tie."
-             if by_model_split else
-             "Tiers come from the transcript's role, because the graph names "
-             "one model at both the executive and the worker tier: main and "
-             "fork sessions are the executive tier, Workflow subagents the "
-             "workers. Tiering by model id would put every worker lane in the "
-             "executive tier and the director in the worker tier."),
+            "Tiers come from the transcript's role, not from its model id: "
+            "main and fork sessions are the executive tier, Workflow subagents "
+            "the workers. Tiering by model id inverts the verdict whenever one "
+            "model serves every tier (every worker lane lands in the executive "
+            "tier and the director in the worker tier), and it misfiles a fork "
+            "whenever the graph moves under it."
+            + (" Flagged 'role-tiered' in this window, having run on the model "
+               "the graph now names at the worker tier while being the "
+               "director: " + ", ".join(role_tiered_rows) + "."
+               if role_tiered_rows else ""),
+            "Every row carries the role of the transcript behind it "
+            f"({', '.join(ROLE_STAMPS)}) and, for a fork, the model it "
+            "actually ran on, read from state/handover.log and the task rows "
+            "rather than from the graph in force now.",
             "Only transcripts on this machine are read; a fork whose session id "
             "was never recorded is found by its brief, and one that wrote "
             "nothing in the window is invisible.",
         ],
     }
+
+
+# ------------------------------------------------------------- tier shares
+#
+# state/tiers.json is the overlay's whole view of where the tokens went: the
+# panel draws two bars per rung from it and parses nothing itself, because a
+# Tk refresh every few seconds cannot afford to read a transcript.
+#
+# The file is rebuilt by the loop every `tiers_refresh_seconds`, over the same
+# window the next report would use, and the cost of rebuilding it is what
+# state/ledger_cache.json is for: a transcript that has not grown since the
+# last pass is read back from the cache instead of from disk.
+
+def _tally_totals(tally: Tally) -> dict[str, int]:
+    """One transcript's tokens, on the panel's two axes.
+
+    Input is everything that was *read*: fresh input, the tokens written into
+    the cache, and the tokens read back out of it. Output is what came back.
+    """
+    return {
+        "input": sum(sum(row["usage"][key] for key in INPUT_KEYS)
+                     for row in tally.by_model.values()),
+        "output": sum(row["usage"]["output_tokens"]
+                      for row in tally.by_model.values()),
+        "turns": sum(row["messages"] for row in tally.by_model.values()),
+    }
+
+
+def read_ledger_cache(cfg: Config) -> dict:
+    """The per-transcript tally cache, or {} when there is none."""
+    try:
+        data = json.loads(cfg.ledger_cache_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_ledger_cache(cfg: Config, cache: dict) -> None:
+    _write_json(cfg.ledger_cache_file, cache)
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    """Swap a JSON file in whole; never raises. Same dance as goal/control."""
+    try:
+        body = json.dumps(payload, indent=2)
+    except (TypeError, ValueError):
+        return
+    tmp = path.parent / f"{path.name}.tmp"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            path.write_text(body, encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def cache_signature(path: Path, start: datetime) -> str | None:
+    """path + mtime + size + window start, or None when the file is gone.
+
+    The window start is part of the key because a tally is only ever a tally
+    *of a window*: the same unchanged file yields different numbers once the
+    window moves. The end is not, and does not need to be - a file whose size
+    and mtime are unchanged has gained no turn for a later end to include.
+    """
+    try:
+        stat = path.stat()
+    except (OSError, AttributeError):
+        return None
+    return f"{CACHE_VERSION}|{stat.st_mtime_ns}|{stat.st_size}|{start.isoformat()}"
+
+
+def file_tally(path: Path, start: datetime, end: datetime, seen: set[str],
+               cache: dict, parse=None, lane=None) -> dict:
+    """One transcript's totals: {input, output, turns, lane, cached}.
+
+    Reuses the cache entry when the file has neither grown nor been rewritten
+    since it was made. The entry carries the message ids that tally counted,
+    and a reuse puts them back into `seen`, so the cross-file dedup stays
+    exact: a fork transcript opens with a verbatim copy of the parent's turns,
+    and skipping the parse must not also skip the "already counted" marks that
+    parse would have left behind.
+
+    `lane` is a zero-argument callable naming an agent transcript's own lane
+    role. It is only asked on a miss - reading it means reading the file's
+    first user message - and is remembered in the entry.
+    """
+    parse = parse or parse_transcript
+    key = str(path)
+    signature = cache_signature(path, start)
+    entry = cache.get(key) if isinstance(cache, dict) else None
+    if (signature is not None and isinstance(entry, dict)
+            and entry.get("sig") == signature):
+        ids = entry.get("ids")
+        if isinstance(ids, list):
+            seen.update(str(i) for i in ids)
+        return {"input": _count(entry.get("input")) or 0,
+                "output": _count(entry.get("output")) or 0,
+                "turns": _count(entry.get("turns")) or 0,
+                "lane": entry.get("lane"), "cached": True}
+    before = set(seen)
+    totals = _tally_totals(parse(path, start, end, seen))
+    totals["lane"] = lane() if lane is not None else None
+    totals["cached"] = False
+    counted = sorted(seen - before)
+    if (signature is not None and isinstance(cache, dict)
+            and len(counted) <= CACHE_MAX_IDS):
+        cache[key] = {"sig": signature, "ids": counted,
+                      **{k: totals[k] for k in ("input", "output", "turns")},
+                      "lane": totals["lane"]}
+    return totals
+
+
+def build_tiers(cfg: Config, start: datetime, end: datetime,
+                cache: dict | None = None, parse=None,
+                now: datetime | None = None) -> dict:
+    """Per-tier input/output tokens over [start, end], in tiers.json's schema.
+
+    The split is by ROLE, exactly like the report's: sessions are the
+    executive, and a Workflow agent is an advisory lens or a worker according
+    to the role its own brief declares. `cache` is updated in place and pruned
+    of every entry this pass did not touch, so it never grows past the set of
+    transcripts the current window actually has.
+    """
+    cache = cache if isinstance(cache, dict) else {}
+    tiers = {tier: {key: 0 for key in TIER_FIELDS} for tier in PANEL_TIERS}
+    seen: set[str] = set()
+    touched: set[str] = set()
+
+    def fold(tier: str, totals: dict) -> None:
+        tiers[tier]["input"] += totals["input"]
+        tiers[tier]["output"] += totals["output"]
+        tiers[tier]["sessions"] += 1
+
+    for session in discover_sessions(cfg, start, end):
+        touched.add(str(session["path"]))
+        fold(panel_tier(session["role"]),
+             file_tally(session["path"], start, end, seen, cache, parse))
+        for path in agent_transcripts(cfg, session["sid"]):
+            touched.add(str(path))
+            totals = file_tally(path, start, end, seen, cache, parse,
+                                lane=lambda p=path: agent_role(p))
+            fold(panel_tier(AGENT_SOURCE, totals.get("lane")), totals)
+    for key in [k for k in cache if k not in touched]:
+        cache.pop(key, None)
+    return {
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "tiers": tiers,
+        "generated_at": (now or utcnow()).isoformat(),
+    }
+
+
+def read_tiers(cfg: Config) -> dict | None:
+    """state/tiers.json, or None when it is missing or unreadable."""
+    try:
+        data = json.loads(cfg.tiers_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("tiers"), dict):
+        return None
+    return data
+
+
+def write_tiers(cfg: Config, payload: dict) -> dict:
+    _write_json(cfg.tiers_file, payload)
+    return payload
+
+
+def tier_shares(payload: Any) -> dict[str, dict[str, float]]:
+    """Per tier: its tokens and its share of the three tiers' totals.
+
+    The shares are of the window's own totals, so the three input shares add
+    to 1 and the three output shares add to 1 whenever anything was spent. An
+    empty window - no file, no turns, a payload of junk - is 0% everywhere
+    rather than an even split: the bars still have to draw something, and "no
+    tokens" is the true thing to draw.
+    """
+    tiers = payload.get("tiers") if isinstance(payload, dict) else None
+    tiers = tiers if isinstance(tiers, dict) else {}
+    values: dict[str, dict[str, float]] = {}
+    for tier in PANEL_TIERS:
+        block = tiers.get(tier)
+        block = block if isinstance(block, dict) else {}
+        values[tier] = {key: max(0, _count(block.get(key)) or 0)
+                        for key in TIER_FIELDS}
+    total_in = sum(v["input"] for v in values.values())
+    total_out = sum(v["output"] for v in values.values())
+    for tier in PANEL_TIERS:
+        values[tier]["input_share"] = (values[tier]["input"] / total_in
+                                       if total_in else 0.0)
+        values[tier]["output_share"] = (values[tier]["output"] / total_out
+                                        if total_out else 0.0)
+    return values
+
+
+def tiers_refresh_seconds(cfg: Config) -> float:
+    try:
+        value = float(getattr(cfg, "tiers_refresh_seconds",
+                              TIERS_REFRESH_SECONDS))
+    except (TypeError, ValueError):
+        return float(TIERS_REFRESH_SECONDS)
+    # The comparison rejects NaN and both infinities without importing math.
+    return value if 0 <= value <= 86400 else float(TIERS_REFRESH_SECONDS)
+
+
+def tiers_due(cfg: Config, now: datetime | None = None) -> bool:
+    """True when state/tiers.json is missing or older than the refresh period."""
+    payload = read_tiers(cfg)
+    if payload is None:
+        return True
+    stamp = parse_iso(payload.get("generated_at"))
+    if stamp is None:
+        return True
+    # A stamp in the future (a clock that moved, a tick that passed its own
+    # `now`) counts as fresh: rebuilding on every poll until the clock catches
+    # up would be the more expensive way to be wrong.
+    return ((now or utcnow()) - stamp).total_seconds() >= tiers_refresh_seconds(cfg)
+
+
+def refresh_tiers(cfg: Config, now: datetime | None = None) -> dict:
+    """Rebuild state/tiers.json now, over the window the next report would use."""
+    now = now or utcnow()
+    start, end = window_for(cfg, now=now)
+    cache = read_ledger_cache(cfg)
+    payload = build_tiers(cfg, start, end, cache, now=now)
+    write_ledger_cache(cfg, cache)
+    return write_tiers(cfg, payload)
+
+
+def maybe_refresh_tiers(cfg: Config, now: datetime | None = None) -> str | None:
+    """Refresh the tier shares off the poll thread when they are due.
+
+    Off-thread for the same reason the report is: the first pass parses every
+    transcript in the window, and the loop's tick must not wait on it. Later
+    passes are cheap - the mtime cache means only the files that grew are read
+    again - but "cheap" is not "instant" and a poll is not the place to find out.
+    """
+    if not tiers_due(cfg, now) or _TIERS_BUSY.locked():
+        return None
+
+    def work() -> None:
+        with _TIERS_BUSY:
+            try:
+                refresh_tiers(cfg, now)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                pass
+
+    threading.Thread(target=work, name="ledger-tiers", daemon=True).start()
+    return "tier shares refreshing"
+
+
+def tiers_status_line(cfg: Config, now: datetime | None = None) -> str:
+    """The `tracker.py status` line for the panel's token-share bars."""
+    payload = read_tiers(cfg)
+    if payload is None:
+        return "tier shares: none yet (state/tiers.json)"
+    shares = tier_shares(payload)
+    parts = " | ".join(
+        f"{tier[:1].upper()} in {shares[tier]['input_share']:.0%} "
+        f"out {shares[tier]['output_share']:.0%}" for tier in PANEL_TIERS)
+    window = payload.get("window") if isinstance(payload.get("window"), dict) else {}
+    start, end = parse_iso(window.get("start")), parse_iso(window.get("end"))
+    span = (f", {(end - start).total_seconds() / 3600:.1f}h window"
+            if start and end and end > start else "")
+    stamp = parse_iso(payload.get("generated_at"))
+    age = ("" if stamp is None else
+           f", {int(max(0.0, ((now or utcnow()) - stamp).total_seconds()) // 60)}m ago")
+    return f"tier shares: {parts}{span}{age}"
 
 
 # ------------------------------------------------------------------ render

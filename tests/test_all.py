@@ -1658,6 +1658,28 @@ def spans():
     return out
 
 
+def check_ladder_texts(tag):
+    """Nothing inside the ladder's own band may overlap anything else in it."""
+    chart = ov.canvas.bbox("ladder")
+    assert chart, tag
+    items = []
+    for item in ov.canvas.find_all():
+        if ov.canvas.type(item) != "text":
+            continue
+        box = ov.canvas.bbox(item)
+        if box[1] >= chart[1] and box[3] <= chart[3]:
+            items.append((ov.canvas.itemcget(item, "text"), box))
+    assert len(items) >= 12, (tag, items)
+    for i, (ta, a) in enumerate(items):
+        for tb, b in items[i + 1:]:
+            assert (a[2] <= b[0] or b[2] <= a[0]
+                    or a[3] <= b[1] or b[3] <= a[1]), (tag, ta, tb, a, b)
+    goal = ov.canvas.bbox("goal_minus")
+    assert goal and chart[3] <= goal[1], (tag, chart, goal)
+    lowest = max(ov.canvas.bbox(i)[3] for i in ov.canvas.find_all())
+    assert lowest <= int(ov.canvas["height"]) + 2, (tag, lowest)
+
+
 def check_collapsed(tag, expect_mode=True):
     ov._collapsed = True
     ov._refresh()
@@ -1679,7 +1701,8 @@ def check_collapsed(tag, expect_mode=True):
     # Collapsed omits the ladder chart entirely rather than squeezing it into
     # a one-line bar: nothing it draws may be on the canvas at all.
     for absent in ("ladder", "ladder_spine", "graph_minus", "graph_plus",
-                   "rung_executive", "rung_advisory", "rung_workers"):
+                   "ladder_note", "rung_in_executive", "rung_out_workers",
+                   "track_in_advisory"):
         assert not ov.canvas.find_withtag(absent), (tag, absent)
     assert "AGENTIC GRAPH" not in labels, (tag, labels)
     for i, (ta, a0, a1) in enumerate(drawn):
@@ -1748,22 +1771,63 @@ for tier in ("EXECUTIVE", "ADVISORY", "WORKERS"):
 # The graph written above is 1 / 3 / 10 with a surge of 20.
 for want in ("x1", "x3", "x10", "surge x20", "opus-5", "haiku-4-5"):
     assert want in texts, (want, texts)
-rungs = [(t, ov.canvas.bbox(f"rung_{t}"))
-         for t in ("executive", "advisory", "workers")]
-assert all(b for _t, b in rungs), rungs
-# Ordered top to bottom, and no two rungs share a pixel of height.
-for (ta, a), (tb, b) in zip(rungs, rungs[1:]):
-    assert a[3] <= b[1], (ta, tb, a, b)
-# Width is the headcount: 10 >= 3 >= 1, and every rung is a visible bar.
-widths = [b[2] - b[0] for _t, b in rungs]
-assert widths[2] >= widths[1] >= widths[0] > 0, (rungs, widths)
-assert widths[2] > widths[0], (rungs, widths)
-# The surge ghost extends past the solid worker rung, and stays inside the card.
-ghost = ov.canvas.bbox("ladder_ghost")
-assert ghost and ghost[2] >= rungs[2][1][2], (ghost, rungs[2])
-assert ghost[2] <= ov.width, (ghost, ov.width)
+
+# Two token-share bars under every rung. With no state/tiers.json yet this is
+# the empty window: every track is drawn, every label reads 0%, and nothing is
+# filled - a blank row would look like a panel that had failed to load.
+TIER_NAMES = ("executive", "advisory", "workers")
+for tier in TIER_NAMES:
+    for kind in ("in", "out"):
+        assert ov.canvas.bbox("track_%s_%s" % (kind, tier)), (kind, tier)
+        assert not ov.canvas.find_withtag("rung_%s_%s" % (kind, tier)), (kind, tier)
+assert texts.count("in 0%") == 3 and texts.count("out 0%") == 3, texts
+assert not ov.canvas.find_withtag("ladder_note"), texts
+
+# The loop's own numbers: 60/20 executive, 20/20 advisory, 20/60 workers.
+now_iso = overlay.utcnow().isoformat()
+(cfg.state_dir / "tiers.json").write_text(json.dumps({
+    "window": {"start": now_iso, "end": now_iso},
+    "tiers": {"executive": {"input": 600, "output": 200, "sessions": 1},
+              "advisory": {"input": 200, "output": 200, "sessions": 2},
+              "workers": {"input": 200, "output": 600, "sessions": 3}},
+    "generated_at": now_iso}), encoding="utf-8")
+ov._refresh()
+ov.root.update_idletasks()
+texts = [t for t, _a, _b in spans()]
+for want in ("in 60%", "out 20%", "in 20%", "out 60%"):
+    assert want in texts, (want, texts)
+bars = {}
+for tier in TIER_NAMES:
+    for kind in ("in", "out"):
+        box = ov.canvas.bbox("rung_%s_%s" % (kind, tier))
+        assert box, (kind, tier)
+        bars[(kind, tier)] = box
+# Input over output inside each rung, and neither bar leaves its own track.
+for tier in TIER_NAMES:
+    assert bars[("in", tier)][3] <= bars[("out", tier)][1], (tier, bars)
+    for kind in ("in", "out"):
+        track = ov.canvas.bbox("track_%s_%s" % (kind, tier))
+        box = bars[(kind, tier)]
+        assert box[0] >= track[0] - 1 and box[2] <= track[2] + 1, (kind, tier, box, track)
+        assert box[2] <= ov.width, (kind, tier, box)
+# Width is the share, on both axes and in both directions.
+def bar_w(kind, tier):
+    return bars[(kind, tier)][2] - bars[(kind, tier)][0]
+assert bar_w("in", "executive") > bar_w("in", "workers"), bars
+assert bar_w("out", "workers") > bar_w("out", "executive"), bars
+assert abs(bar_w("in", "advisory") - bar_w("out", "advisory")) <= 1, bars
+# The six labels are one right-aligned column and no two of them touch.
+label_boxes = sorted(
+    (ov.canvas.bbox(i) for tier in TIER_NAMES for kind in ("in", "out")
+     for i in ov.canvas.find_withtag("share_%s_%s" % (kind, tier))),
+    key=lambda b: b[1])
+assert len(label_boxes) == 6, label_boxes
+assert len({round(b[2]) for b in label_boxes}) == 1, label_boxes
+for a, b in zip(label_boxes, label_boxes[1:]):
+    assert a[3] <= b[1], (a, b)
 # The whole chart is wedged between the footer above and the goal row below.
 chart = ov.canvas.bbox("ladder")
+goal_box = ov.canvas.bbox("goal_minus")
 label_y = [ov.canvas.bbox(i)[1] for i in ov.canvas.find_all()
            if ov.canvas.type(i) == "text"
            and ov.canvas.itemcget(i, "text") == "AGENTIC GRAPH"]
@@ -1774,8 +1838,8 @@ spine = ov.canvas.bbox("ladder_spine")
 assert spine[0] <= chart[0] + ov._px(4), (spine, chart)
 # The spine runs the height of the rungs, which is what makes it read as one
 # ladder rather than three loose bars.
-assert spine[1] <= rungs[0][1][1] + 2 and spine[3] >= rungs[2][1][3] - 2, (
-    spine, rungs)
+assert spine[1] <= bars[("in", "executive")][1] + 2, (spine, bars)
+assert spine[3] >= bars[("out", "workers")][3] - 2, (spine, bars)
 # The xN column is tabular: one right edge shared down all three rungs, and
 # the model ids share one left edge the same way.
 count_right = sorted({round(x1) for t, _x0, x1 in spans()
@@ -1797,8 +1861,127 @@ title_btns = [ov.canvas.bbox(i) for t in ("close_btn", "min_btn")
               for i in ov.canvas.find_withtag(t)]
 assert chip and title_btns, (chip, title_btns)
 assert chip[2] <= min(b[0] for b in title_btns), (chip, title_btns)
+check_ladder_texts("native")
+
+# --------------------------------------------- the ACTIVE graph on the panel
+# The fork is running on opus-5 (the handover record written above) while the
+# graph is moved to fable-5-1 at the executive. The rung must keep showing the
+# model actually in use, name the configured one dimmed beside it, and the
+# ladder must grow its one-line note - all on the next refresh, no restart.
+graph.write_graph(cfg, {graph.EXECUTIVE: {"model": "claude-fable-5-1"}})
+ov._refresh()
+ov.root.update_idletasks()
+texts = [t for t, _a, _b in spans()]
+assert "opus-5" in texts, texts
+assert "cfg fable-5-1" in texts, texts
+assert ov.canvas.find_withtag("cfg_executive"), texts
+note = [t for t in texts if t.startswith("active vs configured")]
+assert note and "..." not in note[0], texts
+assert "executive opus-5" in note[0], note
+note_box = ov.canvas.bbox("ladder_note")
+goal_box = ov.canvas.bbox("goal_minus")
+assert note_box[1] >= ov.canvas.bbox("rung_out_workers")[3], (note_box,)
+assert note_box[3] <= goal_box[1], (note_box, goal_box)
 lowest = max(ov.canvas.bbox(i)[3] for i in ov.canvas.find_all())
 assert lowest <= int(ov.canvas["height"]) + 2, (lowest, ov.canvas["height"])
+
+# Flip the override again: the next refresh carries the new worker model,
+# still with no restart, and the note holds the executive difference.
+graph.write_graph(cfg, {graph.WORKERS: {"model": "claude-sonnet-5"}})
+ov._refresh()
+ov.root.update_idletasks()
+texts = [t for t, _a, _b in spans()]
+assert "sonnet-5" in texts and "haiku-4-5" not in texts, texts
+assert any(t.startswith("active vs configured") for t in texts), texts
+check_ladder_texts("active")
+
+# config.json edited under the running panel: the next refresh shows it, with
+# no restart. The worker fallback is the field to prove it on - state/graph.json
+# is a patch that never named it, so it is config.json's alone to answer for.
+(tmp / "config.json").write_text(json.dumps({"graph": {
+    "workers": {"model": "claude-opus-5",
+                "fallback": "claude-haiku-4-5-20251001", "count": 4,
+                "surge_count": 8}}}), encoding="utf-8")
+ov._refresh()
+ov.root.update_idletasks()
+texts = [t for t, _a, _b in spans()]
+assert "->haiku-4-5" in texts, texts
+assert ov.canvas.find_withtag("fallback_workers"), texts
+
+# Every tier's model is pinned by state/graph.json here (write_graph above named
+# it), so every rung carries the dot that says config.json cannot move it.
+for tier in TIER_NAMES:
+    assert ov.canvas.find_withtag("pinned_%s" % tier), tier
+
+
+def set_scale(scale):
+    """Re-scale tk and the overlay's fonts; False when this build cannot."""
+    try:
+        ov.root.tk.call("tk", "scaling",
+                        scale * overlay.BASELINE_DPI / overlay.POINTS_PER_INCH)
+    except tk.TclError as exc:
+        print("SKIP scaling %s:" % scale, exc)
+        return False
+    ov._font = tkfont.Font(family="Segoe UI", size=9)
+    ov._font_bold = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+    ov._font_small = tkfont.Font(family="Segoe UI", size=8)
+    ov._font_mono = tkfont.Font(family=overlay.FONT_MONO[0],
+                                size=overlay.FONT_MONO[1])
+    ov.s = scale
+    ov.width = ov._px(cfg.overlay_width)
+    return True
+
+
+# ------------------------------- the configured id beside a LIMITED tag
+# The state the "cfg" label exists for: the fork runs on opus-5 while the
+# configured executive model is marked limited. The rung has to carry the red
+# tag AND the configured id, at every DPI - the tag shortens to "LIM" and the
+# model column slides before the suffix is ever ellipsised, because "cfg fab..."
+# names no model at all.
+graph.write_limited(cfg, "claude-fable-5-1", "529 overloaded")
+for scale in (1.0, 1.25, 1.5, 2.0):
+    if not set_scale(scale):
+        continue
+    ov._refresh()
+    ov.root.update_idletasks()
+    texts = [t for t, _a, _b in spans()]
+    # The configured id survives whole at every scale - never an ellipsis.
+    assert "cfg fable-5-1" in texts, (scale, texts)
+    assert ov.canvas.find_withtag("cfg_executive"), (scale, texts)
+    assert not any(t.startswith("cfg ") and t.endswith("...") for t in texts), \
+        (scale, texts)
+    # ... and the rung still says the model is limited, in whichever of the
+    # three forms fits beside it: the word, "LIM", or the red dot.
+    marks = ov.canvas.find_withtag("limited_executive")
+    assert marks, (scale, texts)
+    word = [t for t in texts if t in ("LIMITED", "LIM")]
+    kinds = {ov.canvas.type(i) for i in marks}
+    assert word or kinds == {"oval"}, (scale, texts, kinds)
+    check_ladder_texts("limited-%s" % scale)
+    print("limited at %sx: %s" % (scale, word[0] if word else "dot"))
+graph.clear_limited(cfg)
+
+# The same ladder at a 1x display scale, where the design pixels are at their
+# smallest against the text they have to hold apart.
+try:
+    ov.root.tk.call("tk", "scaling",
+                    overlay.BASELINE_DPI / overlay.POINTS_PER_INCH)
+    ov._font = tkfont.Font(family="Segoe UI", size=9)
+    ov._font_bold = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+    ov._font_small = tkfont.Font(family="Segoe UI", size=8)
+    ov._font_mono = tkfont.Font(family=overlay.FONT_MONO[0],
+                                size=overlay.FONT_MONO[1])
+    ov.s = 1.0
+    ov.width = ov._px(cfg.overlay_width)
+except tk.TclError as exc:
+    print("SKIP scaling 1x:", exc)
+else:
+    ov._refresh()
+    ov.root.update_idletasks()
+    check_ladder_texts("1x")
+    one_x = [t for t, _a, _b in spans()]
+    assert "cfg fable-5-1" in one_x, one_x
+    assert any(t.startswith("in ") for t in one_x), one_x
 
 ids = ov.canvas.find_withtag("close_btn")
 assert ids, "no close button drawn"
@@ -2662,17 +2845,25 @@ def test_overlay_ladder_shows_fallbacks_and_limited_tags():
     # The fallback rides in the rung's own text line, dimmed after the model.
     assert 'f"->{short_model(fallback)}"' in ladder, ladder
     assert "fill=DIM" in ladder and 'f"fallback_{tier}"' in ladder, ladder
-    # The LIMITED tag takes its width out of the model column, so it can never
+    # The limited tag takes its width out of the model column, so it can never
     # land on top of the model id or the count.
-    assert '"LIMITED"' in ladder and 'f"limited_{tier}"' in ladder, ladder
-    assert "right -= self._font_small.measure(tag)" in ladder, ladder
+    assert overlay.LIMITED_TAG == "LIMITED", overlay.LIMITED_TAG
+    assert "LIMITED_TAG" in ladder and 'f"limited_{tier}"' in ladder, ladder
+    assert "right = count_left - tag_w(tag)" in ladder, ladder
     assert "P = self._px" in ladder and "self._pxf(" in ladder, ladder
+    # The tag is what gives way when the rung is full, in three steps, and the
+    # dimmed suffix beside it is drawn whole or not at all - never ellipsised.
+    assert "LIMITED_SHORT" in ladder and "LIMITED_DOT" in ladder, ladder
+    assert "self._fit(suffix" not in ladder and "_fit(text" in ladder, ladder
+    assert "suffix = \"\"" in ladder, ladder
     # Both are read fresh every refresh, like the graph itself.
     refresh = inspect.getsource(overlay.Overlay._refresh)
     assert "limited_model(self.cfg)" in refresh, refresh
-    # The ladder is no taller for either of them.
+    # The ladder is no taller for either of them: three rungs, whose height is
+    # measured from the fonts rather than assumed, plus the gaps.
     height = inspect.getsource(overlay.Overlay._ladder_height)
-    assert "3 * P(LADDER_RUNG_H)" in height, height
+    assert "3 * rung" in height and "_share_geometry()" in height, height
+    assert "2 * P(LADDER_RUNG_GAP)" in height, height
 
 
 # -------------------------------------------------------------- the ledger
@@ -2787,13 +2978,24 @@ def test_ledger_tiers_by_role_when_one_model_serves_every_tier():
     # Whatever the director happens to be running is still the executive tier.
     assert ledger.tier_of("claude-fable-5-1", flat,
                           ledger.FORK_SOURCE) == ledger.EXEC_TIER
-    # Name a second model and the id decides again, role or no role.
+    # A role stamp wins even when the graph DOES name two models: a fork that
+    # ran on the model now sitting at the worker tier was still the director
+    # while it ran, and it is flagged rather than re-filed.
     split = G.normalize({G.WORKERS: {"model": "claude-sonnet-5"}}, flat)
     assert ledger.graph_separates_tiers(split)
     assert ledger.tier_of("claude-sonnet-5", split,
-                          ledger.MAIN_SOURCE) == ledger.WORK_TIER
+                          ledger.MAIN_SOURCE) == ledger.EXEC_TIER
     assert ledger.tier_of("claude-opus-5", split,
-                          ledger.AGENT_SOURCE) == ledger.EXEC_TIER
+                          ledger.AGENT_SOURCE) == ledger.WORK_TIER
+    assert ledger.role_tiered("claude-sonnet-5", split, ledger.FORK_SOURCE)
+    assert not ledger.role_tiered("claude-opus-5", split, ledger.FORK_SOURCE)
+    assert not ledger.role_tiered("claude-sonnet-5", split, ledger.AGENT_SOURCE)
+    # Nothing to flag while one model serves every tier: no id could say a
+    # session belonged anywhere else.
+    assert not ledger.role_tiered("claude-opus-5", flat, ledger.FORK_SOURCE)
+    # With no role at all - a bare model label - the id still decides.
+    assert ledger.tier_of("claude-sonnet-5", split) == ledger.WORK_TIER
+    assert ledger.tier_of("claude-opus-5", split) == ledger.EXEC_TIER
 
 
 def test_ledger_verdict_is_not_inverted_by_a_single_model_graph():
@@ -2925,10 +3127,19 @@ def test_ledger_verdict_uses_the_sixty_percent_rule():
     G.apply_graph(hands)
     summary = ledger.build_summary(hands, utcnow() - timedelta(hours=1), utcnow())
     assert summary["verdict"]["executive_only"] is False, summary["verdict"]
-    assert summary["fable_vs_opus"]["fable_models"] == ["claude-opus-5"]
-    assert summary["fable_vs_opus"]["opus_models"] == ["claude-sonnet-5"]
+    # Tiers follow the transcript's role, so every turn of the main session is
+    # the executive tier's - including the one it ran on the workers' model.
+    assert summary["fable_vs_opus"]["fable_models"] == ["claude-opus-5",
+                                                        "claude-sonnet-5"]
+    assert summary["fable_vs_opus"]["opus_models"] == []
     assert summary["fable_work_breakdown"]["fable"]["AUTHOR"]["output"] == 300
     assert summary["root_causes"], summary["root_causes"]
+    # That row says so on its face: the model is the graph's worker model.
+    flagged = [s for s in summary["where_fable_went"] if s["role_tiered"]]
+    assert [s["model"] for s in flagged] == ["claude-sonnet-5"], flagged
+    assert all(s["role"] == ledger.MAIN_SOURCE
+               for s in summary["where_fable_went"]), summary["where_fable_went"]
+    assert any("role-tiered" in c for c in summary["caveats"]), summary["caveats"]
 
     # The same tier that only decides and delegates passes the same rule.
     exec_only = _ledger_cfg(exec_tools=())
@@ -2938,7 +3149,11 @@ def test_ledger_verdict_uses_the_sixty_percent_rule():
     assert summary["verdict"]["executive_only"] is True, summary["verdict"]
     assert summary["root_causes"] == [], summary["root_causes"]
     breakdown = summary["fable_work_breakdown"]["fable"]
-    assert breakdown["DECIDE"]["share"] == 1.0, breakdown
+    # Three DECIDE turns and the one OPS turn the session ran on the workers'
+    # model; deciding is the bulk of the weighted cost, well under the rule.
+    assert breakdown["DECIDE"]["messages"] == 3, breakdown
+    assert breakdown["OPS"]["messages"] == 1, breakdown
+    assert 0.8 < breakdown["DECIDE"]["share"] < 1.0, breakdown
     for cat in ledger.CATS:
         assert set(breakdown[cat]) >= {"output", "weighted", "share"}, breakdown
 
@@ -3168,9 +3383,10 @@ def test_ledger_finds_forks_by_recorded_id_and_by_prompt():
 
     found = ledger.discover_sessions(cfg, utcnow() - timedelta(hours=1), utcnow())
     roles = {s["sid"]: s["role"] for s in found}
-    assert roles.get(MAIN_ID) == "main", roles
-    assert roles.get(known) == "fork", roles
-    assert roles.get(unknown) == "fork", roles
+    assert roles.get(MAIN_ID) == ledger.MAIN_SOURCE, roles
+    assert roles.get(known) == ledger.FORK_SOURCE, roles
+    assert roles.get(unknown) == ledger.FORK_SOURCE, roles
+    assert set(roles.values()) <= set(ledger.ROLE_STAMPS), roles
     summary = ledger.build_summary(cfg, utcnow() - timedelta(hours=1), utcnow())
     assert summary["totals_by_model"]["claude-sonnet-5"]["output_tokens"] == 74
     assert "fork" in summary["sources"]["fork_sessions"] or True
@@ -3462,8 +3678,25 @@ def test_pricing_summary_cost_block():
     assert used["claude-sonnet-5"]["unpriced"] is True, used
     assert used["claude-sonnet-5"]["input"] is None, used
     sink = cost["top_sinks"][0]
-    assert set(sink) == {"source", "id_or_label", "what", "model", "usd",
-                         "tokens_out", "cache_read"}, sink
+    assert set(sink) == {"source", "role", "id_or_label", "what", "model",
+                         "usd", "tokens_out", "cache_read"}, sink
+    assert sink["role"] in ledger.ROLE_STAMPS, sink
+    # Role x model, the one cut a graph change cannot re-file: turns, output,
+    # weighted cost and the bill, adding back up to the totals above.
+    by_role = summary["by_role"]
+    assert {(r["role"], r["model"]) for r in by_role} == {
+        (ledger.MAIN_SOURCE, "claude-opus-5"),
+        (ledger.MAIN_SOURCE, "claude-sonnet-5")}, by_role
+    priced = next(r for r in by_role if r["model"] == "claude-opus-5")
+    assert priced["turns"] == 3 and priced["output"] == 300, priced
+    assert abs(priced["cost_usd"] - round(want, 4)) < 1e-9, priced
+    assert abs(sum(r["weighted"] for r in by_role) - 380.0) < 1e-9, by_role
+    # The graph the page was built against, printed in its footer.
+    forced = summary["graph_in_force"]
+    assert set(forced) == {"executive", "advisory", "workers"}, forced
+    assert forced["workers"]["model"] == "claude-sonnet-5", forced
+    assert "fallback" in forced["executive"] and "count" in forced["executive"]
+    assert "surge_count" in forced["workers"], forced
     # The per-model totals carry the same bill, and say when there is none.
     totals = summary["totals_by_model"]
     assert abs(totals["claude-opus-5"]["cost_usd"] - round(want, 4)) < 1e-9
@@ -3787,6 +4020,641 @@ def test_repo_config_ships_the_priced_table():
     # with the whole executive tier unpriced.
     from tokentracker import graph as G
     assert P.unpriced(P.read_pricing(cfg), G.known_models(cfg)) == []
+
+
+# ------------------------------------------ the loop's config re-read (6a)
+
+def _reload_root() -> Path:
+    root = Path(tempfile.mkdtemp(prefix="tokdist_reload_"))
+    (root / "state").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _write_reload_config(root: Path, executive: str, prompt: str,
+                         workers: int = 2) -> None:
+    (root / "config.json").write_text(json.dumps({
+        "main_session_ids": [MAIN_ID],
+        "throttle_fork_enabled": True,
+        "fork_in_pace": True,
+        "fork_cooldown_seconds": 0,
+        "throttle_prompt": prompt,
+        "report_repo": "",
+        "report_on_stop": False,
+        "report_on_milestone": False,
+        "local_enabled": False,
+        "graph": {
+            "executive": {"model": executive, "fallback": None, "count": 1},
+            "advisory": {"model": executive, "fallback": None, "count": 3},
+            "workers": {"model": "claude-opus-5", "fallback": None,
+                        "count": workers, "surge_count": workers},
+        },
+    }, indent=2), encoding="utf-8")
+
+
+def test_loop_rereads_config_between_ticks():
+    """config.json edited under a running loop reaches that loop's next launch.
+
+    The proven failure of 2026-09-03 19:48 UTC: the graph was edited while the
+    loop ran, state/graph.json carried only the worker count, and the next fork
+    still went out on the executive model the process had started with.
+    """
+    from tokentracker import cli
+    from tokentracker.config import load_config
+
+    root = _reload_root()
+    _write_reload_config(root, "claude-fable-5-1", "brief one")
+    cfg = load_config(root)
+    # Nothing in this test may read the real ~/.claude tree.
+    cfg.projects_dir = root / "projects"
+    cfg.sessions_dir = root / "sessions"
+    cfg.projects_dir.mkdir(parents=True, exist_ok=True)
+    assert cfg.throttle_model == "claude-fable-5-1", cfg.throttle_model
+    assert cfg.max_concurrency == 2, cfg.max_concurrency
+
+    d, launched = _gate_dispatcher(cfg)
+    argvs: list[list[str]] = []
+
+    def fake_launch(task, now, lane="cloud"):
+        argvs.append(d._argv(task, lane, "claude.exe"))
+        task.status = "running"
+        task.lane = lane
+        task.model_used = d._task_model(task, lane)
+        launched.append((task.id, lane))
+        return f"task {task.id}: launched {lane}"
+
+    d.launch = fake_launch
+    history = usage.UsageHistory(cfg)
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.2, left_h=100.0)
+    try:
+        cli._tick(cfg, d, history)
+        assert argvs, launched
+        assert argvs[0][argvs[0].index("--model") + 1] == "claude-fable-5-1", argvs
+        assert d.get(cli.THROTTLE_TASK_ID).prompt == "brief one"
+
+        # The fork ends; config.json is edited while the loop keeps running.
+        task = d.get(cli.THROTTLE_TASK_ID)
+        task.status = "done"
+        task.finished_at = (utcnow() - timedelta(hours=1)).isoformat()
+        time.sleep(0.01)
+        _write_reload_config(root, "claude-opus-5", "a longer second brief", 5)
+
+        _decision, actions, _exc, _snap, _rolled = cli._tick(cfg, d, history)
+        assert any(a.startswith("config reloaded:") for a in actions), actions
+        reloaded = next(a for a in actions if a.startswith("config reloaded:"))
+        assert "graph" in reloaded and "throttle_prompt" in reloaded, reloaded
+        changed = next(a for a in actions if a.startswith("graph changed:"))
+        assert "fable-5-1" in changed and "opus-5" in changed, changed
+        # Same process, same Config object, new numbers.
+        assert cfg.throttle_model == "claude-opus-5", cfg.throttle_model
+        assert cfg.max_concurrency == 5, cfg.max_concurrency
+        assert cfg.throttle_prompt == "a longer second brief"
+        # And the launch that followed carries them.
+        argv = argvs[-1]
+        assert argv[argv.index("--model") + 1] == "claude-opus-5", argv
+        assert d.get(cli.THROTTLE_TASK_ID).prompt == "a longer second brief"
+        # State paths never move under a running loop.
+        assert cfg.state_dir == root / "state", cfg.state_dir
+        assert cfg.tasks_file == root / "tasks.json", cfg.tasks_file
+        assert cfg.projects_dir == root / "projects", cfg.projects_dir
+        # An unchanged file is not re-read, and says nothing.
+        _decision, actions, _exc, _snap, _rolled = cli._tick(cfg, d, history)
+        assert not [a for a in actions if a.startswith("config reloaded")], actions
+    finally:
+        usage.fetch_usage = real_fetch
+
+
+def test_config_reload_is_a_no_op_until_the_file_changes():
+    from tokentracker.config import config_signature, reload_config
+    root = _reload_root()
+    _write_reload_config(root, "claude-fable-5-1", "brief one")
+    from tokentracker.config import load_config
+    cfg = load_config(root)
+    assert reload_config(cfg) is None          # same signature as the load
+    assert config_signature(cfg) == cfg.config_sig
+
+    time.sleep(0.01)
+    _write_reload_config(root, "claude-fable-5-1", "brief one", workers=9)
+    changed = reload_config(cfg)
+    assert changed == ["graph"], changed
+    assert cfg.max_concurrency == 9, cfg.max_concurrency
+
+    # A key deleted from the file goes back to the dataclass default.
+    time.sleep(0.01)
+    raw = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    raw.pop("throttle_prompt")
+    raw["poll_seconds"] = 77
+    (root / "config.json").write_text(json.dumps(raw), encoding="utf-8")
+    changed = reload_config(cfg)
+    assert set(changed) == {"throttle_prompt", "poll_seconds"}, changed
+    assert cfg.throttle_prompt == "" and cfg.poll_seconds == 77
+
+    # Junk on disk never raises and never re-parses on every poll.
+    time.sleep(0.01)
+    (root / "config.json").write_text("{ not json", encoding="utf-8")
+    assert reload_config(cfg) is None
+    assert reload_config(cfg) is None
+    assert cfg.poll_seconds == 77, cfg.poll_seconds
+    # Paths are not reloadable: a config that names one cannot move it.
+    from tokentracker.config import reloadable_keys
+    for key in ("state_dir", "tasks_file", "projects_dir", "logs_dir"):
+        assert key not in reloadable_keys(), key
+
+
+def test_config_reload_names_the_fields_state_graph_pins():
+    """An edit config.json cannot win, said out loud rather than swallowed.
+
+    state/graph.json wins field by field, so a pinned executive model makes
+    every later edit to config.json's executive model inert - and the reload
+    line ("config reloaded: graph") and the graph label both look exactly as
+    they do for an edit that took effect. This is the live state on this
+    machine: state/graph.json has pinned executive.model since 2026-09-03.
+    """
+    from tokentracker import cli
+    from tokentracker import graph as G
+    from tokentracker.config import load_config
+
+    root = _reload_root()
+    _write_reload_config(root, "claude-fable-5-1", "brief one")
+    (root / "state" / "graph.json").write_text(json.dumps({"graph": {
+        "executive": {"model": "claude-fable-5-1"},
+        "workers": {"count": 7}}}), encoding="utf-8")
+    cfg = load_config(root)
+    assert cfg.throttle_model == "claude-fable-5-1", cfg.throttle_model
+    assert cfg.max_concurrency == 7, cfg.max_concurrency
+    assert G.pinned_fields(cfg) == {"executive": ("model",),
+                                    "workers": ("count",)}
+    # The override is readable, so the standing warning says nothing at all.
+    assert G.override_warning(cfg) is None
+
+    time.sleep(0.01)
+    _write_reload_config(root, "claude-opus-5", "brief one")
+    lines = cli._reload_config(cfg)
+    assert any(l.startswith("config reloaded:") for l in lines), lines
+    note = next(l for l in lines if l.startswith("note:"))
+    assert "state/graph.json pins executive.model=claude-fable-5-1" in note, note
+    assert "config.json's executive.model is ignored" in note, note
+    assert "tracker.py graph set executive.model=" in note, note
+    # The pin is the reason: the executive model did NOT move with the file.
+    assert cfg.throttle_model == "claude-fable-5-1", cfg.throttle_model
+    assert cfg.graph["executive"]["model"] == "claude-opus-5", cfg.graph
+    # The advisory model changed in the same edit and is not pinned, so it
+    # moved and draws no note.
+    assert G.read_graph(cfg)["advisory"]["model"] == "claude-opus-5"
+    assert not any("advisory" in l for l in lines), lines
+    # One note per pinned field the edit touched, not per pin standing.
+    assert len([l for l in lines if l.startswith("note:")]) == 1, lines
+    # An edit that touches nothing pinned is quiet again.
+    time.sleep(0.01)
+    _write_reload_config(root, "claude-opus-5", "second brief")
+    lines = cli._reload_config(cfg)
+    assert not [l for l in lines if l.startswith("note:")], lines
+
+    # Startup and `tracker.py graph` name every pin, edited or not.
+    startup = G.pin_notes(cfg)
+    assert len(startup) == 2, startup
+    assert any("workers.count=7" in l for l in startup), startup
+    printed = _capture(lambda: cli.cmd_graph(cfg, None))
+    for line in startup:
+        assert line in printed.splitlines(), printed
+    # And the panel marks the rung, so the pin is visible without the log.
+    active = G.active_graph(cfg)
+    assert active[G.EXECUTIVE]["pinned"] is True, active
+    assert active[G.ADVISORY]["pinned"] is False, active
+    # A pinned *count* is the ordinary result of a tap on the panel's -/+.
+    assert active[G.WORKERS]["pinned"] is False, active
+
+
+# ------------------------------------------- the ACTIVE graph on the panel (6)
+
+def test_active_graph_reads_what_is_running_now():
+    from tokentracker import graph as G
+    from tokentracker import handover
+    cfg = _limit_cfg()          # E fable-5-1 ->fable-5, W opus-5 ->opus-4-8
+    active = G.active_graph(cfg)
+    for tier in G.TIERS:
+        assert active[tier]["model"] == G.read_graph(cfg)[tier]["model"], tier
+        assert active[tier]["differs"] is False, tier
+    assert G.active_label(active) == ""
+
+    # A fork launched on the executive's fallback: the rung follows the
+    # handover record, and the configured id is carried beside it.
+    handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                            model="claude-fable-5", parent_session=MAIN_ID,
+                            started_at=utcnow().isoformat())
+    active = G.active_graph(cfg)
+    assert active[G.EXECUTIVE]["model"] == "claude-fable-5"
+    assert active[G.EXECUTIVE]["configured"] == "claude-fable-5-1"
+    assert active[G.EXECUTIVE]["differs"] is True
+    assert G.active_label(active) == "executive fable-5 (cfg fable-5-1)"
+    # A finished fork answers for nothing: the tier reads as configured again.
+    handover.finish_handover(cfg, status="done",
+                             finished_at=utcnow().isoformat())
+    assert G.active_graph(cfg)[G.EXECUTIVE]["model"] == "claude-fable-5-1"
+
+    # Running rows name the worker tier, the fork's own row excluded (it is the
+    # executive) and finished rows ignored.
+    def row(task_id, status, model):
+        return {"id": task_id, "prompt": "p", "cwd": str(cfg.root),
+                "status": status, "model_used": model}
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        row("pod", "running", "claude-opus-4-8"),
+        row("pod2", "running", "claude-sonnet-5"),
+        row("pod3", "running", "claude-opus-4-8"),
+        row(handover.FORK_TASK_ID, "running", "claude-fable-5"),
+        row("old", "done", "claude-haiku-4-5-20251001"),
+    ]}), encoding="utf-8")
+    active = G.active_graph(cfg)
+    assert active[G.WORKERS]["models"] == ["claude-opus-4-8", "claude-sonnet-5"]
+    assert active[G.WORKERS]["model"] == "claude-opus-4-8"
+    assert active[G.WORKERS]["differs"] is True
+    assert active[G.EXECUTIVE]["model"] == "claude-fable-5-1", active
+
+    # The advisory lenses have no row anywhere: configured, or the fallback
+    # while the primary is marked limited.
+    G.write_limited(cfg, "claude-fable-5-1", "529")
+    active = G.active_graph(cfg)
+    assert active[G.ADVISORY]["model"] == "claude-fable-5"
+    assert active[G.ADVISORY]["configured"] == "claude-fable-5-1"
+    assert active[G.ADVISORY]["differs"] is True
+    assert "advisory fable-5 (cfg fable-5-1)" in G.active_label(active)
+    G.clear_limited(cfg)
+
+    # Junk on disk degrades to the configured graph rather than raising.
+    cfg.tasks_file.write_text("{ not json", encoding="utf-8")
+    cfg.handover_file.write_text("[]", encoding="utf-8")
+    active = G.active_graph(cfg)
+    assert active[G.WORKERS]["model"] == "claude-opus-5", active
+    assert active[G.EXECUTIVE]["differs"] is False, active
+
+
+def test_overlay_draws_the_active_graph_and_share_bars():
+    import inspect
+    try:
+        import tkinter  # noqa: F401  - absent on headless builds
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    refresh = inspect.getsource(overlay.Overlay._refresh)
+    # Nothing is cached across a refresh: config.json (by mtime), the graph
+    # override, the live models and the tier shares are all re-read.
+    for marker in ("reload_config(self.cfg)", "read_graph(self.cfg)",
+                   "active_graph(self.cfg", "tier_shares(read_tiers(self.cfg))"):
+        assert marker in refresh, marker
+    ladder = inspect.getsource(overlay.Overlay._draw_graph_ladder)
+    assert 'f"cfg {short_model(active.get(\'configured\'))}"' in ladder, ladder
+    assert "_draw_share_bars" in ladder and "ladder_note" in ladder, ladder
+    bars = inspect.getsource(overlay.Overlay._draw_share_bars)
+    # Two bars, in the palette's blue and green, labelled in the mono font.
+    assert '"input_share", BLUE' in bars and '"output_share", GREEN' in bars, bars
+    assert 'f"{kind} {value:.0%}"' in bars and "FONT_MONO" in bars, bars
+    assert 'f"track_{kind}_{tier}"' in bars, bars
+    # The overlay reads the loop's file; it never parses a transcript itself.
+    src = inspect.getsource(overlay)
+    assert "parse_transcript" not in src and "build_tiers" not in src, src
+
+
+# ------------------------------------------- the ladder's token shares (8)
+
+def test_tier_shares_arithmetic_and_missing_file():
+    from tokentracker import ledger
+    cfg = make_cfg()
+    # No file at all: the panel still has three tiers and six zero bars.
+    assert ledger.read_tiers(cfg) is None
+    empty = ledger.tier_shares(ledger.read_tiers(cfg))
+    assert set(empty) == set(ledger.PANEL_TIERS), empty
+    for tier in ledger.PANEL_TIERS:
+        assert empty[tier]["input_share"] == 0.0, empty
+        assert empty[tier]["output_share"] == 0.0, empty
+    assert "none yet" in ledger.tiers_status_line(cfg)
+
+    now = utcnow()
+    ledger.write_tiers(cfg, {
+        "window": {"start": (now - timedelta(hours=6)).isoformat(),
+                   "end": now.isoformat()},
+        "tiers": {"executive": {"input": 600, "output": 200, "sessions": 1},
+                  "advisory": {"input": 200, "output": 200, "sessions": 2},
+                  "workers": {"input": 200, "output": 600, "sessions": 3}},
+        "generated_at": now.isoformat()})
+    shares = ledger.tier_shares(ledger.read_tiers(cfg))
+    assert abs(sum(s["input_share"] for s in shares.values()) - 1.0) < 1e-9
+    assert abs(sum(s["output_share"] for s in shares.values()) - 1.0) < 1e-9
+    assert abs(shares["executive"]["input_share"] - 0.6) < 1e-9, shares
+    assert abs(shares["workers"]["output_share"] - 0.6) < 1e-9, shares
+    assert shares["advisory"]["sessions"] == 2, shares
+    line = ledger.tiers_status_line(cfg, now)
+    assert "E in 60% out 20%" in line and "W in 20% out 60%" in line, line
+    assert "6.0h window" in line, line
+
+    # A junk payload is an empty window, not an exception.
+    cfg.tiers_file.write_text("{ not json", encoding="utf-8")
+    assert ledger.read_tiers(cfg) is None
+    assert ledger.tier_shares({"tiers": {"executive": {"input": "lots"}}}
+                              )["executive"]["input_share"] == 0.0
+
+
+def _tier_cfg() -> Config:
+    """A main session, a fork, a reviewer lens and a worker lane on disk."""
+    cfg = _ledger_cfg(exec_tools=())
+    ts = (utcnow() - timedelta(minutes=4)).isoformat()
+    proj = cfg.projects_dir / "proj"
+    fork_id = "cccccccc-dddd-eeee-ffff-000000000000"
+    (proj / f"{fork_id}.jsonl").write_text("\n".join([
+        json.dumps({"type": "user", "timestamp": ts, "message": {
+            "role": "user", "content": cfg.throttle_prompt + " Continue."}}),
+        _entry("fk1", "claude-fable-5-1", ts, ["Workflow"],
+               _usage(out=40, inp=400), uuid="ufk"),
+    ]), encoding="utf-8")
+    agents = proj / fork_id / "subagents" / "workflows" / "wf1"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "agent-1.jsonl").write_text("\n".join([
+        json.dumps({"type": "user", "timestamp": ts, "message": {
+            "role": "user", "content": "You are the adversarial reviewer."}}),
+        _entry("rv1", "claude-fable-5-1", ts, ["Read"],
+               _usage(out=10, inp=100), uuid="urv"),
+    ]), encoding="utf-8")
+    (agents / "agent-2.jsonl").write_text("\n".join([
+        json.dumps({"type": "user", "timestamp": ts, "message": {
+            "role": "user", "content": "Implementer: build the thing."}}),
+        _entry("wk1", "claude-opus-5", ts, ["Edit"],
+               _usage(out=70, inp=700), uuid="uwk"),
+    ]), encoding="utf-8")
+    return cfg
+
+
+def test_build_tiers_splits_by_role_and_reuses_the_cache():
+    from tokentracker import ledger
+    cfg = _tier_cfg()
+    start, end = utcnow() - timedelta(hours=1), utcnow()
+    calls: list[str] = []
+    real_parse = ledger.parse_transcript
+
+    def counting_parse(path, s, e, seen=None, *rest):
+        calls.append(Path(path).name)
+        return real_parse(path, s, e, seen, *rest)
+
+    cache: dict = {}
+    first = ledger.build_tiers(cfg, start, end, cache, counting_parse)
+    assert set(first) == set(ledger.TIERS_KEYS), first
+    tiers = first["tiers"]
+    # The reviewer lens is the advisory tier, the implementer the workers, and
+    # both sessions the executive - by the role each transcript declares.
+    assert tiers["advisory"]["output"] == 10, tiers
+    assert tiers["workers"]["output"] == 70, tiers
+    # 3 x 100 + the 50 the main session ran on another model, + 40 fork.
+    assert tiers["executive"]["output"] == 390, tiers
+    assert tiers["executive"]["sessions"] == 2, tiers
+    assert tiers["advisory"]["input"] == 100, tiers
+    parsed = len(calls)
+    assert parsed == 4, calls        # main, fork, and the two agent files
+
+    # Nothing changed on disk: the second pass parses nothing at all.
+    second = ledger.build_tiers(cfg, start, end, cache, counting_parse)
+    assert len(calls) == parsed, calls
+    assert second["tiers"] == tiers, second
+
+    # A transcript that grows is read again, and only that one.
+    with (cfg.projects_dir / "proj" / f"{MAIN_ID}.jsonl").open(
+            "a", encoding="utf-8") as handle:
+        handle.write("\n" + _entry("m9", "claude-opus-5",
+                                   (utcnow() - timedelta(minutes=1)).isoformat(),
+                                   [], _usage(out=5), uuid="u9"))
+    third = ledger.build_tiers(cfg, start, end, cache, counting_parse)
+    assert len(calls) == parsed + 1, calls
+    assert calls[-1] == f"{MAIN_ID}.jsonl", calls
+    assert third["tiers"]["executive"]["output"] == 395, third["tiers"]
+
+    # The cache holds one entry per transcript, keyed on what can invalidate it,
+    # and is pruned to the files the current window actually names.
+    assert len(cache) == 4, cache
+    entry = cache[str(cfg.projects_dir / "proj" / f"{MAIN_ID}.jsonl")]
+    assert entry["sig"].endswith(start.isoformat()), entry
+    assert entry["ids"], entry
+    cache["C:/gone.jsonl"] = {"sig": "x", "input": 1, "output": 1, "ids": []}
+    ledger.build_tiers(cfg, start, end, cache, counting_parse)
+    assert "C:/gone.jsonl" not in cache, cache
+
+    # A reused entry restores the dedup marks the parse would have left, so a
+    # fork's copy of the parent's turns is still counted once.
+    fresh = ledger.build_tiers(cfg, start, end, {}, ledger.parse_transcript)
+    assert fresh["tiers"] == third["tiers"], (fresh["tiers"], third["tiers"])
+
+
+def test_refresh_tiers_writes_the_file_the_overlay_reads():
+    from tokentracker import ledger
+    cfg = _tier_cfg()
+    now = utcnow()
+    assert ledger.tiers_due(cfg, now) is True
+    payload = ledger.refresh_tiers(cfg, now)
+    assert cfg.tiers_file.exists() and cfg.ledger_cache_file.exists()
+    on_disk = ledger.read_tiers(cfg)
+    assert on_disk["tiers"] == payload["tiers"], on_disk
+    assert set(on_disk["tiers"]["workers"]) == set(ledger.TIER_FIELDS), on_disk
+    shares = ledger.tier_shares(on_disk)
+    assert abs(sum(s["output_share"] for s in shares.values()) - 1.0) < 1e-9
+    # Freshly written, so not due again until the period is up.
+    assert ledger.tiers_due(cfg, now) is False
+    assert ledger.tiers_due(
+        cfg, now + timedelta(seconds=ledger.tiers_refresh_seconds(cfg) + 1))
+    cfg.tiers_refresh_seconds = "soon"          # never raises on junk config
+    assert ledger.tiers_refresh_seconds(cfg) == float(ledger.TIERS_REFRESH_SECONDS)
+
+
+def test_status_prints_the_tier_shares_line():
+    from tokentracker import cli, ledger
+    cfg = _tier_cfg()
+    now = utcnow()
+    ledger.refresh_tiers(cfg, now)
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.3, left_h=50.0)
+    try:
+        out = _capture(lambda: cli.cmd_status(cfg))
+    finally:
+        usage.fetch_usage = real_fetch
+    line = next(l for l in out.splitlines() if l.startswith("tier shares:"))
+    assert "E in" in line and "A in" in line and "W in" in line, line
+
+
+def test_tick_writes_the_tier_shares_file():
+    """The wiring, not the writer: a poll is what fills the panel's bars.
+
+    `refresh_tiers` has its own test, and it kept passing when the call in
+    cli._tick was deleted - the bars would then read 0% forever with nothing
+    to say so. This runs a real tick, with the refresh thread run inline.
+    """
+    import threading as real_threading
+
+    from tokentracker import cli, ledger
+
+    cfg = _tier_cfg()
+    cfg.report_on_stop = False
+    cfg.report_on_milestone = False
+    d, _launched = _gate_dispatcher(cfg)
+    history = usage.UsageHistory(cfg)
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.2, left_h=100.0)
+
+    class Inline:
+        """Runs the target on start(), so the tick's work is done when it returns."""
+
+        def __init__(self, target=None, name=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    ledger.threading = types.SimpleNamespace(Thread=Inline)
+    try:
+        _decision, actions, _exc, _snap, _rolled = cli._tick(cfg, d, history)
+        assert "tier shares refreshing" in actions, actions
+        assert cfg.tiers_file.exists(), list(cfg.state_dir.iterdir())
+        assert cfg.ledger_cache_file.exists(), list(cfg.state_dir.iterdir())
+        payload = ledger.read_tiers(cfg)
+        assert set(payload["tiers"]) == set(ledger.PANEL_TIERS), payload
+        # The three roles the fixture puts on disk, split by role, not by model.
+        assert payload["tiers"]["advisory"]["output"] == 10, payload
+        assert payload["tiers"]["workers"]["output"] == 70, payload
+        assert payload["tiers"]["executive"]["output"] > 0, payload
+        shares = ledger.tier_shares(payload)
+        assert abs(sum(s["output_share"] for s in shares.values()) - 1.0) < 1e-9
+
+        # A second tick inside the refresh period rebuilds nothing.
+        _decision, actions, _exc, _snap, _rolled = cli._tick(cfg, d, history)
+        assert "tier shares refreshing" not in actions, actions
+    finally:
+        ledger.threading = real_threading
+        usage.fetch_usage = real_fetch
+
+
+# --------------------------------------------- role stamps in the ledger (7)
+
+def test_handover_log_appends_every_record():
+    from tokentracker import handover
+    cfg = make_cfg()
+    assert handover.read_log(cfg) == []
+    assert handover.fork_models(cfg) == {}
+
+    handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                            model="claude-fable-5-1", parent_session=MAIN_ID,
+                            started_at=NOW.isoformat())
+    handover.finish_handover(cfg, status="done",
+                             finished_at=(NOW + timedelta(minutes=5)).isoformat(),
+                             tokens=1200, cost_usd=0.5, fork_session_id="sid-1")
+    # A second fork, on the fallback: the log keeps both, handover.json one.
+    handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="surge",
+                            model="claude-fable-5", parent_session=MAIN_ID,
+                            started_at=(NOW + timedelta(minutes=6)).isoformat())
+    handover.finish_handover(cfg, status="failed",
+                             finished_at=(NOW + timedelta(minutes=9)).isoformat(),
+                             fork_session_id="sid-2")
+
+    log = handover.read_log(cfg)
+    assert [e["status"] for e in log] == ["started", "done", "started", "failed"]
+    assert all(set(e) == set(handover.LOG_KEYS) for e in log), log
+    assert handover.read_handover(cfg)["fork_session_id"] == "sid-2"
+    # Which model each fork actually ran on - the whole point of the log.
+    assert handover.fork_models(cfg) == {"sid-1": "claude-fable-5-1",
+                                         "sid-2": "claude-fable-5"}
+    # A torn append costs one line, never the file.
+    with cfg.handover_log.open("a", encoding="utf-8") as handle:
+        handle.write("{ not json\n")
+    assert len(handover.read_log(cfg)) == 4
+    assert handover.fork_models(cfg)["sid-2"] == "claude-fable-5"
+
+
+def test_dispatcher_appends_to_the_handover_log_on_launch_and_exit():
+    from tokentracker import cli, handover
+    cfg = _limit_cfg()
+    cfg.throttle_prompt = "director brief"
+    d = dispatch.Dispatcher(cfg)
+    cli._ensure_throttle_task(cfg, d, NOW)
+    task = d.get(cli.THROTTLE_TASK_ID)
+    captured: list[list[str]] = []
+    restore = _stub_launcher(captured)
+    try:
+        d.current_mode = "pace"
+        d.launch(task, NOW)
+        assert [e["status"] for e in handover.read_log(cfg)] == ["started"]
+        (cfg.logs_dir / f"{task.id}.out.json").write_text(json.dumps({
+            "is_error": False, "session_id": "fork-sid",
+            "usage": {"output_tokens": 9}}), encoding="utf-8")
+        d._procs[task.id].popen.returncode = 0
+        d._procs[task.id].popen.poll = lambda: 0
+        d.reap(NOW + timedelta(minutes=2))
+    finally:
+        restore()
+    log = handover.read_log(cfg)
+    assert [e["status"] for e in log] == ["started", "done"], log
+    assert log[0]["model"] == "claude-fable-5-1", log
+    assert handover.fork_models(cfg) == {"fork-sid": "claude-fable-5-1"}
+
+
+def test_ledger_stamps_roles_and_the_graph_in_force():
+    from tokentracker import graph as G
+    from tokentracker import handover, ledger
+    cfg = _tier_cfg()
+    fork_id = "cccccccc-dddd-eeee-ffff-000000000000"
+    # The fork ran on Fable 5.1, which the graph now names at the WORKER tier:
+    # tiering by model id would file the director's own turns as worker output.
+    G.write_graph(cfg, {G.EXECUTIVE: {"model": "claude-opus-5"},
+                        G.ADVISORY: {"model": "claude-opus-5"},
+                        G.WORKERS: {"model": "claude-fable-5-1"}})
+    handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                            model="claude-fable-5-1", parent_session=MAIN_ID,
+                            started_at=(utcnow() - timedelta(minutes=6)).isoformat())
+    handover.finish_handover(cfg, status="done",
+                             finished_at=utcnow().isoformat(),
+                             fork_session_id=fork_id)
+
+    sessions = ledger.discover_sessions(cfg, utcnow() - timedelta(hours=1),
+                                        utcnow())
+    stamps = {s["sid"]: (s["role"], s["model"]) for s in sessions}
+    assert stamps[MAIN_ID][0] == ledger.MAIN_SOURCE, stamps
+    assert stamps[fork_id] == (ledger.FORK_SOURCE, "claude-fable-5-1"), stamps
+
+    summary = ledger.build_summary(cfg, utcnow() - timedelta(hours=1), utcnow())
+    # Every row carries a role, and only the three stamps exist.
+    roles = {row["role"] for row in summary["where_fable_went"]}
+    assert roles <= set(ledger.ROLE_STAMPS) and roles, roles
+    assert ledger.FORK_SOURCE in roles and ledger.AGENT_SOURCE in roles, roles
+    # The fork is executive BY ROLE, flagged, and named in a caveat.
+    fork_rows = [r for r in summary["where_fable_went"]
+                 if r["role"] == ledger.FORK_SOURCE]
+    assert fork_rows and all(r["role_tiered"] for r in fork_rows), fork_rows
+    assert summary["fable_vs_opus"]["fable_output"] >= 340, summary["fable_vs_opus"]
+    assert any("role-tiered" in c for c in summary["caveats"]), summary["caveats"]
+    assert any("role" in line for line in summary["verdict"]["evidence"])
+    # by_role: role x model, adding up to the same turns and output.
+    by_role = summary["by_role"]
+    assert {r["role"] for r in by_role} == set(ledger.ROLE_STAMPS), by_role
+    assert set(by_role[0]) >= {"role", "model", "turns", "output", "weighted",
+                               "cost_usd"}, by_role[0]
+    fork_row = next(r for r in by_role if r["role"] == ledger.FORK_SOURCE)
+    assert fork_row["model"] == "claude-fable-5-1", fork_row
+    assert fork_row["output"] == 40 and fork_row["turns"] == 1, fork_row
+    total_out = sum(r["output"] for r in by_role)
+    assert total_out == sum(m["output_tokens"]
+                            for m in summary["totals_by_model"].values()), by_role
+    # The graph the page was generated against, printed in its footer.
+    forced = summary["graph_in_force"]
+    assert forced["workers"]["model"] == "claude-fable-5-1", forced
+    assert forced["executive"]["model"] == "claude-opus-5", forced
+    assert forced["workers"]["count"] >= 1 and "surge_count" in forced["workers"]
+
+
+def test_ledger_page_renders_roles_and_the_graph_in_force():
+    from tokentracker import ledger
+    cfg = _tier_cfg()
+    page = ledger.generate(cfg, "manual", hours=1.0)
+    html = page.read_text(encoding="utf-8")
+    assert "__DATA__" not in html and ledger.TITLE_PLACEHOLDER not in html
+    for marker in (">Roles</h2>", "roles-table", "drawRoles(",
+                   ">Graph in force</h3>", "graph-in-force", "drawGraphInForce(",
+                   '"by_role"', '"graph_in_force"', '["Role", null]',
+                   "role-tiered"):
+        assert marker in html, marker
 
 
 def main() -> int:
