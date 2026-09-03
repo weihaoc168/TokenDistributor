@@ -363,6 +363,7 @@ class Overlay:
         self._max_scroll = 0
         self._throttle = False
         self._after_id: str | None = None
+        self._collapsed = self._load_collapsed()
 
         _enable_dpi_awareness()
         self.root = tk.Tk()
@@ -411,7 +412,80 @@ class Overlay:
         self.root.bind("<Escape>", lambda _e: self.root.destroy())
         self.root.bind("<Button-3>", lambda _e: self.root.destroy())
         self.canvas.tag_bind("throttle_btn", "<Button-1>", self._toggle_throttle)
+        self.canvas.tag_bind("min_btn", "<Button-1>", self._toggle_collapsed)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
+
+    def _collapsed_file(self) -> Path:
+        return self.cfg.state_dir / "overlay.json"
+
+    def _load_collapsed(self) -> bool:
+        try:
+            data = json.loads(self._collapsed_file().read_text(encoding="utf-8"))
+            return bool(isinstance(data, dict) and data.get("collapsed"))
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return False
+
+    def _toggle_collapsed(self, _event: tk.Event) -> str:
+        self._collapsed = not self._collapsed
+        try:
+            self._collapsed_file().write_text(
+                json.dumps({"collapsed": self._collapsed}), encoding="utf-8")
+        except OSError:
+            pass
+        self._refresh()
+        return "break"
+
+    def _draw_min_button(self, cx: float, cy: float, collapsed: bool) -> None:
+        # Custom because the window has no OS title bar (overrideredirect).
+        h = self._pxf(8)
+        self._round_rect(cx - h, cy - h, cx + h, cy + h, self._pxf(4),
+                         fill=SUB_BG, outline=BORDER, width=1, tags="min_btn")
+        w = self._pxf(4)
+        self.canvas.create_line(cx - w, cy, cx + w, cy, fill=FG,
+                                width=max(1, self._px(2)), tags="min_btn")
+        if collapsed:
+            self.canvas.create_line(cx, cy - w, cx, cy + w, fill=FG,
+                                    width=max(1, self._px(2)), tags="min_btn")
+
+    def _refresh_collapsed(self, state: dict | None) -> None:
+        P = self._px
+        width = self.width
+        pad = P(PAD)
+        height = P(40)
+        self.canvas.config(height=height)
+        self._round_card(width, height)
+        cy = height / 2
+        parts: list[tuple[str, str]] = []
+        mode = None
+        if state is None:
+            parts.append(("loop offline", AMBER))
+        else:
+            usage = state.get("usage", {})
+            five, _ = _norm_window(usage.get("five_hour", {}), FIVE_HOURS_F)
+            seven, _ = _norm_window(usage.get("seven_day", {}), WEEK_HOURS_F)
+            parts.append((f"5h {five:.0%}", AMBER))
+            parts.append((f"wk {seven:.0%}", SILVER))
+            for key, window in usage.get("extra", {}).items():
+                if isinstance(window, dict) and any(h in key.lower() for h in FABLE_HINTS):
+                    fable, _ = _norm_window(window, WEEK_HOURS_F)
+                    parts.append((f"Fable {fable:.0%}", PINK))
+                    break
+            mode = str(state.get("decision", {}).get("mode", "?"))
+        x = pad
+        for text, color in parts:
+            self.canvas.create_text(x, cy, text=text, font=FONT_BOLD,
+                                    fill=color, anchor="w")
+            x += self._font_bold.measure(text) + P(12)
+        if mode:
+            self.canvas.create_text(width - pad - P(30), cy, text=mode.upper(),
+                                    font=FONT_SMALL, anchor="e",
+                                    fill=MODE_COLORS.get(mode, FG))
+        self._draw_min_button(width - P(30), cy, collapsed=True)
+        self._gear_center = None
+        self.root.update_idletasks()
+        self._place()
+        self._after_id = self.root.after(
+            self.cfg.overlay_refresh_seconds * 1000, self._refresh)
 
     def _px(self, value: float) -> int:
         return round(value * self.s)
@@ -594,9 +668,12 @@ class Overlay:
             self.root.after_cancel(self._after_id)
             self._after_id = None
         state = self._load_state()
+        self.canvas.delete("all")
+        if self._collapsed:
+            self._refresh_collapsed(state)
+            return
         sessions = _live_sessions(self.cfg)
         self._throttle = _read_throttle(self.cfg)
-        self.canvas.delete("all")
 
         rows: list[tuple[str, str, str]] = []
         footer_left = footer_right = ""
@@ -699,6 +776,8 @@ class Overlay:
 
         self.canvas.config(height=height)
         self._round_card(width, height)
+        # Top-right, above the Fable gauge and inside the corner radius.
+        self._draw_min_button(width - P(34), P(22), collapsed=False)
 
         center_cx = width // 2
         self._gauge(pad + P(48), five_frac, AMBER, "5 hours")
