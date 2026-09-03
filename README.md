@@ -15,7 +15,7 @@ The overlay: three rings (5-hour, weekly with the gear mascot and an amber goal 
 - **Surges on FULL THROTTLE.** The amber button writes `state/throttle.json`, overriding pacing to spend the remaining weekly budget on the project's highest-value work until the weekly limit itself stops it.
 - **Falls back to a local lane.** While `blocked`, queued tasks are re-dispatched to a local FreeToken engine (Qwen on the 5090) that burns zero cloud budget. A GPU guard refuses to auto-start the engine while a listed process (the Unreal editor, a game) owns the card, since the engine pins about 31.5 GB of it.
 - **Runs a configured agentic graph.** `config.json`'s `graph` names the model and headcount at each tier (executive, advisory, workers); the legacy `worker_model` / `max_concurrency` keys are derived from it, the fork brief is handed the same line through its `{graph}` placeholder, and `state/graph.json` (the overlay's `-` / `+`) overrides it without touching the config.
-- **Reports where the work went.** It parses the session, fork and Workflow-agent transcripts for a window, splits every turn by tier and by what it did (DECIDE / DELEGATE / READ / AUTHOR / OPS), and writes `reports/latest.html`: a page whose verdict says whether the executive tier stayed executive-only (the 60% hands-on rule). It runs itself when a fork finishes a milestone and when dispatch stops, and on demand from the CLI or the overlay's **VIEW REPORT**.
+- **Reports where the work went.** It parses the session, fork and Workflow-agent transcripts for a window, splits every turn by tier (by model id, or by transcript role when the graph names one model at every tier) and by what it did (DECIDE / DELEGATE / READ / AUTHOR / OPS), and writes `reports/latest.html`: a page whose verdict says whether the executive tier stayed executive-only (the 60% hands-on rule). It runs itself when a fork finishes a milestone and when dispatch stops, and on demand from the CLI or the overlay's **VIEW REPORT**.
 - **Draws that graph as a ladder chart.** The panel's **AGENTIC GRAPH** block is one rung per tier, executive over advisory over workers, each a bar as wide as its headcount and hung off a spine on the left, with the tier, the short model id and `xN` in aligned columns; the worker rung is the emphasis and carries its surge budget as a ghost extension, and its `-` / `+` still write `state/graph.json`.
 - **Shows an always-on-top overlay.** A Tk card docked near the Sundial widget, refreshed every few seconds, with minimize (collapse to a bar) and close buttons and its own live session, distribution, graph, goal, control, and report rows.
 
@@ -72,7 +72,7 @@ State files under `state/`:
 | `goal.json` | per-user weekly-goal override the `- / +` steppers write |
 | `stop.json` | written once the weekly goal is reached, the main session's stop point |
 | `throttle.json` | the FULL THROTTLE flag (`{"active": ...}`) |
-| `graph.json` | per-user agentic-graph override the ladder chart's `-` / `+` writes |
+| `graph.json` | per-user agentic-graph override the ladder chart's `-` / `+` writes; a patch, so only the fields set here stop following `config.json` |
 | `report.json` | the last work-distribution report: path, reason, window |
 | `overlay.json` | the overlay's collapsed / expanded state |
 | `history.jsonl` | the log of usage snapshots the pacer reads back |
@@ -82,7 +82,7 @@ Reports land in `reports/`: `<UTC timestamp>-ledger.html`, the `<timestamp>-summ
 ## Tests
 
 ```powershell
-py -3.13 tests/test_all.py               # 106/106
+py -3.13 tests/test_all.py               # 112/112
 ```
 
 ## Acknowledgements

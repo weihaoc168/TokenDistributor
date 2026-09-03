@@ -909,6 +909,32 @@ def test_status_prints_fork_line():
         usage.fetch_usage = real_fetch
 
 
+def test_status_prints_report_line():
+    # The monitor session quotes report freshness from `status`; before any
+    # report exists the line has to say so rather than vanish.
+    from tokentracker import cli
+    from tokentracker.ledger import report_status_line, write_report_state
+    cfg = make_cfg()
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.4)
+    try:
+        out = _capture(lambda: cli.cmd_status(cfg))
+        assert "report: none yet" in out, out
+        page = cfg.reports_dir / "latest.html"
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text("<html></html>", encoding="utf-8")
+        write_report_state(cfg, path=page, reason="fork milestone: new commit",
+                           window={"start": NOW.isoformat(),
+                                   "end": NOW.isoformat(), "hours": 12.0})
+        line = report_status_line(cfg)
+        assert line.startswith("report: report just now"), line
+        assert "fork milestone: new commit" in line and "12h window" in line
+        assert str(page) in line, line
+        assert line in _capture(lambda: cli.cmd_status(cfg)).splitlines()
+    finally:
+        usage.fetch_usage = real_fetch
+
+
 def test_repo_config_arms_the_fork_on_opus_5():
     # The shipped config.json is what actually revives the handover.
     from tokentracker import cli, handover
@@ -1881,6 +1907,47 @@ def test_graph_override_file_wins_and_clamps():
     assert G.override_warning(cfg) is None
 
 
+def test_graph_override_is_a_patch_not_a_snapshot():
+    """state/graph.json holds the fields that were set, and nothing else.
+
+    Persisting the whole resolved graph instead meant one tap on the worker '+'
+    copied the models and the advisory count into the override too, and every
+    later edit to config.json's graph section was silently dead.
+    """
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    cfg.throttle_model = "claude-opus-5"
+    cfg.worker_model = "claude-opus-5"
+    cfg.max_concurrency = 4
+    cfg.graph = G.default_graph(cfg)
+    G.write_graph(cfg, {G.WORKERS: {"count": 12}})
+    stored = json.loads(cfg.graph_file.read_text(encoding="utf-8"))["graph"]
+    assert stored == {G.WORKERS: {"count": 12}}, stored
+
+    # config.json edited afterwards: everything the tap did not name follows it.
+    cfg.graph = {G.EXECUTIVE: {"model": "claude-opus-4-8", "count": 1},
+                 G.ADVISORY: {"model": "claude-sonnet-5", "count": 5},
+                 G.WORKERS: {"model": "claude-haiku-4-5-20251001", "count": 6,
+                             "surge_count": 8}}
+    g = G.read_graph(cfg)
+    assert g[G.EXECUTIVE]["model"] == "claude-opus-4-8", g
+    assert g[G.ADVISORY] == {"model": "claude-sonnet-5", "count": 5}, g
+    assert g[G.WORKERS]["model"] == "claude-haiku-4-5-20251001", g
+    assert g[G.WORKERS]["count"] == 12, g       # the tap, and only the tap
+    assert g[G.WORKERS]["surge_count"] == 12, g  # never under the lane count
+
+    # A second patch adds its field and keeps the first.
+    after = G.write_graph(cfg, {G.ADVISORY: {"count": 2}})
+    stored = json.loads(cfg.graph_file.read_text(encoding="utf-8"))["graph"]
+    assert stored == {G.ADVISORY: {"count": 2}, G.WORKERS: {"count": 12}}, stored
+    assert after == G.read_graph(cfg), after
+    assert after[G.EXECUTIVE]["model"] == "claude-opus-4-8", after
+    assert after[G.ADVISORY]["model"] == "claude-sonnet-5", after
+    # A patch that names nothing leaves the file exactly as it was.
+    G.write_graph(cfg, {})
+    assert json.loads(cfg.graph_file.read_text(encoding="utf-8"))["graph"] == stored
+
+
 def test_graph_reads_never_raise_on_hostile_input():
     """Every read path degrades to the config value; none of them raises.
 
@@ -2050,6 +2117,11 @@ def test_cli_graph_shows_and_sets():
     # config.json is never rewritten by a set; the override file carries it.
     raw = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
     assert raw["graph"]["workers"]["count"] == 10, raw["graph"]
+    # And it carries only what was assigned, so the models config.json declares
+    # keep applying to every tier the operator did not name.
+    stored = json.loads(cfg.graph_file.read_text(encoding="utf-8"))["graph"]
+    assert stored == {G.ADVISORY: {"model": "claude-opus-4-8"},
+                      G.WORKERS: {"count": 20}}, stored
     # An unparseable assignment is refused without touching the override.
     assert cli_main(["--root", str(tmp), "graph", "set", "workers.count=lots"]) == 1
     assert G.read_graph(load_config(tmp))[G.WORKERS]["count"] == 20
@@ -2173,6 +2245,140 @@ def test_ledger_tiers_split_by_the_graph():
                        G.default_graph(cfg))
     flat[G.EXECUTIVE]["model"] = "claude-opus-5"
     assert ledger.tier_of("claude-opus-5", flat) == ledger.EXEC_TIER
+    # Which of the two readings applies is a property of the graph, not of the
+    # turn: two models named, the id decides; one model named, it cannot.
+    assert ledger.graph_separates_tiers(graph)
+    assert not ledger.graph_separates_tiers(flat)
+
+
+def test_ledger_tiers_by_role_when_one_model_serves_every_tier():
+    """The shipped graph names claude-opus-5 three times; the id says nothing.
+
+    Keying the split on the model id then puts every worker lane in the
+    executive tier and drops the director into the worker tier, which inverts
+    the verdict. The transcript's role is what separates them.
+    """
+    from tokentracker import graph as G
+    from tokentracker import ledger
+    cfg = make_cfg()
+    flat = G.normalize({G.EXECUTIVE: {"model": "claude-opus-5"},
+                        G.ADVISORY: {"model": "claude-opus-5"},
+                        G.WORKERS: {"model": "claude-opus-5"}},
+                       G.default_graph(cfg))
+    assert not ledger.graph_separates_tiers(flat)
+    for source in (ledger.MAIN_SOURCE, ledger.FORK_SOURCE):
+        assert ledger.tier_of("claude-opus-5", flat, source) == ledger.EXEC_TIER
+    assert ledger.tier_of("claude-opus-5", flat,
+                          ledger.AGENT_SOURCE) == ledger.WORK_TIER
+    # Whatever the director happens to be running is still the executive tier.
+    assert ledger.tier_of("claude-fable-5-1", flat,
+                          ledger.FORK_SOURCE) == ledger.EXEC_TIER
+    # Name a second model and the id decides again, role or no role.
+    split = G.normalize({G.WORKERS: {"model": "claude-sonnet-5"}}, flat)
+    assert ledger.graph_separates_tiers(split)
+    assert ledger.tier_of("claude-sonnet-5", split,
+                          ledger.MAIN_SOURCE) == ledger.WORK_TIER
+    assert ledger.tier_of("claude-opus-5", split,
+                          ledger.AGENT_SOURCE) == ledger.EXEC_TIER
+
+
+def test_ledger_verdict_is_not_inverted_by_a_single_model_graph():
+    from tokentracker import graph as G
+    from tokentracker import ledger
+    cfg = _ledger_cfg(exec_tools=())      # main session: DECIDE turns only
+    cfg.worker_model = "claude-opus-5"    # one model at every tier
+    G.apply_graph(cfg)
+    assert not ledger.graph_separates_tiers(G.read_graph(cfg))
+    ts = (utcnow() - timedelta(minutes=4)).isoformat()
+    agents = (cfg.projects_dir / "proj" / MAIN_ID / "subagents" / "workflows"
+              / "wf1")
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "agent-1.jsonl").write_text("\n".join(
+        _entry(f"a{i}", "claude-opus-5", ts, ["Edit"], _usage(out=500),
+               uuid=f"ua{i}") for i in range(4)), encoding="utf-8")
+
+    summary = ledger.build_summary(cfg, utcnow() - timedelta(hours=1), utcnow())
+    # The four Workflow turns are the worker tier, not the executive one.
+    assert summary["fable_vs_opus"]["opus_output"] == 2000, summary["fable_vs_opus"]
+    assert summary["fable_vs_opus"]["opus_models"] == ["claude-opus-5"]
+    assert summary["fable_work_breakdown"]["opus"]["AUTHOR"]["output"] == 2000
+    # ... and the director's own session is the executive tier, on both models
+    # it used, so the 60% rule is asked of the right turns.
+    assert summary["fable_vs_opus"]["fable_models"] == ["claude-opus-5",
+                                                        "claude-sonnet-5"]
+    assert summary["fable_work_breakdown"]["fable"]["DECIDE"]["messages"] == 3
+    assert summary["verdict"]["executive_only"] is True, summary["verdict"]
+    assert "main + fork sessions on" in summary["verdict"]["one_paragraph"]
+    assert any("role" in line for line in summary["verdict"]["evidence"]), summary
+    # One id in both tiers is labelled as such rather than picking a side.
+    assert summary["totals_by_model"]["claude-opus-5"]["tier"] == ledger.MIXED_TIER
+    assert summary["totals_by_model"]["claude-sonnet-5"]["tier"] == ledger.EXEC_TIER
+
+
+def test_ledger_dedupes_one_turn_across_transcripts():
+    """A resumed fork opens with a verbatim copy of the parent's history.
+
+    Same message.id, same timestamp, same usage, so a per-file dedup counts the
+    parent's whole window once per fork - the same bug the per-file dedup
+    exists to prevent, one level up.
+    """
+    from tokentracker import ledger
+    cfg = make_cfg()
+    start = NOW - timedelta(hours=1)
+    ts = (NOW - timedelta(minutes=10)).isoformat()
+    u = _usage(out=100, inp=10, creation=20, read=1000)
+    parent = cfg.projects_dir / "parent.jsonl"
+    fork = cfg.projects_dir / "fork.jsonl"
+    parent.write_text(_entry("shared", "claude-opus-5", ts, ["Edit"], u),
+                      encoding="utf-8")
+    fork.write_text("\n".join([
+        _entry("shared", "claude-opus-5", ts, ["Edit"], u),   # inherited copy
+        _entry("own", "claude-opus-5", ts, ["Bash"], _usage(out=7), uuid="u9"),
+    ]), encoding="utf-8")
+
+    # On its own, each file sees every turn it holds.
+    assert ledger.parse_transcript(fork, start, NOW).by_model[
+        "claude-opus-5"]["messages"] == 2
+    # Sharing one set, in the order build_summary folds them, the copy stays
+    # with the parent and the fork keeps only what it produced.
+    seen: set = set()
+    first = ledger.parse_transcript(parent, start, NOW, seen)
+    second = ledger.parse_transcript(fork, start, NOW, seen)
+    assert first.by_model["claude-opus-5"]["messages"] == 1
+    assert second.by_model["claude-opus-5"]["messages"] == 1
+    assert second.by_model["claude-opus-5"]["usage"]["output_tokens"] == 7
+    total = ledger.Tally()
+    total.merge(first)
+    total.merge(second)
+    assert total.by_model["claude-opus-5"]["usage"]["output_tokens"] == 107
+    assert abs(total.by_model["claude-opus-5"]["weighted"] - (113.0 + 7)) < 1e-9
+
+
+def test_ledger_summary_counts_a_copied_parent_turn_once():
+    from tokentracker import ledger
+    cfg = _ledger_cfg(exec_tools=())
+    proj = cfg.projects_dir / "proj"
+    inherited = (proj / f"{MAIN_ID}.jsonl").read_text(encoding="utf-8")
+    fork_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    ts = (utcnow() - timedelta(minutes=2)).isoformat()
+    (proj / f"{fork_id}.jsonl").write_text("\n".join([
+        inherited,      # the whole parent history, exactly as the fork gets it
+        _entry("fk", "claude-sonnet-5", ts, ["Edit"], _usage(out=42), uuid="uf"),
+    ]), encoding="utf-8")
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "throttle-main-continue", "prompt": "p", "cwd": str(cfg.root),
+         "status": "done", "fork_session_id": fork_id},
+    ]}), encoding="utf-8")
+
+    summary = ledger.build_summary(cfg, utcnow() - timedelta(hours=1), utcnow())
+    totals = summary["totals_by_model"]
+    assert totals["claude-opus-5"]["output_tokens"] == 300, totals
+    assert totals["claude-opus-5"]["messages"] == 3, totals
+    assert totals["claude-sonnet-5"]["output_tokens"] == 92, totals
+    # The fork's row shows the one turn it actually produced, not the parent's.
+    fork_rows = [s for s in summary["where_fable_went"]
+                 if s["id_or_label"].startswith(fork_id[:8])]
+    assert len(fork_rows) == 1 and fork_rows[0]["fable_output"] == 42, fork_rows
 
 
 def _ledger_cfg(exec_tools=("Edit",)) -> Config:
@@ -2353,15 +2559,53 @@ def test_ledger_fires_on_fork_milestone_and_once_per_stop():
         assert ledger.maybe_report(cfg, d, before=("done", None),
                                    control=control.STOPPED, stop=None) is None
         assert calls == [], calls
-        # The weekly-goal stop is its own episode and reports on its own.
+        # The weekly-goal stop is its own episode and reports on its own; the
+        # key carries both halves, so it cannot collide with the manual stop
+        # that was just reported at the same control-file changed_at.
         stop = {"reason": "weekly goal reached", "goal": 0.9, "weekly": 0.95,
                 "at": utcnow().isoformat()}
         line = ledger.maybe_report(cfg, d, before=("done", None),
                                    control=control.STOPPED, stop=stop)
         assert line is not None, line
-        assert calls[0][1]["stop_key"].startswith("goal:"), calls
+        goal_key = calls[0][1]["stop_key"]
+        assert goal_key.startswith("stop:") and "|goal:" in goal_key, calls
+        assert goal_key != key, (goal_key, key)
     finally:
         ledger.generate_async = real
+
+
+def test_ledger_stop_key_is_not_frozen_by_a_standing_goal_record():
+    """A manual STOP after a goal stop is its own episode, and still reports.
+
+    state/stop.json is deliberately not cleared when the operator presses START
+    over the goal, so a key built from the goal record alone stayed identical
+    for the rest of the week and every later STOP was swallowed as "already
+    reported".
+    """
+    from tokentracker import control, ledger
+    cfg = make_cfg()
+    stop = {"reason": "weekly goal reached", "goal": 0.9, "weekly": 0.95,
+            "at": utcnow().isoformat()}
+    # The goal stop: it writes the record and the control file together.
+    control.write_control(cfg, control.STOPPED)
+    first = ledger.stop_key_for(cfg, control.STOPPED, stop)
+    assert ledger.stop_wanted(first, None)
+    ledger.write_report_state(cfg, path=Path("x"), reason="stopped",
+                              window={}, stop_key=first)
+    # START over the goal: the record still stands, but dispatch is running, so
+    # there is no stop episode at all and nothing may fire mid-run.
+    control.write_control(cfg, control.RUNNING)
+    assert ledger.stop_key_for(cfg, control.RUNNING, stop) is None
+    assert not ledger.stop_wanted(None, first)
+    # STOP pressed again, record unchanged: a new episode, and it reports.
+    time.sleep(0.01)
+    control.write_control(cfg, control.STOPPED)
+    second = ledger.stop_key_for(cfg, control.STOPPED, stop)
+    assert second != first, (first, second)
+    assert ledger.stop_wanted(second, first), (first, second)
+    # Same episode polled again: silent.
+    assert not ledger.stop_wanted(
+        ledger.stop_key_for(cfg, control.STOPPED, stop), second)
 
 
 def test_ledger_survives_a_broken_dispatcher():
@@ -2510,8 +2754,11 @@ def test_overlay_worker_step_clamps_and_writes_the_override():
     for _ in range(60):
         fake._step_workers(-1)
     assert G.read_graph(cfg)[G.WORKERS]["count"] == G.COUNT_MIN
-    # The override is what changed; config.json is never touched by a tap.
+    # The override is what changed; config.json is never touched by a tap, and
+    # the tap writes one field so the rest of the graph still follows the file.
     assert cfg.graph_file.exists() and not (cfg.root / "config.json").exists()
+    stored = json.loads(cfg.graph_file.read_text(encoding="utf-8"))["graph"]
+    assert stored == {G.WORKERS: {"count": G.COUNT_MIN}}, stored
     assert G.overlay_label(G.read_graph(cfg)).startswith("E opus-5 x1 | A ")
 
 

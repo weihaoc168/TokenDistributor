@@ -379,13 +379,24 @@ def cmd_run(cfg: Config, once: bool) -> int:
 def _run_loop(cfg: Config, once: bool) -> int:
     from .usage import RateLimitedError, UsageHistory
 
-    from .graph import known_models, overlay_label, read_graph, validate_graph
+    from .graph import (
+        known_models,
+        override_warning,
+        overlay_label,
+        read_graph_source,
+        validate_graph,
+    )
 
     dispatcher = Dispatcher(cfg, supervise=True)
     history = UsageHistory(cfg)
     print(f"TokenDistributor loop started (poll every {cfg.poll_seconds}s, ctrl-c to stop)")
-    graph = read_graph(cfg)
-    print(f"graph: {overlay_label(graph)}")
+    # Named with its source: the numbers in force can come from either file, and
+    # "why is config.json not applying" has no other symptom.
+    graph, source = read_graph_source(cfg)
+    print(f"graph: {overlay_label(graph)} (source: {source})")
+    ignored = override_warning(cfg)
+    if ignored:
+        print(ignored)
     # A warning, not a refusal: an unknown id is usually a new model.
     for warning in validate_graph(graph, known_models(cfg)):
         print(warning)
@@ -446,6 +457,7 @@ def _run_loop(cfg: Config, once: bool) -> int:
 
 
 def cmd_status(cfg: Config) -> int:
+    from .ledger import report_status_line
     from .scheduler import pacing
     from .usage import UsageFetchError, fetch_usage
 
@@ -457,6 +469,7 @@ def cmd_status(cfg: Config) -> int:
         fork_line = fork_status_line(cfg)
         if fork_line is not None:
             print(fork_line)
+        print(report_status_line(cfg))
         if cfg.state_file.exists():
             state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
             print(f"last known state from {state.get('at')}:")
@@ -486,6 +499,9 @@ def cmd_status(cfg: Config) -> int:
     fork_line = fork_status_line(cfg)
     if fork_line is not None:
         print(fork_line)
+    # The work-distribution report the overlay's VIEW REPORT button opens; the
+    # monitor session reads its freshness and trigger from here.
+    print(report_status_line(cfg))
 
     if cfg.state_file.exists():
         state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
@@ -557,13 +573,12 @@ def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
 def cmd_graph(cfg: Config, assignments: list[str] | None) -> int:
     """Print the agentic graph, or set tiers from `tier.field=value` pairs."""
     from .graph import (
-        SOURCE_OVERRIDE,
         format_tiers,
         graph_line,
         known_models,
         override_warning,
+        parse_assignments,
         read_graph_source,
-        set_assignments,
         validate_graph,
         write_graph,
     )
@@ -571,13 +586,16 @@ def cmd_graph(cfg: Config, assignments: list[str] | None) -> int:
     ignored = override_warning(cfg)
     graph, source = read_graph_source(cfg)
     if assignments:
-        graph, errors = set_assignments(graph, assignments)
+        # Only the assignments given are persisted: state/graph.json is a patch
+        # over config.json, not a snapshot of it, so setting the worker count
+        # never freezes the models the config declares.
+        patch, errors = parse_assignments(assignments)
         for error in errors:
             print(f"error: {error}")
         if errors:
             return 1
-        graph = write_graph(cfg, graph)
-        source = SOURCE_OVERRIDE
+        write_graph(cfg, patch)
+        graph, source = read_graph_source(cfg)
     print(f"agentic graph (source: {source})")
     if ignored and not assignments:
         # The read path swallows a broken override on purpose; without this the

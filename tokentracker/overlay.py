@@ -823,12 +823,13 @@ class Overlay:
         """Nudge the worker lane count; the loop re-derives concurrency from it.
 
         Clamped to the graph's own bounds, and written to state/graph.json so
-        the checked-in config.json is never rewritten by a click.
+        the checked-in config.json is never rewritten by a click. Only the one
+        field goes into the override: writing the whole graph would copy the
+        models into it too, and config.json would stop mattering after a tap.
         """
-        graph = read_graph(self.cfg)
-        count = int(graph[WORKERS]["count"]) + delta
-        graph[WORKERS]["count"] = min(max(count, COUNT_MIN), COUNT_MAX)
-        self._graph = write_graph(self.cfg, graph)
+        count = int(read_graph(self.cfg)[WORKERS]["count"]) + delta
+        count = min(max(count, COUNT_MIN), COUNT_MAX)
+        self._graph = write_graph(self.cfg, {WORKERS: {"count": count}})
         self._refresh()
         return "break"
 

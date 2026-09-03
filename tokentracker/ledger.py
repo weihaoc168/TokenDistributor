@@ -21,6 +21,12 @@ every one of them repeats the IDENTICAL full `message.usage`. Counting raw
 entries inflates every token figure ~3.4x, so turns are deduplicated by
 `message.id` and the content blocks of a turn are merged before categorising.
 
+The same artifact appears one level up, between files: a `--resume
+--fork-session` transcript opens with a verbatim copy of the parent's history,
+identical message ids, timestamps and usage included. So the dedup set is
+shared across every source `build_summary` folds, main session first, and each
+turn is attributed to the transcript that actually produced it.
+
 Weighted cost is a comparison proxy, not a bill:
 
     weighted = output + 0.1*(input + cache_creation) + 0.01*cache_read
@@ -69,6 +75,14 @@ WEIGHTING = ("weighted_cost = output_tokens + 0.1*(input_tokens + "
 
 EXEC_TIER = "fable"    # template key for the executive/advisory tier
 WORK_TIER = "opus"     # template key for the worker tier
+MIXED_TIER = "mixed"   # a model whose turns landed in both tiers
+# Which tier a transcript's role means, used when the graph names one model at
+# both ends and the model id therefore cannot tell the tiers apart.
+MAIN_SOURCE = "main_session"
+FORK_SOURCE = "fork_session"
+AGENT_SOURCE = "workflow_agent"
+SOURCE_TIERS = {MAIN_SOURCE: EXEC_TIER, FORK_SOURCE: EXEC_TIER,
+                AGENT_SOURCE: WORK_TIER}
 SERIES_MAX_POINTS = 60
 LEDGER_ROWS = 12
 FORK_PROBE_CHARS = 60
@@ -221,14 +235,27 @@ def _iter_entries(path: Path) -> Iterable[dict]:
                 yield entry
 
 
-def parse_transcript(path: Path, start: datetime, end: datetime) -> Tally:
+def parse_transcript(path: Path, start: datetime, end: datetime,
+                     seen: set[str] | None = None) -> Tally:
     """One transcript's turns inside [start, end], deduplicated by message.id.
 
-    The dedup is the whole point: several JSONL entries share one message.id
-    and each repeats the same usage, so usage is taken once per id while the
-    tool_use blocks of every entry are merged before the turn is categorised.
+    The dedup is the whole point, and it has to reach across files as well as
+    within one:
+
+      * within a file, several JSONL entries share one message.id and each
+        repeats the same usage, so usage is taken once per id while the
+        tool_use blocks of every entry are merged before categorising;
+      * across files, a resumed fork carries a verbatim copy of the parent's
+        history - same ids, same timestamps, same usage - so `seen` (one set
+        for the whole report, passed by `build_summary` with the main session
+        read first) keeps the copy from being counted again per fork.
+
+    `seen` is read *and* written: every id this call counts is added to it.
+    Called without one, each call dedups only itself, which is the old
+    single-transcript behaviour.
     """
     turns: dict[str, dict[str, Any]] = {}
+    counted = seen if seen is not None else set()
     for entry in _iter_entries(path):
         if entry.get("type") != "assistant":
             continue
@@ -241,12 +268,17 @@ def parse_transcript(path: Path, start: datetime, end: datetime) -> Tally:
         mid = message.get("id") or f"noid::{entry.get('uuid')}"
         turn = turns.get(mid)
         if turn is None:
+            if mid in counted:
+                # Already counted from an earlier transcript: this is the copy
+                # a resumed fork inherited, not a turn the fork produced.
+                continue
             usage = new_usage()
             add_usage(usage, message.get("usage"))
             model = str(message.get("model") or "unknown").strip("<>") or "unknown"
             turn = {"model": model, "usage": usage, "ts": stamp,
                     "tools": [], "tool_ids": set()}
             turns[mid] = turn
+            counted.add(mid)
         elif stamp < turn["ts"]:
             turn["ts"] = stamp
         content = message.get("content")
@@ -445,16 +477,45 @@ def utilization_series(cfg: Config, start: datetime, end: datetime) -> list[dict
 
 # ------------------------------------------------------------------ summary
 
-def tier_of(model: str, graph: dict) -> str:
-    """Which tier a model id belongs to, executive first on a tie.
+def graph_separates_tiers(graph: dict) -> bool:
+    """True when the graph names a worker model the executive tier does not use.
 
-    The graph often names one model for every tier (opus everywhere). Counting
-    it twice would double the totals, so the executive/advisory membership wins
-    and the worker tier holds what is left - which is exactly the reading the
-    verdict needs: did the model wearing the director's hat also do the work?
+    False is the shipped default: config.json names claude-opus-5 at all three
+    tiers, so a model id says nothing about which hat the turn was wearing.
+    """
+    from .graph import tiers_of
+
+    executive, advisory, workers = tiers_of(graph)
+    worker = str(workers.get("model") or "")
+    exec_models = {str(executive.get("model") or ""),
+                   str(advisory.get("model") or "")}
+    return bool(worker) and worker not in exec_models
+
+
+def tier_of(model: str, graph: dict, source: str | None = None) -> str:
+    """Which tier a turn belongs to: by model id, or by role when ids collide.
+
+    Two readings of the same question - did the model wearing the director's
+    hat also do the building?
+
+    * The graph names different models for the executive and the workers: the
+      model id answers it, executive/advisory membership winning a tie so a
+      model named twice is still counted once.
+    * The graph names ONE model at both ends (the shipped default is opus
+      everywhere): the id cannot answer it at all, and keying on it puts every
+      worker lane in the executive tier and drops the actual director - running
+      whatever model it happens to run - into the worker tier, inverting the
+      verdict. So the transcript's own role decides: main and fork sessions are
+      the executive tier, Workflow subagents are the workers.
+
+    `source` is the role (`main_session`, `fork_session`, `workflow_agent`).
+    Without one - a per-model label with no single role behind it - the model
+    rule is used, as before.
     """
     from .graph import ADVISORY, EXECUTIVE, WORKERS
 
+    if source is not None and not graph_separates_tiers(graph):
+        return SOURCE_TIERS.get(source, WORK_TIER)
     name = str(model or "")
     exec_models = {str(graph.get(EXECUTIVE, {}).get("model", "")),
                    str(graph.get(ADVISORY, {}).get("model", ""))}
@@ -491,12 +552,19 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
     from .graph import ADVISORY, EXECUTIVE, WORKERS, read_graph
 
     graph = read_graph(cfg)
+    by_model_split = graph_separates_tiers(graph)
     sessions = discover_sessions(cfg, start, end)
     overall = Tally()
     tiers = {EXEC_TIER: Tally(), WORK_TIER: Tally()}
     model_sources: dict[str, list[str]] = {}
+    model_tiers: dict[str, set[str]] = {}
     sinks: list[dict] = []
     agent_files = 0
+    # One dedup set for the whole report: a resumed fork's transcript repeats
+    # the parent's turns verbatim, and discover_sessions yields the main
+    # session first, so the parent keeps its own turns and each fork keeps only
+    # what it actually produced.
+    seen_turns: set[str] = set()
 
     def fold(tally: Tally, source: str) -> None:
         overall.merge(tally)
@@ -507,11 +575,13 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
             split = Tally()
             split.by_model[model] = row
             split.hourly = {model: tally.hourly.get(model, {})}
-            tiers[tier_of(model, graph)].merge(split)
+            tier = tier_of(model, graph, source)
+            model_tiers.setdefault(model, set()).add(tier)
+            tiers[tier].merge(split)
 
     for session in sessions:
-        source = "main_session" if session["role"] == "main" else "fork_session"
-        tally = parse_transcript(session["path"], start, end)
+        source = MAIN_SOURCE if session["role"] == "main" else FORK_SOURCE
+        tally = parse_transcript(session["path"], start, end, seen_turns)
         fold(tally, source)
         for model, row in tally.by_model.items():
             cats = {c: cell["messages"] for c, cell in row["cats"].items()}
@@ -532,13 +602,13 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
         agents = Tally()
         for path in agent_transcripts(cfg, session["sid"]):
             agent_files += 1
-            agents.merge(parse_transcript(path, start, end))
+            agents.merge(parse_transcript(path, start, end, seen_turns))
         if agents.by_model:
-            fold(agents, "workflow_agent")
+            fold(agents, AGENT_SOURCE)
             for model, row in agents.by_model.items():
                 cats = {c: cell["messages"] for c, cell in row["cats"].items()}
                 sinks.append({
-                    "source": "workflow_agent",
+                    "source": AGENT_SOURCE,
                     "id_or_label": f"{session['sid'][:8]} workflow agents / {model}",
                     "what": (f"Workflow subagents under {session['sid'][:8]} on "
                              f"{model}: {cats.get('OPS', 0)} OPS, "
@@ -557,21 +627,28 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
     exec_hands = tiers[EXEC_TIER].hands_on_share()
     work_hands = tiers[WORK_TIER].hands_on_share()
     exec_only = exec_hands <= HANDS_ON_LIMIT
-    exec_models = sorted({m for m in overall.by_model
-                          if tier_of(m, graph) == EXEC_TIER})
-    work_models = sorted({m for m in overall.by_model
-                          if tier_of(m, graph) == WORK_TIER})
+    # Membership is what actually landed in each tier, not what tier_of says
+    # about a bare model id: with one model at both ends the same id is in both.
+    exec_models = sorted(tiers[EXEC_TIER].by_model)
+    work_models = sorted(tiers[WORK_TIER].by_model)
     cat_counts = tiers[EXEC_TIER].cat_counts()
+    exec_label = ", ".join(exec_models) or "none"
+    work_label = ", ".join(work_models) or "none"
+    if not by_model_split:
+        # Say which turns the tier is, or "executive tier (claude-opus-5)" and
+        # "worker tier (claude-opus-5)" read as the same sentence twice.
+        exec_label = f"main + fork sessions on {exec_label}"
+        work_label = f"workflow agents on {work_label}"
 
     verdict_para = (
         "The executive tier ({models}) spent {hands:.1%} of its weighted cost on "
         "hands-on work (AUTHOR/OPS/READ) against a {limit:.0%} line, so it "
         "{did} stay executive-only in this window. It produced {eout:,} output "
         "tokens ({eshare:.1%} of all output) across {ecount} turns; the worker "
-        "tier produced {wout:,}. Executive turns split {decide} DECIDE / "
-        "{delegate} DELEGATE against {ops} OPS and {author} AUTHOR."
+        "tier ({wmodels}) produced {wout:,}. Executive turns split {decide} "
+        "DECIDE / {delegate} DELEGATE against {ops} OPS and {author} AUTHOR."
     ).format(
-        models=", ".join(exec_models) or "none",
+        models=exec_label, wmodels=work_label,
         hands=exec_hands, limit=HANDS_ON_LIMIT,
         did="did" if exec_only else "did NOT",
         eout=exec_out, eshare=(exec_out / out_total if out_total else 0.0),
@@ -594,12 +671,17 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
         f"x{graph[EXECUTIVE]['count']}, advisory {graph[ADVISORY]['model']} "
         f"x{graph[ADVISORY]['count']}, workers {graph[WORKERS]['model']} "
         f"x{graph[WORKERS]['count']} (surge {graph[WORKERS]['surge_count']}).",
+        ("Tiers split by model id, which the graph names differently at the "
+         "executive and worker tiers." if by_model_split else
+         "Tiers split by transcript role (main and fork sessions are the "
+         "executive tier, Workflow subagents the workers): the graph names one "
+         "model at both ends, so the model id cannot tell them apart."),
     ]
 
     root_causes = ([] if exec_only else [
         "The executive tier ran the tools itself instead of dispatching: "
         f"{cat_counts.get('OPS', 0)} OPS and {cat_counts.get('AUTHOR', 0)} "
-        "AUTHOR turns on the executive model.",
+        "AUTHOR turns in the director's own sessions.",
         "Worker lanes were idle or under-used while the executive tier worked, "
         f"so only {(work_out / out_total if out_total else 0.0):.1%} of output "
         "came from the worker tier.",
@@ -639,7 +721,12 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
                 "cache_creation_tokens": row["usage"]["cache_creation_input_tokens"],
                 "input_tokens": row["usage"]["input_tokens"],
                 "weighted_cost": _round(row["weighted"]),
-                "tier": tier_of(model, graph),
+                # Where this model's turns actually landed; "mixed" when the
+                # same id ran in both tiers, which is the normal case once the
+                # split is by role rather than by model.
+                "tier": (sorted(model_tiers[model])[0]
+                         if len(model_tiers.get(model, ())) == 1
+                         else MIXED_TIER),
                 "sources": model_sources.get(model, []),
             }
             for model, row in sorted(overall.by_model.items(),
@@ -673,14 +760,22 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
             for model, hours in sorted(overall.hourly.items())
         },
         "caveats": [
-            "Turns are deduplicated by message.id; Claude Code repeats the same "
-            "usage on every JSONL entry of one turn, so raw entries would "
-            "inflate every figure about 3.4x.",
+            "Turns are deduplicated by message.id across every transcript, not "
+            "only within one: Claude Code repeats the same usage on each JSONL "
+            "entry of a turn, and a resumed fork opens with a verbatim copy of "
+            "the parent's history. A turn is counted once, against the "
+            "transcript that produced it (the main session is read first).",
             "Weighted cost is a comparison proxy, not a bill, and models no "
             "per-model pricing.",
-            "Tiers come from the agentic graph: a model named at more than one "
-            "tier is counted once, at the executive tier, and a model the graph "
-            "never names falls to the worker tier, so the totals always add up.",
+            ("Tiers come from the agentic graph. It names different models at "
+             "the executive and worker tiers, so each turn is tiered by its "
+             "model id, executive winning a tie."
+             if by_model_split else
+             "Tiers come from the transcript's role, because the graph names "
+             "one model at both the executive and the worker tier: main and "
+             "fork sessions are the executive tier, Workflow subagents the "
+             "workers. Tiering by model id would put every worker lane in the "
+             "executive tier and the director in the worker tier."),
             "Only transcripts on this machine are read; a fork whose session id "
             "was never recorded is found by its brief, and one that wrote "
             "nothing in the window is invisible.",
@@ -799,9 +894,9 @@ def stop_wanted(stop_key: str | None, last_stop_key: str | None,
                 enabled: bool = True) -> bool:
     """One report per stop, not one per poll.
 
-    `stop_key` identifies the stop episode (the control file's changed_at, the
-    stop record's `at`, or the loop's exit time); while it is unchanged the
-    stop has already been reported.
+    `stop_key` identifies the stop episode (the control file's changed_at with
+    the goal record's `at` appended, or the loop's exit time); while it is
+    unchanged the stop has already been reported.
     """
     return bool(enabled and stop_key and stop_key != last_stop_key)
 
@@ -841,11 +936,20 @@ def repo_changed_since(cfg: Config, since: datetime | None) -> tuple[bool, str]:
 
 
 def stop_key_for(cfg: Config, control: str, stop: dict | None) -> str | None:
-    """The identity of the stop episode standing right now, or None."""
+    """The identity of the stop episode standing right now, or None.
+
+    The control file leads and the goal record only extends the key, because
+    state/stop.json is deliberately NOT cleared when the operator presses START
+    over the goal (goal.py keeps the record while the week is over goal). A key
+    built from the goal record alone would therefore freeze for the rest of the
+    week: the first goal stop reports, and every later STOP press produces the
+    same key and is silently swallowed as "already reported".
+
+    Nothing is returned while dispatch is running: a stop record left standing
+    behind a START is not a stop, and reporting it would fire mid-run.
+    """
     from .control import STOPPED
 
-    if isinstance(stop, dict) and stop.get("at"):
-        return f"goal:{stop.get('at')}"
     if control != STOPPED:
         return None
     try:
@@ -853,7 +957,12 @@ def stop_key_for(cfg: Config, control: str, stop: dict | None) -> str | None:
         changed = data.get("changed_at") if isinstance(data, dict) else None
     except (OSError, json.JSONDecodeError, ValueError):
         changed = None
-    return f"stop:{changed or 'unknown'}"
+    key = f"stop:{changed or 'unknown'}"
+    at = stop.get("at") if isinstance(stop, dict) else None
+    # Composite, so the goal stop and a manual STOP at the same changed_at are
+    # still two episodes: the goal writes the record and the control file
+    # together, and the operator can stop again afterwards.
+    return f"{key}|goal:{at}" if at else key
 
 
 # -------------------------------------------------------------- generation
@@ -954,6 +1063,24 @@ def open_report(cfg: Config) -> Path | None:
         except OSError:
             return path
     return path
+
+
+def report_status_line(cfg: Config, now: datetime | None = None) -> str:
+    """The `tracker.py status` line for the work-distribution report.
+
+    Says when the last one was written, what triggered it and where it is, so
+    the monitor session can quote freshness without opening the page.
+    """
+    state = read_report_state(cfg)
+    age = report_age(cfg, now)
+    if age is None or not state.get("last_report"):
+        return "report: none yet (tracker.py report --hours 12)"
+    reason = str(state.get("last_reason") or "?")
+    window = state.get("window") if isinstance(state.get("window"), dict) else {}
+    hours = window.get("hours")
+    span = f", {float(hours):g}h window" if isinstance(hours, (int, float)) else ""
+    return (f"report: {age} ({reason}{span}) "
+            f"-> {cfg.reports_dir / LATEST_NAME}")
 
 
 def report_age(cfg: Config, now: datetime | None = None) -> str | None:

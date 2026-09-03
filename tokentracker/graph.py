@@ -8,7 +8,9 @@ Three tiers, in the order the work flows through them:
 
 `config.json` carries the checked-in graph; `state/graph.json` is the per-user
 override the overlay writes on a tap, exactly like goal.json - so a click never
-has to rewrite the checked-in config.
+has to rewrite the checked-in config. The override is a *patch*: `write_graph`
+persists only the fields it was handed, so a tap on the worker `+` changes the
+worker count and leaves every other field still following config.json.
 
 The legacy scalar keys (`throttle_model`, `worker_model`, `max_concurrency`,
 `surge_concurrency`) stay in `config.json` for compatibility and are *derived*
@@ -231,10 +233,52 @@ def override_warning(cfg: Config) -> str | None:
     return None
 
 
-def write_graph(cfg: Config, graph: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Persist the per-user override; returns the normalized graph written."""
-    graph = normalize(graph, default_graph(cfg))
-    body = json.dumps({"graph": graph, "set_at": utcnow().isoformat()}, indent=2)
+def _named_fields(patch: Any) -> dict[str, tuple[str, ...]]:
+    """{tier: the fields `patch` actually names}, ignoring everything else."""
+    named: dict[str, tuple[str, ...]] = {}
+    if not isinstance(patch, dict):
+        return named
+    for tier in TIERS:
+        block = patch.get(tier)
+        if not isinstance(block, dict):
+            continue
+        fields = tuple(f for f in TIER_FIELDS[tier] if f in block)
+        if fields:
+            named[tier] = fields
+    return named
+
+
+def write_graph(cfg: Config, patch: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Persist ONLY the fields `patch` names, merged into the standing override.
+
+    This is a patch, not a snapshot, and that is the whole contract: the
+    overlay's -/+ hands over one field (workers.count) and `tracker.py graph
+    set` hands over the assignments it was given. Writing the resolved graph
+    instead - which is what this used to do - copied the executive and advisory
+    models into state/graph.json as a side effect of one tap, and from then on
+    every edit to config.json's graph section was silently dead, with the read
+    path preferring the override field by field and nothing anywhere saying so.
+
+    Values are clamped against the graph in force, so junk falls back to the
+    number the operator can actually see. Returns the graph now in force, read
+    back from disk: a write that failed reports the old numbers rather than the
+    ones it meant to write.
+    """
+    effective = read_graph(cfg)                   # config.json + what stands
+    resolved = normalize(patch, effective)        # the patch, clamped
+    stored = _override_payload(cfg) or {}
+    kept = normalize(stored, effective)           # the standing override, clamped
+    merged: dict[str, dict[str, Any]] = {}
+    for tier, fields in _named_fields(stored).items():
+        merged[tier] = {f: kept[tier][f] for f in fields}
+    for tier, fields in _named_fields(patch).items():
+        merged.setdefault(tier, {}).update(
+            {f: resolved[tier][f] for f in fields})
+    if not merged:
+        # Nothing named: leave the file alone rather than writing an empty
+        # override, which reads back as "unreadable" and warns forever.
+        return effective
+    body = json.dumps({"graph": merged, "set_at": utcnow().isoformat()}, indent=2)
     path = cfg.graph_file
     tmp = path.parent / f"{path.name}.tmp"
     try:
@@ -252,7 +296,7 @@ def write_graph(cfg: Config, graph: dict[str, dict[str, Any]]) -> dict[str, dict
             tmp.unlink()
         except OSError:
             pass
-    return graph
+    return read_graph(cfg)
 
 
 def apply_graph(cfg: Config) -> dict[str, dict[str, Any]]:
@@ -306,9 +350,13 @@ def validate_graph(graph: dict[str, dict[str, Any]], models: list[str]) -> list[
     return warnings
 
 
-def set_assignments(graph: dict[str, dict[str, Any]], items: list[str],
-                    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """Apply `tier.field=value` strings; returns (graph, errors)."""
+def parse_assignments(items: list[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """`tier.field=value` strings -> (patch, errors).
+
+    The patch holds only the fields that were named, which is what makes
+    `tracker.py graph set workers.count=20` write exactly one field to
+    state/graph.json instead of pinning the whole graph.
+    """
     patch: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
     for item in items:
@@ -336,6 +384,13 @@ def set_assignments(graph: dict[str, dict[str, Any]], items: list[str],
                 errors.append(f"'{value}' is not a whole number for {target}")
                 continue
         patch.setdefault(tier, {})[fieldname] = value
+    return patch, errors
+
+
+def set_assignments(graph: dict[str, dict[str, Any]], items: list[str],
+                    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Apply `tier.field=value` strings to `graph`; returns (graph, errors)."""
+    patch, errors = parse_assignments(items)
     return normalize(patch, graph), errors
 
 
