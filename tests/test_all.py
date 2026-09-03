@@ -578,6 +578,21 @@ def test_throttle_task_uses_throttle_model():
     assert task.resume_session == MAIN_ID
 
 
+def test_throttle_fork_disabled():
+    from tokentracker import cli
+    cfg = _local_cfg()
+    cfg.main_session_ids = [MAIN_ID]
+    cfg.throttle_fork_enabled = False
+    d = dispatch.Dispatcher(cfg)
+    cli._ensure_throttle_task(cfg, d)
+    assert d.get(cli.THROTTLE_TASK_ID) is None
+    # An existing finished fork row must stay finished (no resurrect).
+    d.add(TaskSpec(id=cli.THROTTLE_TASK_ID, prompt="p", cwd=str(cfg.root),
+                   status="done"))
+    cli._ensure_throttle_task(cfg, d)
+    assert d.get(cli.THROTTLE_TASK_ID).status == "done"
+
+
 def test_throttle_task_respec_on_requeue():
     from tokentracker import cli
     cfg = _local_cfg()

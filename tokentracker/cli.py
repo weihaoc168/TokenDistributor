@@ -39,7 +39,10 @@ def _throttle_sig(cfg: Config) -> float | None:
 
 
 def _ensure_throttle_task(cfg: Config, dispatcher: Dispatcher) -> None:
-    if not cfg.main_session_ids:
+    # With forking disabled, full throttle still surges queued workers but the
+    # executive continuation runs inside the main session itself (its agent
+    # graph), not as a forked headless copy.
+    if not cfg.main_session_ids or not cfg.throttle_fork_enabled:
         return
     task = dispatcher.get(THROTTLE_TASK_ID)
     if task is None:

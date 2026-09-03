@@ -42,6 +42,7 @@ class Config:
     permission_mode: str = "acceptEdits"
     worker_model: str = ""
     throttle_model: str = ""
+    throttle_fork_enabled: bool = True
     extra_claude_args: list[str] = field(default_factory=list)
     main_session_ids: list[str] = field(default_factory=list)
     local_enabled: bool = False
