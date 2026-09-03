@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,11 +38,15 @@ THROTTLE_PROMPT = (
 
 
 def _throttle_active(cfg: Config) -> bool:
-    try:
-        data = json.loads(cfg.throttle_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return bool(isinstance(data, dict) and data.get("active"))
+    """The FULL THROTTLE manual override.
+
+    One reader, in the allocator, because the override is the one thing that
+    outranks it: the loop, the fork's brief and the panel all have to agree on
+    whether the allocator is being ignored right now.
+    """
+    from .allocator import throttle_active
+
+    return throttle_active(cfg)
 
 
 def _throttle_sig(cfg: Config) -> float | None:
@@ -65,25 +70,38 @@ def _goal_sig(cfg: Config) -> float | None:
         return None
 
 
-def _wake_sig(cfg: Config) -> tuple[float | None, float | None, float | None]:
+def _tasks_sig(cfg: Config) -> float | None:
+    try:
+        return cfg.tasks_file.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _wake_sig(cfg: Config) -> tuple[float | None, ...]:
     # Any operator switch (full throttle, start/stop, weekly goal) should cut
     # the sleep short so a click takes effect within seconds, not a whole poll
     # period - a goal dragged down under the current weekly stops the loop now.
-    return _throttle_sig(cfg), _control_sig(cfg), _goal_sig(cfg)
+    #
+    # tasks.json is in here for the same reason and one more: `tracker.py add`
+    # writes that file, so the mtime IS the wake signal, and a task queued from
+    # a second terminal starts within seconds instead of at the next poll.
+    return (_throttle_sig(cfg), _control_sig(cfg), _goal_sig(cfg),
+            _tasks_sig(cfg))
 
 
 def _fork_prompt(cfg: Config) -> str:
     """The director brief handed to the fork; config.json is authoritative.
 
     The `{graph}` placeholder is expanded here, at launch, so the fork is told
-    the agentic graph that is in force this poll - including a worker count the
-    operator changed from the overlay a minute ago.
+    the agentic graph that is in force this poll - the graph the allocator has
+    budgeted out of the operator's ceiling, including a worker count the
+    overlay changed a minute ago and an advisory count the ladder just stepped.
     """
-    from .graph import graph_line, read_graph
+    from .graph import allocated_line
 
     text = str(getattr(cfg, "throttle_prompt", "") or "").strip() or THROTTLE_PROMPT
     if "{graph}" in text:
-        text = text.replace("{graph}", graph_line(read_graph(cfg)))
+        text = text.replace("{graph}", allocated_line(cfg))
     return text
 
 
@@ -155,11 +173,17 @@ def _reload_config(cfg: Config) -> list[str]:
 
 
 def _fork_cooldown(cfg: Config) -> float:
-    try:
-        return max(0.0, float(getattr(cfg, "fork_cooldown_seconds",
-                                      FORK_COOLDOWN_SECONDS)))
-    except (TypeError, ValueError):
-        return float(FORK_COOLDOWN_SECONDS)
+    """The fork re-arm cooldown in force: the ALLOCATED one, not the configured.
+
+    Fork cadence is the third rung of the allocation ladder (x2, then x4, then
+    the configured maximum), so the gate that decides when the director may be
+    relaunched has to read the allocation rather than `fork_cooldown_seconds`
+    straight off the Config - otherwise the rung would be decided every poll
+    and applied by nobody.
+    """
+    from .allocator import allocate
+
+    return max(0.0, float(allocate(cfg).fork_cooldown_seconds))
 
 
 def _rearm_ready(cfg: Config, task: TaskSpec, now) -> bool:
@@ -177,13 +201,19 @@ def _rearm_ready(cfg: Config, task: TaskSpec, now) -> bool:
     return (now - finished).total_seconds() >= cooldown
 
 
-def _fork_wanted(cfg: Config, mode: str, control: str, throttle: bool) -> bool:
+def _fork_wanted(cfg: Config, mode: str, control: str, throttle: bool,
+                 dispatcher: Dispatcher | None = None) -> bool:
     """Whether the continue fork should be ensured on this tick.
 
     The handover is only armed while dispatch is actually running, the weekly
     goal has not been reached, and the loop is in a working mode: pace (normal
     dispatch, when fork_in_pace is on) or surge (full throttle). blocked,
     yield, coast and stopped never hand the director job over.
+
+    A queued or running screenshot pass also disarms it. That is the whole
+    point of the snapshot policy: it fires when the budget is nearly gone, and
+    a fork re-armed beside it would take the concurrency slot and spend the
+    reserve the pacer set aside for exactly this task.
     """
     if not cfg.main_session_ids or not cfg.throttle_fork_enabled:
         return False
@@ -191,6 +221,11 @@ def _fork_wanted(cfg: Config, mode: str, control: str, throttle: bool) -> bool:
         return False
     if read_stop(cfg) is not None:
         return False
+    if dispatcher is not None:
+        from .snapshot import pending_or_running
+
+        if pending_or_running(dispatcher) is not None:
+            return False
     return True if throttle else bool(getattr(cfg, "fork_in_pace", True))
 
 
@@ -259,7 +294,6 @@ def _bar(frac: float) -> str:
 def _write_state(cfg: Config, payload: dict) -> None:
     tmp = cfg.state_file.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    import os
     os.replace(tmp, cfg.state_file)
 
 
@@ -303,13 +337,29 @@ def _distribution(cfg: Config, own_dirs: set[str], now) -> dict:
     }
 
 
+def _snapshot_state(cfg: Config, allocation, now) -> dict:
+    """What the panel draws for the screenshot policy. Never raises."""
+    from .snapshot import age, enabled, read_state, status_line
+
+    try:
+        return {"enabled": enabled(cfg),
+                "line": status_line(cfg, allocation.buckets, now),
+                "age": age(cfg, now),
+                **{k: v for k, v in read_state(cfg).items() if k != "commits"}}
+    except Exception:
+        return {}
+
+
 def _tick(
     cfg: Config, dispatcher: Dispatcher, history, do_fetch: bool = True,
 ) -> tuple[Decision, list[str], Exception | None, "object | None", bool]:
     from .activity import detect_activity
+    from .allocator import allocate, evaluate, tick_notes
     from .graph import apply_graph
     from .ledger import maybe_refresh_tiers, maybe_report
     from .scheduler import decide, decide_local, normalize, pacing
+    from .snapshot import maybe_enqueue as maybe_snapshot
+    from .snapshot import note_finished as note_snapshot
     from .usage import (
         UsageFetchError,
         compute_burn_rates,
@@ -372,6 +422,17 @@ def _tick(
     )
     snap = normalize(snap, now)
 
+    # The allocation is decided here, once, from this poll's reading: each
+    # bucket's burn rate against the time left to its own reset. It writes
+    # state/allocation.json, and the apply_graph below folds the graph it
+    # decided onto the Config - so the concurrency `decide` reads, the cooldown
+    # the fork's re-arm gate reads and the {graph} line the fork is handed are
+    # all this poll's allocation rather than the last one's.
+    standing = allocate(cfg)
+    allocation = evaluate(cfg, snap, now)
+    notes += tick_notes(standing, allocation)
+    apply_graph(cfg)
+
     # The weekly goal is checked before anything is launched, so the poll that
     # crosses it is also the poll that stops dispatch. apply_goal_stop may have
     # just written the control file, hence the re-read.
@@ -379,6 +440,16 @@ def _tick(
     stop, goal_line = apply_goal_stop(cfg, snap.seven_day.utilization, now)
     if goal_line is not None:
         control = read_control(cfg)
+
+    # The screenshot policy, off this poll's own forecasts, and BEFORE the
+    # decision is made: the row has to exist for `_fork_wanted` to see it and
+    # for this tick's launch batch to start it, priority 200 ahead of the
+    # fork's 100. `goal_line is not None` is the poll that wrote the stop.
+    snapshot_line = maybe_snapshot(cfg, dispatcher, allocation.buckets, now,
+                                   stop_written=(goal_line is not None
+                                                 and stop is not None))
+    if snapshot_line is not None:
+        notes.append(snapshot_line)
 
     rates = compute_burn_rates(cfg, history, own_dirs, now)
     activity = detect_activity(cfg, own_dirs, now)
@@ -395,7 +466,7 @@ def _tick(
     # The handover is armed in normal pace mode too, not only under full
     # throttle: the fork is the acting director for as long as the loop is
     # dispatching at all. read_stop is current here - apply_goal_stop ran above.
-    fork_wanted = _fork_wanted(cfg, decision.mode, control, throttle)
+    fork_wanted = _fork_wanted(cfg, decision.mode, control, throttle, dispatcher)
     # apply() below may requeue the fork onto its tier's fallback (a limit
     # exit), which happens after this decision is made; the gate carries the
     # decision into the launch batch so that requeue obeys it too.
@@ -420,6 +491,11 @@ def _tick(
                                control=control, stop=stop, now=now)
     if report_line is not None:
         actions.append(report_line)
+    # A snapshot that finished on this tick's reap reports its commit hash;
+    # record it so `status` and the ledger's milestone table can name it.
+    commit_line = note_snapshot(cfg, dispatcher)
+    if commit_line is not None:
+        actions.append(commit_line)
 
     decision_payload = decision.to_dict()
     if stop is not None:
@@ -455,11 +531,32 @@ def _tick(
         "dispatch": control,
         "weekly_goal": goal,
         "goal_stop": stop,
+        # The graph the loop actually ran this tick, beside the ceiling it came
+        # from. state/allocation.json carries the buckets behind it.
+        "allocation": {**allocation.to_dict(),
+                       "reasons": allocation.reasons,
+                       "notes": allocation.notes},
+        # The screenshot policy's own line, so the panel draws it without
+        # recomputing the forecast on every frame.
+        "snapshot": _snapshot_state(cfg, allocation, now),
     })
     return decision, actions, fetch_exc, snap, rolled
 
 
-def cmd_run(cfg: Config, once: bool) -> int:
+def supervising(cfg: Config, no_supervise: bool = False) -> bool:
+    """Whether this run merges tasks.json from disk before every apply.
+
+    On by default, and the default is load-bearing. A loop started without it
+    holds the queue in memory and writes it back on every save, so a row added
+    by `tracker.py add` from another terminal is silently deleted at the next
+    poll - which is exactly what happened to a queued task on 2026-09-03 21:45
+    UTC. `--no-supervise` is the deliberate opt-out; `config.json`'s
+    `supervise` is the standing setting.
+    """
+    return False if no_supervise else bool(getattr(cfg, "supervise", True))
+
+
+def cmd_run(cfg: Config, once: bool, no_supervise: bool = False) -> int:
     """The control loop, with the loop-exit report bolted onto both exits.
 
     ctrl-c and a SystemExit both mean dispatch has stopped, which is one of the
@@ -469,7 +566,7 @@ def cmd_run(cfg: Config, once: bool) -> int:
     from .ledger import report_on_exit
 
     try:
-        return _run_loop(cfg, once)
+        return _run_loop(cfg, once, no_supervise)
     except (KeyboardInterrupt, SystemExit):
         print("stopped; running background tasks continue detached")
         line = report_on_exit(cfg)
@@ -478,7 +575,8 @@ def cmd_run(cfg: Config, once: bool) -> int:
         return 0
 
 
-def _run_loop(cfg: Config, once: bool) -> int:
+def _run_loop(cfg: Config, once: bool, no_supervise: bool = False) -> int:
+    from .clock import describe
     from .usage import RateLimitedError, UsageHistory
 
     from .graph import (
@@ -490,9 +588,17 @@ def _run_loop(cfg: Config, once: bool) -> int:
         validate_graph,
     )
 
-    dispatcher = Dispatcher(cfg, supervise=True)
+    supervise = supervising(cfg, no_supervise)
+    dispatcher = Dispatcher(cfg, supervise=supervise)
     history = UsageHistory(cfg)
     print(f"TokenDistributor loop started (poll every {cfg.poll_seconds}s, ctrl-c to stop)")
+    print(describe(cfg))
+    if supervise:
+        print("supervising tasks.json: external `tracker.py add` rows are "
+              "merged in before every apply")
+    else:
+        print("WARNING: --no-supervise; a task added while this loop runs will "
+              "be overwritten at the next poll")
     # Named with its source: the numbers in force can come from either file, and
     # "why is config.json not applying" has no other symptom.
     graph, source = read_graph_source(cfg)
@@ -566,11 +672,18 @@ def _run_loop(cfg: Config, once: bool) -> int:
 
 
 def cmd_status(cfg: Config) -> int:
+    from .allocator import status_line
+    from .clock import describe, fmt_local
     from .graph import active_graph, active_label
     from .ledger import report_status_line, tiers_status_line
     from .scheduler import pacing
+    from .snapshot import status_line as snapshot_line
     from .usage import UsageFetchError, fetch_usage
 
+    # Every absolute time below is the operator's clock; every stored one stays
+    # UTC. The zone, and how it was resolved, is named once at the top so a
+    # reading that looks an hour out has somewhere to be checked.
+    print(describe(cfg))
     try:
         snap = fetch_usage(cfg)
     except UsageFetchError as exc:
@@ -581,28 +694,40 @@ def cmd_status(cfg: Config) -> int:
             print(fork_line)
         print(report_status_line(cfg))
         print(tiers_status_line(cfg))
+        print(snapshot_line(cfg))
+        print(status_line(cfg))
         if cfg.state_file.exists():
             state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
-            print(f"last known state from {state.get('at')}:")
+            print("last known state from "
+                  f"{fmt_local(state.get('at'), '%a %H:%M', cfg, with_label=True)}:")
             print(json.dumps(state.get("usage"), indent=2))
         return 1
 
     now = utcnow()
     p = pacing(snap, cfg, now)
     print("weekly  " + _bar(snap.seven_day.utilization)
-          + f"  resets in {p['time_left_h']:.1f}h")
-    print("5-hour  " + _bar(snap.five_hour.utilization))
+          + f"  resets in {p['time_left_h']:.1f}h ("
+          + fmt_local(snap.seven_day.resets_at, "%a %H:%M", cfg, with_label=True)
+          + ")")
+    print("5-hour  " + _bar(snap.five_hour.utilization)
+          + "  resets "
+          + fmt_local(snap.five_hour.resets_at, "%H:%M", cfg, with_label=True))
     for name, w in snap.extra.items():
-        print(f"{name:<7} " + _bar(w.utilization))
-    print(f"pace: elapsed {p['elapsed_frac']:.1%}, reserve {p['reserve']:.1%}, "
-          f"required {p['required_total_pct_per_hr']:.2f}%/h")
+        print(f"{name:<7} " + _bar(w.utilization)
+              + "  resets "
+              + fmt_local(w.resets_at, "%a %H:%M", cfg, with_label=True))
+    held = p.get("snapshot_reserve", 0.0)
+    shots = f", shots reserve {held:.1%}" if held else ""
+    print(f"pace: elapsed {p['elapsed_frac']:.1%}, reserve {p['reserve']:.1%}"
+          f"{shots}, required {p['required_total_pct_per_hr']:.2f}%/h")
 
     goal = read_goal(cfg)
     print(f"weekly goal: {goal:.0%} (weekly now {snap.seven_day.utilization:.0%})")
     stop = read_stop(cfg)
     if stop is not None:
         print(f"STOPPED: {stop.get('reason')} - goal {float(stop.get('goal', 0)):.0%}, "
-              f"weekly {float(stop.get('weekly', 0)):.0%} at {stop.get('at')}")
+              f"weekly {float(stop.get('weekly', 0)):.0%} at "
+              f"{fmt_local(stop.get('at'), '%a %H:%M', cfg, with_label=True)}")
 
     print(f"dispatch: {read_control(cfg)}")
     # The monitor session reports from this line: who is acting as director,
@@ -621,12 +746,19 @@ def cmd_status(cfg: Config) -> int:
     active = active_label(active_graph(cfg))
     if active:
         print(f"active vs configured: {active}")
+    # One line for the automatic allocation: the rung the ladder is on, what it
+    # moved, and the pace reading that moved it.
+    print(status_line(cfg))
+    # And one for the screenshot policy: how old the gallery is, and which of
+    # the two triggers comes next.
+    print(snapshot_line(cfg, now=now))
 
     if cfg.state_file.exists():
         state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
         d = state.get("decision", {})
-        print(f"last decision [{state.get('at', '?')}]: {d.get('mode')} "
-              f"conc={d.get('target_concurrency')} - {d.get('reason')}")
+        print("last decision ["
+              f"{fmt_local(state.get('at'), '%a %H:%M', cfg, with_label=True)}]: "
+              f"{d.get('mode')} conc={d.get('target_concurrency')} - {d.get('reason')}")
 
     dispatcher = Dispatcher(cfg)
     stats = dispatcher.queue_stats()
@@ -664,8 +796,84 @@ def cmd_goal(cfg: Config, value: str | None) -> int:
     return 0
 
 
+def cmd_alloc(cfg: Config) -> int:
+    """Print the buckets, their pace, the ladder rung and why it is there.
+
+    The read-only view of state/allocation.json: it never evaluates, so running
+    it does not move the graph under the loop that owns that decision.
+    """
+    from .allocator import (
+        MAX_STEP,
+        STEP_LABELS,
+        allocate,
+        format_buckets,
+        max_cooldown,
+        min_advisory,
+        min_workers,
+    )
+    from .clock import fmt_local, label
+    from .graph import ADVISORY, TIERS, WORKERS, read_graph, tiers_of
+
+    allocation = allocate(cfg)
+    if allocation.generated_at is None:
+        print("no allocation yet: state/allocation.json is written by the loop "
+              "(python tracker.py run); the configured graph is in force")
+    else:
+        # Local for the reader, with the stored UTC beside it: this line is
+        # quoted into reports, and the file itself is on the other clock.
+        print(f"allocation at "
+              f"{fmt_local(allocation.generated_at, '%a %H:%M:%S', cfg)} "
+              f"{label(cfg)} ({allocation.generated_at})")
+    print(f"step {allocation.step}/{MAX_STEP}: "
+          f"{STEP_LABELS.get(allocation.step, '?')}")
+    if allocation.override:
+        print("FULL THROTTLE (manual override) is on: the allocator is ignored "
+              f"and the workers are pinned to x{allocation.worker_count}")
+    if allocation.buckets:
+        for line in format_buckets(allocation, cfg):
+            print(line)
+    else:
+        print("  no bucket readings yet")
+    counts = allocation.counts()
+    for tier in TIERS:
+        block = allocation.graph.get(tier, {})
+        allocated, configured = counts[tier]
+        model = str(block.get("model") or "(account default)")
+        cfg_model = str(allocation.configured.get(tier, {}).get("model") or "")
+        # Allocated first, the ceiling it came out of in brackets after it.
+        extras = []
+        if cfg_model and cfg_model != block.get("model"):
+            extras.append(f"cfg {cfg_model}")
+        if allocated != configured:
+            extras.append(f"cfg x{configured}")
+        tail = f" ({', '.join(extras)})" if extras else ""
+        if tier == ADVISORY:
+            tail += f" effort {allocation.advisory_effort}"
+        if tier == WORKERS:
+            tail += f" surge x{block.get('surge_count', allocated)}"
+        print(f"  {tier:<9} {model:<28} x{allocated}{tail}")
+    print(f"fork cadence {allocation.fork_cooldown_seconds:.0f}s "
+          f"(max {max_cooldown(cfg):.0f}s); floors: advisory "
+          f"{min_advisory(cfg)}, workers {min_workers(cfg)}")
+    for reason in allocation.reasons:
+        print(f"  reason: {reason}")
+    for note in allocation.notes:
+        print(f"  note: {note}")
+    ceiling = tiers_of(read_graph(cfg))[2]
+    print(f"ceiling (configured): workers x{ceiling['count']} "
+          f"(surge x{ceiling['surge_count']}) - config.json and "
+          "state/graph.json are never written by the allocator")
+    # The screenshot policy reads the same buckets, so its two triggers belong
+    # under the same table.
+    from .snapshot import status_line as snapshot_line
+
+    print(snapshot_line(cfg, allocation.buckets or None))
+    return 0
+
+
 def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
     """Generate the work-distribution report now, and optionally open it."""
+    from .clock import fmt_local, stamp
     from .ledger import generate, latest_report, open_report
 
     since = None
@@ -674,10 +882,13 @@ def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
         if since is None:
             print(f"error: cannot read '{args.since}' as an ISO timestamp")
             return 1
+        # `--since` is given as ISO UTC and echoed back on the operator's clock,
+        # so a window typed in one zone is not read as the other.
+        print(f"window starts {fmt_local(since, '%a %H:%M', cfg, with_label=True)}")
     try:
         page = generate(cfg, "manual", since=since,
                         hours=getattr(args, "hours", None))
-        print(f"wrote {page}")
+        print(f"wrote {page} at {stamp(None, '%a %H:%M:%S', cfg)}")
         print(f"latest: {cfg.reports_dir / 'latest.html'}")
     except (OSError, ValueError, KeyError) as exc:
         print(f"error: report generation failed ({exc})")
@@ -754,12 +965,26 @@ def cmd_graph(cfg: Config, assignments: list[str] | None,
         print(note)
     for warning in validate_graph(graph, known_models(cfg), cfg):
         print(warning)
-    print(f"fork prompt line: {graph_line(graph)}")
+    # The tiers above are the CEILING. What is actually running is the
+    # allocation, which is only ever a step down from it (or the worker lanes a
+    # step up toward surge), so it is named here rather than left to `alloc`.
+    from .allocator import allocate
+    from .clock import fmt_local, label as tz_label
+
+    allocation = allocate(cfg)
+    if allocation.differs or allocation.reasons:
+        when = (f" (allocated {fmt_local(allocation.generated_at, '%a %H:%M', cfg)}"
+                f" {tz_label(cfg)})" if allocation.generated_at else "")
+        print(f"allocated now: {allocation.label()}{when}")
+        for reason in allocation.reasons:
+            print(f"  reason: {reason}")
+    print(f"fork prompt line: {graph_line(allocation.graph, allocation)}")
     return 0
 
 
 def cmd_pricing(cfg: Config, assignments: list[str] | None) -> int:
     """Print the price table, or set prices from `model.field=value` pairs."""
+    from .clock import stamp
     from .pricing import (
         default_row,
         format_table,
@@ -782,12 +1007,44 @@ def cmd_pricing(cfg: Config, assignments: list[str] | None) -> int:
             return 1
         write_pricing(cfg, patch)
         table, source = read_pricing_source(cfg)
-    print(f"model prices, USD per 1M tokens (source: {source})")
+    # The per-row `checked` values are dates, not clock times, so they are left
+    # as written; the read itself is stamped on the operator's clock.
+    print(f"model prices, USD per 1M tokens (source: {source}, read "
+          f"{stamp(None, '%a %H:%M', cfg)})")
     if ignored and not assignments:
         print(ignored)
     for line in format_table(table, default_row(cfg)):
         print(line)
     return 0
+
+
+def loop_liveness(cfg: Config, now=None) -> tuple[bool, str]:
+    """(a loop is live, how it will treat a task added right now).
+
+    state/state.json is stamped at the top of every tick, so its age is the
+    loop's own heartbeat. Anything inside a couple of poll periods is live.
+    The line matters because `add` is the command whose failure mode is
+    silent: on 2026-09-03 21:45 UTC a queued task vanished at the next poll,
+    and the only way to have known was to check whether the running loop was
+    supervising.
+    """
+    now = now or utcnow()
+    stamp = None
+    try:
+        state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
+        stamp = parse_iso(state.get("at")) if isinstance(state, dict) else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        stamp = None
+    if stamp is None:
+        return False, ("no loop heartbeat in state/state.json: the task waits "
+                       "on disk until `py -3.13 tracker.py run` is started")
+    age = max(0.0, (now - stamp).total_seconds())
+    limit = max(2.5 * float(getattr(cfg, "poll_seconds", 300) or 300), 120.0)
+    if age > limit:
+        return False, (f"last loop tick was {age / 60:.0f}m ago (stale): the "
+                       "task waits on disk until a loop runs again")
+    return True, (f"a live loop (last tick {age:.0f}s ago) picks it up within "
+                  "seconds - tasks.json is its wake signal")
 
 
 def cmd_add(cfg: Config, args: argparse.Namespace) -> int:
@@ -802,7 +1059,20 @@ def cmd_add(cfg: Config, args: argparse.Namespace) -> int:
         max_minutes=args.max_minutes,
     )
     dispatcher.add(task)
-    print(f"added task {task.id} ({task.weight})")
+    print(f"added task {task.id} ({task.weight}, priority {task.priority})")
+    # `add` already wrote tasks.json, and its mtime is what `_wake_sig` watches
+    # - but a save inside one filesystem timestamp tick can land on the mtime
+    # the file already had, and then the sleeping loop sees no change at all.
+    # One explicit touch costs nothing and closes that window.
+    try:
+        os.utime(cfg.tasks_file, None)
+    except OSError:
+        pass
+    live, note = loop_liveness(cfg)
+    print(("queued: " if live else "queued, but ") + note)
+    if live and not bool(getattr(cfg, "supervise", True)):
+        print("warning: config.json sets supervise=false, so a loop started "
+              "with it will overwrite this row at its next save")
     return 0
 
 
@@ -844,11 +1114,17 @@ def main(argv: list[str] | None = None) -> int:
 
     run_p = sub.add_parser("run", help="start the control loop")
     run_p.add_argument("--once", action="store_true", help="single tick then exit")
+    run_p.add_argument("--no-supervise", action="store_true",
+                       help="do not merge external tasks.json edits before "
+                            "each apply (a task added while this loop runs "
+                            "will be overwritten)")
     sub.add_parser("status", help="live usage, pacing and queue")
     goal_p = sub.add_parser(
         "goal", help="show or set the weekly goal (the loop's stopping point)")
     goal_p.add_argument("value", nargs="?", default=None,
                         help="0.85, 85 or 85%% - omit to print the current goal")
+    sub.add_parser(
+        "alloc", help="the automatic allocation: buckets, pace, ladder step")
     sub.add_parser("list", help="list tasks")
     sub.add_parser("overlay", help="always-on-top panel docked to the Sundial layer")
 
@@ -902,11 +1178,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.cmd == "run":
-            return cmd_run(cfg, args.once)
+            return cmd_run(cfg, args.once,
+                           bool(getattr(args, "no_supervise", False)))
         if args.cmd == "status":
             return cmd_status(cfg)
         if args.cmd == "goal":
             return cmd_goal(cfg, args.value)
+        if args.cmd == "alloc":
+            return cmd_alloc(cfg)
         if args.cmd == "report":
             return cmd_report(cfg, args)
         if args.cmd == "graph":

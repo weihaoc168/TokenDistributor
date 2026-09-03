@@ -8,6 +8,7 @@ import tkinter.font as tkfont
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .allocator import allocate
 from .config import Config, reload_config
 from .control import RUNNING as CONTROL_RUNNING
 from .control import STOPPED as CONTROL_STOPPED
@@ -148,6 +149,9 @@ LADDER_STEP_GAP = 3
 REPORT_BTN_H = 26
 REPORT_NOW_W = 84
 REPORT_AGE_H = 16
+# The screenshot policy's line, under the report age: how old the gallery is
+# and which of the two triggers fires next.
+SHOTS_LINE_H = 15
 # Red band naming the stop point, drawn under the mode label when stop.json is
 # on disk (expanded), or across the usage readouts (collapsed).
 STOP_BAND_H = 20
@@ -451,12 +455,58 @@ def _norm_window(window: dict, hours: float) -> tuple[float, str | None]:
     return frac, resets.isoformat() if resets else None
 
 
-def _local_clock(iso_value: str | None, with_day: bool = False) -> str | None:
+def _local_clock(iso_value: str | None, with_day: bool = False,
+                 cfg=None) -> str | None:
+    """"Fri 07:00" on the operator's configured clock, or None.
+
+    `clock.fmt_local` rather than `astimezone()`: config.json names the zone
+    (America/Chicago here), and the machine's own zone is not necessarily it.
+    """
+    from .clock import fmt_local
+
     dt = parse_iso(iso_value)
     if dt is None:
         return None
-    local = dt.astimezone()
-    return local.strftime("%a %H:%M") if with_day else local.strftime("%H:%M")
+    return fmt_local(dt, "%a %H:%M" if with_day else "%H:%M", cfg, fallback="?")
+
+
+def _tz_label(cfg=None) -> str:
+    """"CT" - the zone every clock on the panel is drawn in."""
+    from .clock import label
+
+    return label(cfg)
+
+
+def _shots_line(cfg) -> str | None:
+    """"shots 3h ago · next eod 23:00 CT" for the panel, or None.
+
+    Compressed from `snapshot.status_line`: the panel is 300px wide, so the
+    two triggers are shortened to whichever comes first rather than both being
+    printed. None when the policy is off, which is the one case where a line
+    saying nothing would be worse than no line.
+    """
+    try:
+        from .snapshot import age, due, enabled
+        from .clock import fmt_local
+        from .models import utcnow as _now
+
+        if not enabled(cfg):
+            return None
+        from .allocator import read_state as _read_alloc
+
+        now = _now()
+        buckets = (_read_alloc(cfg) or {}).get("buckets")
+        _reason, next_eod, forecast_at, _sup = due(cfg, buckets, now)
+        eod_text = f"eod {fmt_local(next_eod, '%H:%M', cfg)}"
+        if forecast_at is not None and forecast_at < next_eod:
+            minutes = max(0.0, (forecast_at - now).total_seconds() / 60.0)
+            nxt = (f"pre-limit {minutes / 60:.1f}h" if minutes >= 90
+                   else f"pre-limit {minutes:.0f}m")
+        else:
+            nxt = eod_text
+        return f"{age(cfg, now)} · next {nxt} {_tz_label(cfg)}"
+    except Exception:
+        return None
 
 
 class Overlay:
@@ -475,11 +525,13 @@ class Overlay:
         self._stop = read_stop(cfg)
         self._fork = fork_active(cfg)
         self._graph = read_graph(cfg)
+        self._alloc = allocate(cfg, self._graph)
         self._active = active_graph(cfg, self._graph)
         self._shares = tier_shares(read_tiers(cfg))
         self._limited = limited_model(cfg)
         self._report = latest_report(cfg)
         self._report_age = report_age(cfg)
+        self._shots = _shots_line(cfg)
         self._after_id: str | None = None
         self._collapsed = self._load_collapsed()
 
@@ -792,11 +844,21 @@ class Overlay:
 
     def _draw_button(self, x0: float, y0: float, x1: float, y1: float,
                      active: bool) -> None:
+        """The throttle toggle, which now reads as the STATE it is in.
+
+        Off is no longer "FULL THROTTLE" (an unpressed button that named the
+        thing it would do): the loop allocates the budget by itself, so off is
+        AUTO and the button says which of the two is running. The label carries
+        the tap as well, because the button is the only control that overrides
+        the allocator and an operator has to be able to get back.
+        """
         self._round_rect(x0, y0, x1, y1, self._pxf(14),
                          fill=BTN_ACTIVE_BG if active else SUB_BG,
                          outline=RED if active else AMBER, width=1,
                          tags="throttle_btn")
-        label = "THROTTLE ON - tap to stop" if active else "FULL THROTTLE"
+        label = ("THROTTLE ON - tap for auto" if active
+                 else "AUTO (tap for full throttle)")
+        label = self._fit(label, self._font_bold, (x1 - x0) - self._px(12))
         self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label,
                                 font=FONT_BOLD, fill=FG if active else AMBER,
                                 tags="throttle_btn")
@@ -903,14 +965,42 @@ class Overlay:
                          f"(cfg {short_model(row.get('configured'))})")
         return "active vs configured: " + "; ".join(parts) if parts else None
 
+    def _alloc_note(self) -> str | None:
+        """"ALLOCATION step 1 - advisory x2 (cfg x3): fable 6% ahead ...".
+
+        None while the allocator is holding the configured graph and has said
+        nothing about it, which is the ordinary case: a line reading "step 0"
+        under an unchanged ladder is noise. The manual override always says so,
+        because a pinned graph that looks automatic is the one state an
+        operator must not have to infer.
+        """
+        alloc = getattr(self, "_alloc", None)
+        if alloc is None:
+            return None
+        if not (alloc.override or alloc.differs or alloc.reasons):
+            return None
+        return alloc.line()
+
+    def _ladder_notes(self) -> list[tuple[str, str, str]]:
+        """The (text, colour, tag) lines drawn under the rungs, in order."""
+        lines: list[tuple[str, str, str]] = []
+        active = self._active_note()
+        if active:
+            lines.append((active, AMBER, "ladder_note"))
+        alloc = self._alloc_note()
+        if alloc:
+            override = bool(getattr(self._alloc, "override", False))
+            lines.append((alloc, RED if override else BLUE, "alloc_note"))
+        return lines
+
     def _ladder_height(self) -> int:
         """What `_draw_graph_ladder` will occupy, so the card can grow for it."""
         P = self._px
-        note = (self._text_row(LADDER_NOTE_H, self._font_small)
-                if self._active_note() else 0)
+        notes = (len(self._ladder_notes())
+                 * self._text_row(LADDER_NOTE_H, self._font_small))
         rung = max(P(LADDER_RUNG_H), self._share_geometry()[2])
         return (self._text_row(LADDER_LABEL_H, self._font_small) + 3 * rung
-                + 2 * P(LADDER_RUNG_GAP) + note)
+                + 2 * P(LADDER_RUNG_GAP) + notes)
 
     def _text_row(self, design: float, font: tkfont.Font) -> int:
         """A row at least one line of `font` tall, whatever the DPI.
@@ -1017,7 +1107,13 @@ class Overlay:
         step_w = P(LADDER_STEP_W)
         gutter = 2 * step_w + P(LADDER_STEP_GAP)
         num_x = x1 - gutter - P(LADDER_TEXT_PAD)
-        blocks = dict(zip(TIERS, tiers_of(self._graph)))
+        # Three columns per rung when they differ: the ACTIVE model (the main
+        # label), the ALLOCATED count (the bold xN, what is running now) and
+        # the CONFIGURED count dimmed beside it ("cfg x3", the ceiling the
+        # operator set). They are the same number most of the time, and the
+        # difference is the whole point of the allocator being automatic.
+        blocks = dict(zip(TIERS, tiers_of(self._alloc.graph)))
+        ceiling = dict(zip(TIERS, tiers_of(self._graph)))
         workers = blocks[WORKERS]
         surge = int(workers.get("surge_count", workers["count"]))
 
@@ -1063,6 +1159,17 @@ class Overlay:
             # tier name, which is wider at some DPIs than at others.
             left = name_x + self._font_small.measure(name)
             count_left = num_x - self._font_bold.measure(counts)
+            # The configured count, dimmed, only while the allocator is running
+            # this tier at something else. It takes its width out of the model
+            # column below (like the LIMITED tag) rather than overprinting it.
+            cfg_count = int(ceiling[tier].get("count", count) or count)
+            cfg_counts = f"cfg x{cfg_count}" if cfg_count != count else ""
+            if cfg_counts:
+                self.canvas.create_text(
+                    count_left - P(4), mid, text=cfg_counts, font=FONT_SMALL,
+                    fill=DIM, anchor="e",
+                    tags=("ladder", f"alloccfg_{tier}"))
+                count_left -= self._font_small.measure(cfg_counts) + P(6)
             # Whether THIS rung's own primary is the model marked limited; the
             # tag it draws takes its width out of the model column below rather
             # than overprinting it.
@@ -1081,6 +1188,17 @@ class Overlay:
             # operator needs to see when they are not.
             active = self._active.get(tier) if isinstance(self._active, dict) else None
             active = active if isinstance(active, dict) else {}
+            # `active_graph` resolves each tier against the CEILING, so a tier
+            # the allocator moved (the advisory lenses onto the workers' model,
+            # the ladder's fourth rung) would otherwise still be labelled with
+            # the model config.json names. Only when nothing live already
+            # differs: a running row's `model_used` is the harder fact.
+            alloc_model = str(block.get("model") or "")
+            cfg_model = str(ceiling[tier].get("model") or "")
+            if (alloc_model and alloc_model != cfg_model
+                    and str(active.get("model") or "") == cfg_model):
+                active = {**active, "model": alloc_model, "models": [alloc_model],
+                          "configured": cfg_model, "differs": True}
             running = active.get("models") or [block["model"]]
             text = short_model(active.get("model") or block["model"])
             if len(running) > 1:
@@ -1188,16 +1306,18 @@ class Overlay:
                     self.canvas.create_text(bx0 + step_w / 2, mid, text=label,
                                             font=FONT_BOLD, fill=BLUE, tags=tag)
 
-        note = self._active_note()
-        if note:
-            # Under the last rung, in the amber the panel uses for "something
-            # is not what you set it to". `_ladder_height` reserved the row.
-            note_y = (top + 3 * rung_h + 2 * gap
-                      + self._text_row(LADDER_NOTE_H, self._font_small) / 2)
+        # Under the last rung, one row each and in the order they matter: the
+        # amber "not what you set it to" note first, then the allocation line
+        # (blue, or red while the manual override has the allocator switched
+        # off). `_ladder_height` reserved a row for each of them.
+        row_h = self._text_row(LADDER_NOTE_H, self._font_small)
+        note_top = top + 3 * rung_h + 2 * gap
+        for i, (text, color, tag) in enumerate(self._ladder_notes()):
             self.canvas.create_text(
-                x0, note_y, text=self._fit(note, self._font_small, x1 - x0),
-                font=FONT_SMALL, fill=AMBER, anchor="w",
-                tags=("ladder", "ladder_note"))
+                x0, note_top + i * row_h + row_h / 2,
+                text=self._fit(text, self._font_small, x1 - x0),
+                font=FONT_SMALL, fill=color, anchor="w",
+                tags=("ladder", tag))
 
     def _click_view_report(self, _event: tk.Event) -> str:
         # Dead until there is a page: a click with no report must not launch
@@ -1368,6 +1488,10 @@ class Overlay:
         # The graph and the last report are both files another process writes
         # (the CLI, the loop's report thread), so they are re-read every pass.
         self._graph = read_graph(self.cfg)
+        # The graph the loop actually budgeted out of that ceiling, from
+        # state/allocation.json - another file another process writes, so it is
+        # re-read every pass like the rest of them.
+        self._alloc = allocate(self.cfg, self._graph)
         # Which model the dispatcher has marked limited, if any: it expires on
         # its own (fallback_minutes), so it is re-read rather than remembered.
         self._limited = limited_model(self.cfg)
@@ -1379,6 +1503,9 @@ class Overlay:
         self._shares = tier_shares(read_tiers(self.cfg))
         self._report = latest_report(self.cfg)
         self._report_age = report_age(self.cfg)
+        # The screenshot policy: another file the loop writes, re-read like the
+        # rest rather than remembered across a frame.
+        self._shots = _shots_line(self.cfg)
         self.canvas.delete("all")
         if self._collapsed:
             self._refresh_collapsed(state)
@@ -1408,15 +1535,17 @@ class Overlay:
                     fable_frac, _ = _norm_window(window, WEEK_HOURS_F)
                     break
 
-            reset5 = _local_clock(reset5_iso)
-            reset7 = _local_clock(reset7_iso, with_day=True)
+            reset5 = _local_clock(reset5_iso, cfg=self.cfg)
+            reset7 = _local_clock(reset7_iso, with_day=True, cfg=self.cfg)
             parts = []
             if reset5:
                 parts.append(f"5h {reset5}")
             if reset7:
                 parts.append(f"wk {reset7}")
             if parts:
-                info_line = " · ".join(parts)
+                # The zone rides on the line, once: two wall clocks with no
+                # label is the reading a panel gets wrong.
+                info_line = " · ".join(parts) + f" {_tz_label(self.cfg)}"
 
             mode = str(state.get("decision", {}).get("mode", "?"))
             mode_label = mode.upper()
@@ -1445,7 +1574,9 @@ class Overlay:
             at = parse_iso(state.get("at"))
             stale_after = max(STALE_FACTOR * self.cfg.poll_seconds, STALE_MIN_SECONDS)
             if at is not None and utcnow() - at > timedelta(seconds=stale_after):
-                warn = f"loop offline - last tick {at.astimezone().strftime('%H:%M')}"
+                warn = ("loop offline - last tick "
+                        f"{_local_clock(state.get('at'), cfg=self.cfg)} "
+                        f"{_tz_label(self.cfg)}")
             elif state.get("fetch_error"):
                 if "429" in str(state["fetch_error"]):
                     warn = "endpoint rate-limited - using cached usage"
@@ -1503,7 +1634,9 @@ class Overlay:
         btn_y = ctl_y + P(BTN_H) + P(BTN_ROW_GAP)
         rep_y = btn_y + P(BTN_H) + P(BTN_ROW_GAP)
         age_y = rep_y + P(REPORT_BTN_H) + P(REPORT_AGE_H) / 2
-        height = rep_y + P(REPORT_BTN_H) + P(REPORT_AGE_H) + P(30)
+        shots_h = P(SHOTS_LINE_H) if self._shots else 0
+        shots_y = rep_y + P(REPORT_BTN_H) + P(REPORT_AGE_H) + shots_h / 2
+        height = rep_y + P(REPORT_BTN_H) + P(REPORT_AGE_H) + shots_h + P(30)
 
         self.canvas.config(height=height)
         self._round_card(width, height)
@@ -1635,6 +1768,13 @@ class Overlay:
             # repeat it.
             self.canvas.create_text(width / 2, age_y, text=self._report_age,
                                     font=FONT_SMALL, fill=DIM)
+        if self._shots:
+            # The screenshot policy's own line: how stale the gallery is, and
+            # whether end of day or the pre-exhaustion forecast comes first.
+            self.canvas.create_text(
+                width / 2, shots_y,
+                text=self._fit(self._shots, self._font_small, width - 2 * pad),
+                font=FONT_SMALL, fill=DIM)
 
         bottom = warn or updated_line
         if bottom:

@@ -645,10 +645,11 @@ class Dispatcher:
         prompt = task.prompt
         if "{graph}" in prompt:
             # Expanded at launch, not when the row was queued: the agentic
-            # graph the fork is told about is the one in force right now,
-            # including a worker count the operator just changed.
-            from .graph import graph_line, read_graph
-            prompt = prompt.replace("{graph}", graph_line(read_graph(self.cfg)))
+            # graph the fork is told about is the one in force right now - the
+            # allocated one, including a worker count the operator just changed
+            # and an advisory count the allocator just stepped.
+            from .graph import allocated_line
+            prompt = prompt.replace("{graph}", allocated_line(self.cfg))
         if lane == "local" and self.cfg.local_prompt_preamble:
             return f"{self.cfg.local_prompt_preamble}\n\n{prompt}"
         return prompt

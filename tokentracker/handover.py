@@ -193,14 +193,23 @@ def fork_active(cfg: Config) -> bool:
 
 
 def fork_status_line(cfg: Config) -> str | None:
-    """The one line `status` prints for the monitor session, or None."""
+    """The one line `status` prints for the monitor session, or None.
+
+    "since" is rendered on the operator's clock (the record itself keeps ISO
+    UTC): the monitor session quotes this line to a human, and a UTC timestamp
+    beside a local reset time is the reading that gets misjudged.
+    """
+    from .clock import fmt_local
+
     record = read_handover(cfg)
     if not isinstance(record, dict):
         return None
     status = record.get("status")
     if not isinstance(status, str) or not status:
         return None
-    since = record.get("started_at") or "?"
+    raw = record.get("started_at")
+    since = fmt_local(raw, "%a %H:%M", cfg, with_label=True,
+                      fallback=str(raw or "?"))
     mode = record.get("mode") or "?"
     model = record.get("model") or "?"
     return f"fork: {status} since {since} ({mode}, {model})"

@@ -6,6 +6,27 @@
   "reserve_week_frac": 0.15,
   "ahead_margin": 0.03,
   "weekly_goal": 0.9,
+  "fable_goal": null,
+  "allocation": {
+    "ahead_step": 0.03,
+    "behind_step": 0.02,
+    "min_advisory": 1,
+    "min_workers": 2,
+    "max_fork_cooldown_seconds": 1800,
+    "min_dwell_seconds": 1800
+  },
+  "snapshot": {
+    "enabled": true,
+    "eod_local": "23:00",
+    "lead_minutes": 45,
+    "reserve_fraction": 0.02,
+    "repo": "C:/Users/chenw/StarGTA",
+    "min_gap_minutes": 120
+  },
+  "timezone": "America/Chicago",
+  "tz_offset_hours": -5,
+  "tz_label": "",
+  "supervise": true,
   "endgame_hours": 12.0,
   "five_hour_guard_active": 0.8,
   "five_hour_guard_idle": 0.95,

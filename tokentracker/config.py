@@ -33,6 +33,28 @@ class Config:
     reserve_week_frac: float = 0.15
     ahead_margin: float = 0.03
     weekly_goal: float = 0.90
+    # The Fable window's own stopping point. Null (the default) means "the same
+    # number as weekly_goal", so an operator who sets one goal sets both.
+    fable_goal: float | None = None
+    # Automatic allocation (tokentracker/allocator.py): ahead_step, behind_step,
+    # min_advisory, min_workers, max_fork_cooldown_seconds, min_dwell_seconds.
+    # Every key has a built-in default, so an empty block means "use them".
+    allocation: dict[str, Any] = field(default_factory=dict)
+    # Screenshot policy (tokentracker/snapshot.py): enabled, eod_local,
+    # lead_minutes, reserve_fraction, repo, min_gap_minutes. Same contract as
+    # `allocation`: every key defaults, so {} means "the built-in policy".
+    snapshot: dict[str, Any] = field(default_factory=dict)
+    # The operator's clock (tokentracker/clock.py). Everything on disk stays
+    # ISO UTC; these only decide what the screen says. zoneinfo is tried first
+    # and `tz_offset_hours` is the fallback for a box with no tz database,
+    # which is what Windows is unless `tzdata` is installed.
+    timezone: str = "America/Chicago"
+    tz_offset_hours: float = -5.0
+    tz_label: str = ""
+    # The run loop merges tasks.json from disk before every apply, so a
+    # `tracker.py add` made while it runs is picked up instead of being
+    # overwritten by the loop's own save. `--no-supervise` opts one run out.
+    supervise: bool = True
     endgame_hours: float = 12.0
     five_hour_guard_active: float = 0.80
     five_hour_guard_idle: float = 0.95
@@ -144,6 +166,28 @@ class Config:
     def graph_file(self) -> Path:
         """Per-user agentic-graph override; wins over config.json like goal.json."""
         return self.state_dir / "graph.json"
+
+    @property
+    def allocation_file(self) -> Path:
+        """This poll's bucket forecasts and the ladder rung they put the graph on.
+
+        Written by the loop every tick (tokentracker/allocator.py) and read by
+        everything that needs the graph actually in force - `apply_graph`, the
+        fork's brief, the panel - so the allocation is decided in one place and
+        applied everywhere from a file.
+        """
+        return self.state_dir / "allocation.json"
+
+    @property
+    def snapshot_file(self) -> Path:
+        """When the gallery was last refreshed, why, and what it committed.
+
+        {last_run, last_reason, last_commit, next_eod, forecast_trigger_at,
+        commits} - written by the loop's snapshot policy
+        (tokentracker/snapshot.py) and read by `status`, the panel and the
+        ledger's milestone table.
+        """
+        return self.state_dir / "snapshot.json"
 
     @property
     def limited_file(self) -> Path:
@@ -317,10 +361,14 @@ def reload_config(cfg: Config) -> list[str] | None:
     if raw is None:
         return None
     changed = apply_raw(cfg, raw)
+    from .clock import use as use_clock
     from .graph import apply_graph, default_graph
     if not isinstance(cfg.graph, dict) or not cfg.graph:
         cfg.graph = default_graph(cfg)
     apply_graph(cfg)
+    # An edited `timezone` takes effect on the next rendered line, not at the
+    # next restart, the same as the graph.
+    use_clock(cfg)
     return changed
 
 
@@ -354,6 +402,10 @@ def load_config(root: str | Path) -> Config:
             kwargs[key] = value
 
     cfg = Config(root=root, **kwargs)
+    # Every display helper that renders a time without a Config in hand (the
+    # overlay's draw calls, the allocator's reset labels) reads this one.
+    from .clock import use as use_clock
+    use_clock(cfg)
     # What was on disk, and when: `reload_config` compares against both, so the
     # loop can pick up an edit to config.json without being restarted.
     cfg.config_raw = copy.deepcopy(raw)

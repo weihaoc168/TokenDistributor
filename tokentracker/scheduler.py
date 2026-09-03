@@ -47,6 +47,25 @@ def _hours_until(resets_at: datetime | None, now: datetime) -> float:
     return min(max(hours, 0.25), WEEK_HOURS)
 
 
+def snapshot_reserve(cfg: Config) -> float:
+    """Weekly budget the screenshot policy holds back. 0 when it is off.
+
+    Kept apart from the pacing reserve rather than folded into it, and for two
+    different reasons. The pacing reserve is a *schedule* - it shrinks as the
+    week runs and is dropped entirely in the endgame, because at that point
+    there is no later to save for. The snapshot reserve is a *bill*: the
+    gallery refresh costs what it costs, and the hour it matters most is
+    exactly the endgame hour the pacing reserve gives up. So it is subtracted
+    from the target in both branches, and reported under its own key.
+    """
+    try:
+        from .snapshot import reserve_fraction
+
+        return reserve_fraction(cfg)
+    except Exception:
+        return 0.0
+
+
 def pacing(snap: UsageSnapshot, cfg: Config, now: datetime) -> dict[str, float]:
     u = snap.seven_day.utilization
     time_left_h = _hours_until(snap.seven_day.resets_at, now)
@@ -55,11 +74,13 @@ def pacing(snap: UsageSnapshot, cfg: Config, now: datetime) -> dict[str, float]:
         reserve = 0.0
     else:
         reserve = cfg.reserve_week_frac * (time_left_h / WEEK_HOURS)
-    required = max(0.0, 1 - reserve - u) / time_left_h * 100
+    held = snapshot_reserve(cfg)
+    required = max(0.0, 1 - reserve - held - u) / time_left_h * 100
     return {
         "time_left_h": time_left_h,
         "elapsed_frac": elapsed_frac,
         "reserve": reserve,
+        "snapshot_reserve": held,
         "required_total_pct_per_hr": required,
         "utilization": u,
     }

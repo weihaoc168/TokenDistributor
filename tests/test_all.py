@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from tokentracker import activity, dispatch, scheduler, usage
+from tokentracker import activity, clock, dispatch, scheduler, usage
 from tokentracker.config import Config
 from tokentracker.models import (
     ActivityState,
@@ -20,6 +20,7 @@ from tokentracker.models import (
     TaskSpec,
     UsageSnapshot,
     WindowUsage,
+    parse_iso,
     utcnow,
 )
 
@@ -27,7 +28,7 @@ NOW = utcnow()
 MAIN_ID = "690b1fea-bf11-4d69-8e8f-4500794ec87d"
 
 
-def make_cfg() -> Config:
+def make_cfg(snapshot: dict | None = None) -> Config:
     tmp = Path(tempfile.mkdtemp(prefix="tokdist_test_"))
     cfg = Config(
         root=tmp,
@@ -37,6 +38,11 @@ def make_cfg() -> Config:
         state_dir=tmp / "state",
         logs_dir=tmp / "logs",
         tasks_file=tmp / "tasks.json",
+        # Off unless a test asks for it. The shipped default is ON (see
+        # test_snapshot_policy_ships_enabled); leaving it on here would make
+        # every multi-tick test that happens to run after 23:00 local queue an
+        # end-of-day screenshot pass and change what it launches.
+        snapshot=({"enabled": False} if snapshot is None else snapshot),
     )
     for d in (cfg.state_dir, cfg.logs_dir, cfg.projects_dir):
         d.mkdir(parents=True, exist_ok=True)
@@ -898,12 +904,16 @@ def test_status_prints_fork_line():
                                 model="claude-opus-5", parent_session=MAIN_ID,
                                 started_at=NOW.isoformat())
         out = _capture(lambda: cli.cmd_status(cfg))
-        assert (f"fork: started since {NOW.isoformat()} (pace, claude-opus-5)"
+        # "since" is rendered on the operator's clock with its label; the
+        # handover record itself keeps the ISO UTC timestamp it was written on.
+        since = clock.fmt_local(NOW, "%a %H:%M", cfg, with_label=True)
+        assert (f"fork: started since {since} (pace, claude-opus-5)"
                 in out.splitlines()), out
+        assert handover.read_handover(cfg)["started_at"] == NOW.isoformat()
         handover.finish_handover(cfg, status="done",
                                  finished_at=NOW.isoformat(), tokens=5)
         out = _capture(lambda: cli.cmd_status(cfg))
-        assert (f"fork: done since {NOW.isoformat()} (pace, claude-opus-5)"
+        assert (f"fork: done since {since} (pace, claude-opus-5)"
                 in out.splitlines()), out
     finally:
         usage.fetch_usage = real_fetch
@@ -957,14 +967,19 @@ def test_repo_config_arms_the_fork_on_the_executive_model():
     # dev_JSON / Tools paths stay short, so the brief has to name their root.
     assert "relative to C:/Users/chenw/StarGTA" in prompt, prompt
     # The brief carries the agentic graph as a placeholder, expanded at launch
-    # so the fork is told the counts that are actually in force this poll.
+    # so the fork is told the counts that are actually in force this poll -
+    # the ALLOCATED ones, not the ceiling. Compared against `allocated_line`
+    # rather than against the configured graph for exactly that reason: with a
+    # loop running, the two differ whenever the ladder has stepped, and the
+    # allocated line is the one the fork is contractually handed.
     from tokentracker import graph as graph_mod
     assert "{graph}" in prompt, prompt
+    line = graph_mod.allocated_line(cfg)
     expanded = cli._fork_prompt(cfg)
     assert "{graph}" not in expanded, expanded
-    assert graph_mod.graph_line(graph_mod.read_graph(cfg)) in expanded, expanded
-    assert expanded == prompt.replace(
-        "{graph}", graph_mod.graph_line(graph_mod.read_graph(cfg)))
+    assert "allocated by TokenDistributor" in line, line
+    assert line in expanded, (line, expanded)
+    assert expanded == prompt.replace("{graph}", line)
     task = TaskSpec(id=handover.FORK_TASK_ID, prompt=prompt, cwd=str(ROOT),
                     model=cfg.throttle_model,
                     resume_session=cfg.main_session_ids[0])
@@ -1961,6 +1976,70 @@ for scale in (1.0, 1.25, 1.5, 2.0):
     print("limited at %sx: %s" % (scale, word[0] if word else "dot"))
 graph.clear_limited(cfg)
 
+# ------------------------------------------ the ALLOCATION columns and line
+# The loop budgets 2 advisory lenses and 4 worker lanes out of a ceiling of
+# 3 and 10. The rung's bold count is the ALLOCATED one, the ceiling follows it
+# dimmed as "cfg xN", and a line under the ladder names the rung and the pace
+# reading that put it there.
+from tokentracker import allocator
+
+allocation = allocator._build(cfg, graph.read_graph(cfg), 1, 4, False)
+allocation.reasons = ["fable 6% ahead of pace at reset Fri 07:00 -> "
+                      "advisory 3->2"]
+allocator.write_state(cfg, allocation, {},
+                      {"up_polls": 0, "down_polls": 0}, overlay.utcnow())
+set_scale(1.0)   # the tightest case: design pixels at their smallest
+ov._refresh()
+ov.root.update_idletasks()
+texts = [t for t, _a, _b in spans()]
+assert "x2" in texts and "x4" in texts, texts        # allocated, not 3 / 10
+assert "cfg x3" in texts and "cfg x10" in texts, texts
+assert ov.canvas.find_withtag("alloccfg_advisory"), texts
+assert ov.canvas.find_withtag("alloccfg_workers"), texts
+assert not ov.canvas.find_withtag("alloccfg_executive"), texts
+drawn_line = [t for t in texts if t.startswith("ALLOCATION")]
+assert drawn_line and drawn_line[0].startswith("ALLOCATION step 1: "), texts
+# The line the panel is drawing from, before the width fit: the rung and the
+# top reason, which is the pace reading that moved it.
+full = ov._alloc_note()
+assert "step 1" in full and "advisory 3->2" in full, full
+assert "ahead of pace at reset" in full, full
+alloc_box = ov.canvas.bbox("alloc_note")
+assert alloc_box and alloc_box[1] >= ov.canvas.bbox("rung_out_workers")[3], alloc_box
+assert alloc_box[3] <= ov.canvas.bbox("goal_minus")[1], alloc_box
+check_ladder_texts("allocated")
+
+# The manual override wins over all of it, and says so in red.
+cfg.throttle_file.write_text(json.dumps({"active": True}), encoding="utf-8")
+ov._refresh()
+ov.root.update_idletasks()
+texts = [t for t, _a, _b in spans()]
+assert "THROTTLE ON - tap for auto" in texts, texts
+assert any(t.startswith("ALLOCATION manual override") for t in texts), texts
+assert "x20" in texts and "cfg x10" in texts, texts       # pinned to surge
+assert ov.canvas.itemcget(ov.canvas.find_withtag("alloc_note")[0],
+                          "fill") == overlay.RED
+check_ladder_texts("override")
+cfg.throttle_file.unlink()
+
+# Back to auto: the button reads as the state it is in, not as the tap.
+ov._refresh()
+ov.root.update_idletasks()
+texts = [t for t, _a, _b in spans()]
+assert "AUTO (tap for full throttle)" in texts, texts
+
+# With the allocation cleared the ladder is the ceiling again, and the line
+# under it goes away rather than sitting there saying "step 0".
+cfg.allocation_file.unlink()
+ov._refresh()
+ov.root.update_idletasks()
+texts = [t for t, _a, _b in spans()]
+assert "x3" in texts and "x10" in texts, texts
+assert not any(t.startswith("ALLOCATION") for t in texts), texts
+assert not ov.canvas.find_withtag("alloc_note"), texts
+assert not ov.canvas.find_withtag("alloccfg_workers"), texts
+check_ladder_texts("ceiling")
+
 # The same ladder at a 1x display scale, where the design pixels are at their
 # smallest against the text they have to hold apart.
 try:
@@ -2298,7 +2377,10 @@ def test_cli_graph_shows_and_sets():
     for tier in G.TIERS:
         assert tier in out, (tier, out)
     assert "x10 (surge x20)" in out, out
-    assert "Agentic graph (from TokenDistributor config)" in out, out
+    # The fork is told the ALLOCATED graph, and the line says so: config.json
+    # is the ceiling the allocator budgets out of, not the plan.
+    assert ("Agentic graph (allocated by TokenDistributor from your configured "
+            "ceiling)") in out, out
 
     out = _capture(lambda: cli_main(
         ["--root", str(tmp), "graph", "set", "workers.count=20",
@@ -2369,10 +2451,28 @@ def test_scheduler_reads_the_graph_worker_counts():
     assert cfg.max_concurrency == 2 and cfg.surge_concurrency == 3, cfg
 
 
-def test_repo_config_ships_the_graph():
+def _repo_cfg() -> Config:
+    """The repo's own config.json, read against a scratch state directory.
+
+    `load_config(ROOT)` points `state_dir` at the LIVE one, and `apply_graph`
+    derives the scalar keys from the ALLOCATED graph - so with a loop actually
+    running, a test about what `config.json` *ships* would read whichever rung
+    the ladder happens to be on and fail for the right reason at the wrong
+    altitude. The scratch directory removes state/allocation.json and
+    state/graph.json from the question; the ceiling is what is under test.
+    """
     from tokentracker import graph as G
     from tokentracker.config import load_config
+
     cfg = load_config(ROOT)
+    cfg.state_dir = Path(tempfile.mkdtemp(prefix="tokdist_repocfg_"))
+    G.apply_graph(cfg)
+    return cfg
+
+
+def test_repo_config_ships_the_graph():
+    from tokentracker import graph as G
+    cfg = _repo_cfg()
     g = G.read_graph(cfg)
     assert g[G.EXECUTIVE]["model"] == "claude-fable-5-1", g  # user directive 2026-09-03
     assert g[G.ADVISORY]["count"] == 3 and g[G.WORKERS]["count"] == 10, g
@@ -3913,7 +4013,10 @@ def test_cli_pricing_shows_and_sets():
     }), encoding="utf-8")
 
     out = _capture(lambda: cli_main(["--root", str(tmp), "pricing"]))
-    assert f"(source: {P.SOURCE_CONFIG})" in out, out
+    # The header names the source and stamps the read on the operator's clock
+    # (the per-row `checked` values stay dates, which have no clock).
+    assert f"(source: {P.SOURCE_CONFIG}, read " in out, out
+    assert clock.label(None) in out.splitlines()[0], out
     assert "claude-opus-5" in out and "$25.00" in out, out
     assert "Qwen3.8-27B-NVFP4" in out and "local" in out, out
     # Both cache-write durations are columns, so the table shows what is billed.
@@ -3929,7 +4032,7 @@ def test_cli_pricing_shows_and_sets():
 
     out = _capture(lambda: cli_main(
         ["--root", str(tmp), "pricing", "set", "claude-opus-5.output=30"]))
-    assert f"(source: {P.SOURCE_OVERRIDE})" in out, out
+    assert f"(source: {P.SOURCE_OVERRIDE}, read " in out, out
     assert "$30.00" in out, out
     cfg = load_config(tmp)
     assert P.read_pricing(cfg)["claude-opus-5"]["output"] == 30.0
@@ -4655,6 +4758,1234 @@ def test_ledger_page_renders_roles_and_the_graph_in_force():
                    '"by_role"', '"graph_in_force"', '["Role", null]',
                    "role-tiered"):
         assert marker in html, marker
+
+
+# -------------------------------------------------- the automatic allocator
+
+def _alloc_cfg(workers: int = 10, surge: int = 20, advisory: int = 3) -> Config:
+    """A Config whose graph is the ceiling the allocator budgets out of."""
+    from tokentracker import graph as G
+
+    cfg = make_cfg()
+    cfg.weekly_goal = 0.90
+    cfg.fork_cooldown_seconds = 120
+    cfg.graph = {
+        G.EXECUTIVE: {"model": "claude-fable-5-1", "fallback": "claude-fable-5",
+                      "count": 1},
+        G.ADVISORY: {"model": "claude-fable-5-1", "fallback": "claude-fable-5",
+                     "count": advisory},
+        G.WORKERS: {"model": "claude-opus-5", "fallback": "claude-opus-4-8",
+                    "count": workers, "surge_count": surge},
+    }
+    G.apply_graph(cfg)
+    return cfg
+
+
+def _alloc_history(cfg: Config, points, now=None, reset_h: float = 48.0) -> None:
+    """Write (minutes_ago, fable, weekly, five_hour) readings into history.jsonl."""
+    now = now or NOW
+    history = usage.UsageHistory(cfg)
+    for minutes, fable, weekly, five in points:
+        stamp = now - timedelta(minutes=minutes)
+        history.append(UsageSnapshot(
+            fetched_at=stamp,
+            five_hour=WindowUsage(five, now + timedelta(hours=2)),
+            seven_day=WindowUsage(weekly, now + timedelta(hours=reset_h)),
+            extra={"fable": WindowUsage(fable, now + timedelta(hours=reset_h))},
+        ))
+
+
+def _alloc_poll(cfg: Config, points, now, reset_h: float = 48.0):
+    """One allocator poll at `now`, off a history rewritten for that clock.
+
+    The ladder is bounded in wall-clock time as well as in polls
+    (`allocation.min_dwell_seconds`), so a test that wants two rungs has to
+    move the clock between them the way the loop does.
+    """
+    from tokentracker import allocator as A
+
+    try:
+        cfg.history_file.unlink()
+    except OSError:
+        pass
+    _alloc_history(cfg, points, now, reset_h)
+    return A.evaluate(cfg, None, now)
+
+
+def test_alloc_bucket_pace_math_on_synthetic_history():
+    """Ahead, behind and at-reset, measured off state/history.jsonl."""
+    from tokentracker import allocator as A
+
+    # 0.48 -> 0.50 over the last hour: 2 points/hour, 48h of week left.
+    cfg = _alloc_cfg()
+    _alloc_history(cfg, [(60, 0.48, 0.40, 0.10), (0, 0.50, 0.44, 0.20)])
+    buckets = A.read_buckets(cfg, None, NOW)
+    assert set(buckets) == set(A.BUCKET_ORDER), buckets
+    fable = buckets[A.FABLE]
+    assert abs(fable.utilization - 0.50) < 1e-9, fable
+    assert abs(fable.rate_1h - 0.02) < 1e-6, fable.rate_1h
+    assert abs(fable.hours_to_reset - 48.0) < 0.01, fable.hours_to_reset
+    # 0.50 + 0.02 * 48 = 1.46, a long way over a 90% goal.
+    assert abs(fable.expected_at_reset - 1.46) < 1e-6, fable.expected_at_reset
+    assert abs(fable.ahead_by - 0.56) < 1e-6, fable.ahead_by
+    assert fable.goal == 0.90 and fable.stop == A.FABLE_STOP, fable
+    # The weekly bucket is the same maths on the seven-day window.
+    weekly = buckets[A.WEEKLY]
+    assert abs(weekly.rate_1h - 0.04) < 1e-6, weekly.rate_1h
+    assert weekly.ahead_by > 0.9, weekly.ahead_by
+    # The five-hour bucket is paced to its guard, not to the weekly goal.
+    assert buckets[A.FIVE_HOUR].goal == cfg.five_hour_guard_idle
+
+    # Behind: flat spending well under the goal. A flat history is a MEASURED
+    # zero rate, not a missing one - which is what makes "behind" actionable.
+    cfg = _alloc_cfg()
+    _alloc_history(cfg, [(60, 0.10, 0.10, 0.0), (0, 0.10, 0.10, 0.0)])
+    fable = A.read_buckets(cfg, None, NOW)[A.FABLE]
+    assert fable.rate == 0.0 and fable.ahead_by is not None
+    assert abs(fable.ahead_by + 0.80) < 1e-6, fable.ahead_by
+
+    # At the reset: no hours left to spend, so the forecast is the reading.
+    cfg = _alloc_cfg()
+    _alloc_history(cfg, [(60, 0.60, 0.60, 0.0), (0, 0.70, 0.70, 0.0)],
+                   reset_h=0.05)
+    fable = A.read_buckets(cfg, None, NOW)[A.FABLE]
+    assert abs(fable.hours_to_reset - 0.05) < 1e-6, fable.hours_to_reset
+    assert abs(fable.expected_at_reset - 0.705) < 1e-3, fable.expected_at_reset
+
+    # No history at all: no rate, no forecast, and nothing anywhere raises.
+    empty = _alloc_cfg()
+    fable = A.read_buckets(empty, None, NOW)[A.FABLE]
+    assert fable.rate is None and fable.ahead_by is None
+    assert A.allocate(empty).graph == A.allocate(empty).configured
+
+
+def test_alloc_ladder_steps_up_on_two_polls_and_down_on_three():
+    """Hysteresis: two consecutive polls to give a rung up, three to take it back."""
+    from tokentracker import allocator as A
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg(advisory=3)
+    ahead = [(60, 0.48, 0.40, 0.10), (0, 0.50, 0.44, 0.20)]
+    _alloc_history(cfg, ahead)
+    fable = A.read_buckets(cfg, None, NOW)[A.FABLE]
+    assert fable.ahead_by > A.AHEAD_STEP
+    assert fable.pace_state(A.AHEAD_STEP, A.BEHIND_STEP) == "ahead", fable
+
+    # One poll over the threshold changes nothing at all.
+    first = A.evaluate(cfg, None, NOW)
+    assert first.step == 0, first.step
+    assert A.read_decision(cfg)["up_polls"] == 1
+    assert first.graph[G.ADVISORY]["count"] == 3, first.graph
+    # The second consecutive poll gives up the first rung.
+    second = _alloc_poll(cfg, ahead, NOW + timedelta(minutes=35))
+    assert second.step == 1, second.step
+    assert second.graph[G.ADVISORY]["count"] == 2, second.graph
+    assert A.read_decision(cfg)["up_polls"] == 0
+    assert any("advisory 3->2" in r for r in second.reasons), second.reasons
+    # ... and the reason names the pace and the reset that caused it.
+    assert any("ahead of pace at reset" in r for r in second.reasons), second.reasons
+    # Two more polls, the second rung: the review effort, not a model. The
+    # clock has to move too - one rung per dwell, however long the signal has
+    # been saturated.
+    _alloc_poll(cfg, ahead, NOW + timedelta(minutes=70))
+    third = _alloc_poll(cfg, ahead, NOW + timedelta(minutes=105))
+    assert third.step == 2 and third.advisory_effort == A.EFFORT_REDUCED, third
+
+    # Now behind pace: the ladder needs THREE polls to give a rung back.
+    behind = [(60, 0.10, 0.10, 0.0), (0, 0.10, 0.10, 0.0)]
+    assert _alloc_poll(cfg, behind, NOW + timedelta(minutes=140)).step == 2
+    assert _alloc_poll(cfg, behind, NOW + timedelta(minutes=175)).step == 2
+    assert A.read_decision(cfg)["down_polls"] == 2
+    back = _alloc_poll(cfg, behind, NOW + timedelta(minutes=210))
+    assert back.step == 1, back.step
+    assert back.advisory_effort == A.EFFORT_FULL, back
+    assert A.read_decision(cfg)["down_polls"] == 0
+
+    # A reading inside the band resets both counters rather than drifting.
+    # 0.875 -> 0.8875 in the hour before a reset one hour out is exactly the
+    # pace that lands on the 90% goal: 1.25%/h wanted, 1.25%/h spent.
+    held = _alloc_poll(cfg, [(60, 0.875, 0.10, 0.0), (0, 0.8875, 0.10, 0.0)],
+                       NOW + timedelta(minutes=245), reset_h=1.0)
+    assert held.step == 1, held.step
+    standing = A.read_decision(cfg)
+    assert (standing["step"], standing["up_polls"], standing["down_polls"]) \
+        == (1, 0, 0), standing
+    assert standing["worker_count"] == held.worker_count, standing
+
+
+def test_alloc_pace_band_is_never_narrower_than_the_measurement_grid():
+    """The gate reads rate space, so a reachable rate can actually sit inside it.
+
+    The endpoint reports utilization in whole percent, so a rate measured over
+    `h` hours can only be a multiple of 0.01/h. The old gate compared a
+    `hours_to_reset`-long extrapolation of that against a 0.05-wide band in
+    utilization space - on a weekly window one quantum of rate moves the
+    forecast by ~1.4, so NO reachable reading landed inside the band and the
+    ladder could only read "climb" or "give back".
+    """
+    from tokentracker import allocator as A
+
+    cfg = _alloc_cfg()
+
+    def bucket(util, rate, span, hours=48.0, goal=0.90):
+        return A.Bucket(name=A.FABLE, utilization=util, hours_to_reset=hours,
+                        goal=goal, stop=A.FABLE_STOP, rate_long=rate,
+                        span_hours=span)
+
+    # The band is at least one quantum of the estimate that produced the rate.
+    hour = bucket(0.50, 0.0, 1.0)
+    assert abs(hour.rate_quantum - 0.01) < 1e-12, hour.rate_quantum
+    assert hour.tolerance(A.AHEAD_STEP) >= hour.rate_quantum
+    # ... and it narrows as the window's own baseline lengthens, which is the
+    # point of anchoring the rate at the window's opening.
+    day = bucket(0.50, 0.0, 24.0)
+    assert day.rate_quantum < hour.rate_quantum / 20, (day.rate_quantum,
+                                                       hour.rate_quantum)
+
+    # Every rate one quantum apart around the required pace, on a 24h baseline:
+    # at least one of them has to read "hold", or the ladder is a bang-bang
+    # oscillator again.
+    required = (0.90 - 0.50) / 48.0
+    grid = [round(k * 0.01 / 24.0, 12) for k in range(0, 60)]
+    verdicts = [bucket(0.50, r, 24.0).pace_state(A.AHEAD_STEP, A.BEHIND_STEP)
+                for r in grid]
+    assert "hold" in verdicts, verdicts
+    assert "ahead" in verdicts and "behind" in verdicts, verdicts
+    # The band brackets the required pace, and only rates outside it move.
+    for rate, verdict in zip(grid, verdicts):
+        if verdict == "ahead":
+            assert rate > required, (rate, required)
+        elif verdict == "behind":
+            assert rate < required, (rate, required)
+
+    # Replayed on the real shape that oscillated: fable creeping 0.83 -> 0.85
+    # over six hours, sampled every ten minutes, all readings whole percent.
+    stamps = [NOW - timedelta(minutes=360 - 10 * i) for i in range(37)]
+    points = [(t, 0.83 + 0.01 * (i // 18)) for i, t in enumerate(stamps)]
+    rate, span = A._rate_long(points, NOW)
+    creep = A.Bucket(name=A.FABLE, utilization=points[-1][1],
+                     hours_to_reset=48.0, goal=0.97, stop=A.FABLE_STOP,
+                     rate_long=rate, span_hours=span)
+    assert abs(span - 6.0) < 1e-9, span
+    assert creep.pace_state(A.AHEAD_STEP, A.BEHIND_STEP) == "hold", (
+        rate, creep.required, creep.tolerance(A.AHEAD_STEP))
+
+
+def test_alloc_ladder_holds_a_rung_for_the_dwell():
+    """One rung per `min_dwell_seconds`, however long the signal has been saturated.
+
+    Hysteresis counts polls, not signal. A rate that stays over the threshold
+    for ten polls satisfies two-polls-to-climb five times over, so without a
+    wall-clock bound the ladder walks its whole length in minutes.
+    """
+    from tokentracker import allocator as A
+
+    cfg = _alloc_cfg(advisory=3)
+    cfg.allocation = {"min_dwell_seconds": 1800}
+    ahead = [(60, 0.48, 0.40, 0.10), (0, 0.50, 0.44, 0.20)]
+
+    _alloc_poll(cfg, ahead, NOW)
+    first = _alloc_poll(cfg, ahead, NOW + timedelta(minutes=5))
+    assert first.step == 1, first.step
+    moved_at = A.read_decision(cfg)["last_step_at"]
+    assert moved_at is not None, "the move has to stamp the dwell clock"
+
+    # Five more polls, all saturated, all inside the dwell: still one rung.
+    for minutes in (10, 15, 20, 25, 30):
+        held = _alloc_poll(cfg, ahead, NOW + timedelta(minutes=minutes))
+        assert held.step == 1, (minutes, held.step)
+    # The agreement is kept armed rather than thrown away, so the rung moves on
+    # the first poll past the dwell and not two polls after it.
+    assert A.read_decision(cfg)["up_polls"] == A.UP_POLLS
+    assert any("armed but the rung has stood" in n for n in held.notes), held.notes
+    moved = _alloc_poll(cfg, ahead, NOW + timedelta(minutes=36))
+    assert moved.step == 2, moved.step
+    assert A.read_decision(cfg)["last_step_at"] > moved_at
+
+    # A dwell of zero is the old behaviour, for anyone who wants it back.
+    loose = _alloc_cfg(advisory=3)
+    loose.allocation = {"min_dwell_seconds": 0}
+    _alloc_poll(loose, ahead, NOW)
+    assert _alloc_poll(loose, ahead, NOW).step == 1
+    _alloc_poll(loose, ahead, NOW)
+    assert _alloc_poll(loose, ahead, NOW).step == 2
+
+
+def test_alloc_replaying_the_real_history_does_not_oscillate():
+    """The recorded shape that walked the ladder 35 times in a day now holds.
+
+    Whole-percent readings, a flat-then-creeping Fable window, and the exact
+    hysteresis the loop runs. The measure is rung transitions: the graph being
+    fully reshaped and restored every few hours is worse than either end of it.
+    """
+    from tokentracker import allocator as A
+
+    cfg = _alloc_cfg(advisory=3)
+    cfg.allocation = {"min_dwell_seconds": 1800}
+    start = NOW - timedelta(hours=24)
+    # 0.34 -> 0.85 over the first ten hours, then the long flat creep that made
+    # the old gate flip: 0.83 -> 0.85 across the last fourteen.
+    series = []
+    for i in range(144):                       # a poll every ten minutes
+        stamp = start + timedelta(minutes=10 * i)
+        hours = 10 * i / 60.0
+        util = (round(0.34 + 0.05 * hours, 2) if hours <= 10.0
+                else round(0.83 + 0.01 * int((hours - 10.0) / 7.0), 2))
+        series.append((stamp, min(util, 0.99)))
+    history = usage.UsageHistory(cfg)
+    for stamp, util in series:
+        history.append(UsageSnapshot(
+            fetched_at=stamp,
+            five_hour=WindowUsage(0.2, stamp + timedelta(hours=2)),
+            seven_day=WindowUsage(0.44, stamp + timedelta(hours=48)),
+            extra={"fable": WindowUsage(util, stamp + timedelta(hours=48))}))
+
+    steps, transitions = [], 0
+    for stamp, _util in series:
+        step = A.evaluate(cfg, None, stamp).step
+        if steps and step != steps[-1]:
+            transitions += 1
+        steps.append(step)
+    # The old gate managed 35 transitions on 24h of real history. A rung per
+    # dwell over 24h is 48 at the absolute most; the point is that the flat
+    # creep stops driving them at all.
+    assert transitions <= 6, (transitions, steps)
+    # ... and specifically: the ladder does not move at all across the flat
+    # creep, where utilization advances two percent in fourteen hours.
+    creep = steps[len(steps) // 2:]
+    assert len(set(creep)) == 1, (set(creep), creep)
+
+
+def test_alloc_ladder_keeps_the_order_rule_at_every_step():
+    """Every rung, checked: the order holds and the executive is never moved."""
+    from tokentracker import allocator as A
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg(advisory=3)
+    graph = G.read_graph(cfg)
+    seen: list[tuple[int, int, str, str]] = []
+    for step in range(A.MAX_STEP + 1):
+        alloc = A._build(cfg, graph, step, None, False)
+        assert G.order_warnings(alloc.graph, cfg) == [], (step, alloc.graph)
+        # The executive is the one tier the ladder never touches.
+        assert alloc.graph[G.EXECUTIVE] == graph[G.EXECUTIVE], step
+        assert alloc.graph[G.ADVISORY]["count"] >= A.min_advisory(cfg), step
+        assert (G.model_rank(alloc.graph[G.EXECUTIVE]["model"], cfg)
+                >= G.model_rank(alloc.graph[G.ADVISORY]["model"], cfg)
+                >= G.model_rank(alloc.graph[G.WORKERS]["model"], cfg)), step
+        seen.append((step, alloc.graph[G.ADVISORY]["count"],
+                     alloc.graph[G.ADVISORY]["model"], alloc.advisory_effort))
+    steps = dict((s, (c, m, e)) for s, c, m, e in seen)
+    assert steps[0] == (3, "claude-fable-5-1", "high"), steps
+    assert steps[1] == (2, "claude-fable-5-1", "high"), steps
+    assert steps[2] == (2, "claude-fable-5-1", "medium"), steps
+    assert steps[3] == (2, "claude-fable-5-1", "medium"), steps
+    # Rung 4 is the only one that moves a model, and only DOWN onto the
+    # workers' own - which is what keeps advisory >= workers true.
+    assert steps[4] == (2, "claude-opus-5", "medium"), steps
+    assert steps[5] == (A.min_advisory(cfg), "claude-opus-5", "medium"), steps
+    # Fork cadence: x1, x2, x4, then the configured maximum.
+    cadence = [A._build(cfg, graph, s, None, False).fork_cooldown_seconds
+               for s in range(A.MAX_STEP + 1)]
+    assert cadence == [120, 120, 120, 240, 480, A.max_cooldown(cfg)], cadence
+    # A step past the top is clamped, never applied twice.
+    assert A._build(cfg, graph, 99, None, False).step == A.MAX_STEP
+
+    # A ceiling that already breaks the order rule is not made worse: the
+    # model rung is skipped rather than promoting the advisory lenses.
+    upside = G.normalize({G.EXECUTIVE: {"model": "claude-opus-4-8"},
+                          G.ADVISORY: {"model": "claude-opus-4-8"},
+                          G.WORKERS: {"model": "claude-fable-5-1"}}, graph)
+    standing = set(G.order_warnings(upside, cfg))
+    stepped = A._build(cfg, upside, 4, None, False)
+    assert stepped.graph[G.ADVISORY]["model"] == "claude-opus-4-8", stepped.graph
+    assert not set(G.order_warnings(stepped.graph, cfg)) - standing
+
+
+def test_alloc_worker_lanes_follow_the_weekly_pace():
+    """Behind pace raises lanes toward surge, ahead lowers them toward the floor."""
+    from tokentracker import allocator as A
+
+    cfg = _alloc_cfg(workers=10, surge=20)
+    workers = {"count": 10, "surge_count": 20}
+
+    def bucket(util, rate, hours=48.0, goal=0.90):
+        b = A.Bucket(name=A.WEEKLY, utilization=util, hours_to_reset=hours,
+                     goal=goal, stop=goal)
+        b.rate_1h = rate
+        return b
+
+    # Behind: 10 lanes are burning 0.4%/h and 90% - 20% must land in 48h, i.e.
+    # 1.458%/h. That is 37 lanes of demand, clamped to the surge ceiling.
+    lanes, why = A.worker_target(cfg, bucket(0.20, 0.004), None, workers)
+    assert lanes == 20, (lanes, why)
+    assert why and "auto surge" in why, why
+    # Ahead: the same lanes are burning far more than the goal needs.
+    lanes, why = A.worker_target(cfg, bucket(0.80, 0.05), None, workers)
+    assert lanes == A.min_workers(cfg), (lanes, why)
+    assert why and "floor" in why, why
+    # Exactly on pace: the configured count, and nothing to say about it.
+    on_pace = bucket(0.20, (0.90 - 0.20) / 48.0)
+    assert A.worker_target(cfg, on_pace, None, workers) == (10, None)
+    # No usable rate: the operator's own number stands rather than a forecast
+    # built on rounding noise.
+    assert A.worker_target(cfg, bucket(0.20, None), None, workers) == (10, None)
+    assert A.worker_target(cfg, None, None, workers) == (10, None)
+    # The five-hour guard is the loop's brake: forecast to trip it, the
+    # allocator must not be the thing raising lanes into it.
+    guard = A.Bucket(name=A.FIVE_HOUR, utilization=0.90, hours_to_reset=1.0,
+                     goal=0.95, stop=0.95)
+    guard.rate_1h = 0.10
+    lanes, _why = A.worker_target(cfg, bucket(0.20, 0.004), guard, workers)
+    assert lanes == 10, lanes
+    # ... and it clamps to what is RUNNING, not to the ceiling. Standing at the
+    # floor of 2, a clamp at the configured 10 would still authorise a
+    # five-fold raise into the window the scheduler is about to block.
+    lanes, _why = A.worker_target(cfg, bucket(0.20, 0.004), guard, workers,
+                                  running=2)
+    assert lanes == 2, lanes
+    # Lowering is never what the guard is protecting against, so it still may.
+    lanes, _why = A.worker_target(cfg, bucket(0.80, 0.05), guard, workers,
+                                  running=8)
+    assert lanes == A.min_workers(cfg), lanes
+
+
+def test_alloc_worker_lanes_converge_in_closed_loop():
+    """The rate is attributed to the lanes that produced it, so this settles.
+
+    Feeding the previous answer back with a rate proportional to it is the
+    loop the live poll actually runs. Dividing the measured rate by the
+    CONFIGURED ceiling instead of the standing count makes `per_lane` wrong by
+    `running / configured` and the answer wrong by its inverse, which is
+    positive feedback: the count flips between the ceiling and the floor once
+    per poll, forever. Divided by what ran, `ceil(required * running / rate)`
+    does not depend on `running` at all.
+    """
+    from tokentracker import allocator as A
+
+    cfg = _alloc_cfg(workers=10, surge=20)
+    workers = {"count": 10, "surge_count": 20}
+
+    def run(util, hours, per_lane, start, polls=8):
+        """Poll the controller `polls` times, feeding its answer back."""
+        seen, lanes = [], start
+        for _ in range(polls):
+            weekly = A.Bucket(name=A.WEEKLY, utilization=util,
+                              hours_to_reset=hours, goal=0.90, stop=0.90,
+                              rate_long=per_lane * lanes, span_hours=12.0)
+            lanes, _why = A.worker_target(cfg, weekly, None, workers, lanes)
+            seen.append(lanes)
+        return seen
+
+    # Ahead of pace: the fixed point is 3 lanes, and it is reached and held.
+    ahead = run(0.80, 40.0, 0.001, 10)
+    assert ahead[-4:] == [3, 3, 3, 3], ahead
+    # Behind pace: pinned at the surge ceiling, not flapping 20 -> 19 -> 20.
+    behind = run(0.20, 48.0, 0.0004, 20)
+    assert behind[-4:] == [20, 20, 20, 20], behind
+    # Starting from the floor reaches the same fixed point as from the ceiling:
+    # deadbeat means the answer does not depend on where it started.
+    assert run(0.80, 40.0, 0.001, 2)[-1] == ahead[-1]
+    assert run(0.80, 40.0, 0.001, 20)[-1] == ahead[-1]
+    # And the reason names what is actually running, not the untouched ceiling.
+    def at(lanes):
+        return A.Bucket(name=A.WEEKLY, utilization=0.80, hours_to_reset=40.0,
+                        goal=0.90, stop=0.90, rate_long=0.001 * lanes,
+                        span_hours=12.0)
+
+    assert A.worker_target(cfg, at(3), None, workers, running=3) == (3, None)
+    lanes, why = A.worker_target(cfg, at(4), None, workers, running=4)
+    assert lanes == 3, lanes
+    assert why and "workers 4->3" in why and "cfg x10" in why, why
+
+
+def test_alloc_manual_override_pins_surge_and_ignores_the_ladder():
+    """FULL THROTTLE stays manual: the ladder is measured, and then ignored."""
+    from tokentracker import allocator as A
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg(workers=10, surge=20, advisory=3)
+    _alloc_history(cfg, [(60, 0.48, 0.40, 0.10), (0, 0.50, 0.44, 0.20)])
+    # Climb the ladder first, so the override has something to ignore.
+    A.evaluate(cfg, None, NOW)
+    stepped = A.evaluate(cfg, None, NOW)
+    assert stepped.step == 1 and stepped.graph[G.ADVISORY]["count"] == 2
+
+    cfg.throttle_file.write_text(json.dumps({"active": True}), encoding="utf-8")
+    pinned = A.allocate(cfg)
+    assert pinned.override is True
+    assert pinned.graph[G.WORKERS]["count"] == 20, pinned.graph   # surge_count
+    assert pinned.graph[G.ADVISORY] == pinned.configured[G.ADVISORY], pinned.graph
+    assert pinned.advisory_effort == A.EFFORT_FULL, pinned
+    assert pinned.fork_cooldown_seconds == 120, pinned
+    assert "manual override" in pinned.label(), pinned.label()
+    # It reaches the Config the scheduler reads, too.
+    G.apply_graph(cfg)
+    assert cfg.max_concurrency == 20 and cfg.surge_concurrency == 20
+    # The loop says out loud that the allocator is being ignored.
+    during = A.evaluate(cfg, None, NOW)
+    assert during.override and any("FULL THROTTLE" in n for n in during.notes)
+    assert during.reasons == [], during.reasons
+
+    # Off again: the rung the ladder had reached is still there.
+    cfg.throttle_file.unlink()
+    back = A.allocate(cfg)
+    assert back.override is False and back.step >= 1, back
+    assert back.graph[G.ADVISORY]["count"] == 2, back.graph
+
+
+def test_apply_graph_returns_the_allocated_graph_and_leaves_the_ceiling_alone():
+    from tokentracker import allocator as A
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg(workers=10, surge=20, advisory=3)
+    # With nothing decided the allocation IS the configured graph, so an
+    # install that never polls behaves exactly as it did before.
+    assert G.apply_graph(cfg) == G.read_graph(cfg)
+    assert cfg.max_concurrency == 10, cfg.max_concurrency
+
+    A.write_state(cfg, A._build(cfg, G.read_graph(cfg), 1, 4, False),
+                  {}, {"up_polls": 0, "down_polls": 0}, NOW)
+    applied = G.apply_graph(cfg)
+    assert applied[G.WORKERS]["count"] == 4, applied
+    assert applied[G.ADVISORY]["count"] == 2, applied
+    assert cfg.max_concurrency == 4, cfg.max_concurrency
+    assert cfg.surge_concurrency == 20, cfg.surge_concurrency
+    # The ceiling is untouched: the allocation lives in its own file, and
+    # config.json / state/graph.json stay the operator's to set.
+    assert G.read_graph(cfg)[G.WORKERS]["count"] == 10
+    assert G.read_graph(cfg)[G.ADVISORY]["count"] == 3
+    assert not cfg.graph_file.exists()
+    assert cfg.graph[G.ADVISORY]["count"] == 3, cfg.graph
+    # The scheduler reads the allocated lane count and nothing else.
+    d = scheduler.decide(snap(0.10, left_h=100.0), rates(), idle(), QS, cfg,
+                         (0.05, 0.05), NOW)
+    assert d.target_concurrency <= 4, d
+
+
+def test_alloc_reads_never_raise_on_hostile_state():
+    from tokentracker import allocator as A
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg()
+    configured = G.read_graph(cfg)
+    for junk in ("{ not json", "[]", "", "{}", '{"decision": 5}', "null",
+                 '{"decision": {"step": "x", "worker_count": "y"}}',
+                 '{"decision": {"step": 1e999}}', '{"buckets": 7}',
+                 '{"decision": {"step": 3, "worker_count": -4}}',
+                 '{"reasons": "not a list"}'):
+        cfg.allocation_file.write_text(junk, encoding="utf-8")
+        allocation = A.allocate(cfg)
+        assert 0 <= allocation.step <= A.MAX_STEP, junk
+        # A lane count that is not a finite number is no decision at all: the
+        # configured count stands rather than the loop parking on one lane.
+        assert allocation.graph[G.WORKERS]["count"] >= 1, junk
+        if "worker_count" not in junk:
+            assert allocation.graph[G.WORKERS]["count"] == 10, junk
+        assert isinstance(allocation.reasons, list), junk
+        assert G.apply_graph(cfg)[G.EXECUTIVE] == configured[G.EXECUTIVE], junk
+    # A hostile history line is skipped, not fatal.
+    cfg.history_file.write_text("{ not json\n\n[]\n"
+                                '{"fetched_at": null}\n', encoding="utf-8")
+    assert A.read_buckets(cfg, None, NOW)[A.FABLE].rate is None
+    assert A.evaluate(cfg, None, NOW).step >= 0
+    # And a hand-edited allocation block falls back to the built-in defaults.
+    cfg.allocation = {"ahead_step": "nonsense", "min_advisory": float("nan"),
+                      "max_fork_cooldown_seconds": None}
+    assert A.alloc_setting(cfg, "ahead_step") == A.AHEAD_STEP
+    assert A.min_advisory(cfg) == A.MIN_ADVISORY
+    assert A.max_cooldown(cfg) == A.MAX_FORK_COOLDOWN_SECONDS
+    cfg.allocation = []
+    assert A.alloc_setting(cfg, "behind_step") == A.BEHIND_STEP
+
+
+def test_fork_prompt_and_cooldown_carry_the_allocated_values():
+    from tokentracker import allocator as A
+    from tokentracker import cli
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg(workers=10, surge=20, advisory=3)
+    cfg.throttle_prompt = "director brief. {graph} end."
+    cfg.main_session_ids = [MAIN_ID]
+
+    # Nothing decided: the ceiling is what the fork is told.
+    assert "advisory/reviewers claude-fable-5-1 (fallback claude-fable-5) x3 " \
+           "effort high" in cli._fork_prompt(cfg)
+    assert cli._fork_cooldown(cfg) == 120
+
+    allocation = A._build(cfg, G.read_graph(cfg), 4, 6, False)
+    allocation.reasons = ["fable 6% ahead of pace at reset Fri 07:00 -> "
+                          "advisory 3->2"]
+    A.write_state(cfg, allocation, {}, {"up_polls": 0, "down_polls": 0}, NOW)
+
+    prompt = cli._fork_prompt(cfg)
+    assert "allocated by TokenDistributor from your configured ceiling" in prompt
+    assert "executive claude-fable-5-1 (fallback claude-fable-5) x1" in prompt
+    assert "advisory/reviewers claude-opus-5 (fallback claude-opus-4-8) x2 " \
+           "effort medium" in prompt, prompt
+    assert "workers claude-opus-5 (fallback claude-opus-4-8) x6 (surge 20)" \
+        in prompt, prompt
+    assert "Allocation reasons: fable 6% ahead of pace at reset Fri 07:00 -> " \
+           "advisory 3->2." in prompt, prompt
+    # The fork's re-arm cadence is the allocated one, not config.json's.
+    assert cli._fork_cooldown(cfg) == 480, cli._fork_cooldown(cfg)
+    task = TaskSpec(id="worker-1", prompt="do it. {graph}", cwd=str(ROOT))
+    assert G.allocated_line(cfg) in dispatch.Dispatcher(cfg)._task_prompt(
+        task, "cloud")
+
+    # A row armed before the allocation moved is refreshed before it launches.
+    d = dispatch.Dispatcher(cfg)
+    cli._ensure_throttle_task(cfg, d, NOW)
+    armed = d.get(cli.THROTTLE_TASK_ID)
+    assert "x6 (surge 20)" in armed.prompt, armed.prompt
+    A.write_state(cfg, A._build(cfg, G.read_graph(cfg), 0, 9, False), {},
+                  {"up_polls": 0, "down_polls": 0}, NOW)
+    assert cli._refresh_fork_spec(cfg, armed) is True
+    assert "x9 (surge 20)" in armed.prompt, armed.prompt
+
+
+def test_tick_writes_allocation_json_every_poll():
+    from tokentracker import allocator as A
+    from tokentracker import cli
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg(workers=10, surge=20, advisory=3)
+    cfg.main_session_ids = []
+    cfg.report_repo = ""
+    cfg.report_on_stop = False
+    cfg.report_on_milestone = False
+    cfg.local_enabled = False
+    d, _launched = _gate_dispatcher(cfg)
+    history = usage.UsageHistory(cfg)
+    real_fetch = usage.fetch_usage
+    # Rising Fable, well past the goal by the reset: the ladder should climb.
+    series = iter([(0.48, 40), (0.50, 0)])
+    try:
+        for fable, minutes in series:
+            stamp = NOW - timedelta(minutes=minutes)
+            usage.fetch_usage = lambda _cfg, f=fable, s=stamp: UsageSnapshot(
+                fetched_at=s,
+                five_hour=WindowUsage(0.2, NOW + timedelta(hours=2)),
+                seven_day=WindowUsage(0.44, NOW + timedelta(hours=48)),
+                extra={"fable": WindowUsage(f, NOW + timedelta(hours=48))})
+            cli._tick(cfg, d, history)
+        for _ in range(2):
+            cli._tick(cfg, d, history)
+    finally:
+        usage.fetch_usage = real_fetch
+
+    payload = json.loads(cfg.allocation_file.read_text(encoding="utf-8"))
+    assert set(payload) == set(A.STATE_KEYS), payload
+    assert set(payload["buckets"]) == set(A.BUCKET_ORDER), payload["buckets"]
+    fable = payload["buckets"][A.FABLE]
+    assert fable["ahead_by"] > A.AHEAD_STEP, fable
+    assert fable["expected_at_reset"] > fable["utilization"], fable
+    decision = payload["decision"]
+    assert decision["step"] >= 1, decision
+    assert decision["advisory_count"] == 2, decision
+    assert decision["worker_count"] >= 1, decision
+    assert payload["generated_at"] and payload["reasons"], payload
+    # The tick's own log line names the move, once, when it happens.
+    _d, actions, _e, _s, _r = cli._tick(cfg, d, history)
+    assert isinstance(actions, list)
+    # state.json carries the same allocation, so `status` needs no second read.
+    state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
+    assert state["allocation"]["advisory_count"] == 2, state["allocation"]
+    # The ceiling on disk never moved.
+    assert G.read_graph(cfg)[G.ADVISORY]["count"] == 3
+    assert not cfg.graph_file.exists()
+
+
+def test_cli_alloc_and_status_print_the_allocation():
+    from tokentracker import allocator as A
+    from tokentracker import cli
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg(workers=10, surge=20, advisory=3)
+    out = _capture(lambda: cli.cmd_alloc(cfg))
+    assert "no allocation yet" in out, out
+    assert "step 0/5" in out and "configured graph" in out, out
+    assert "no bucket readings yet" in out, out
+
+    _alloc_history(cfg, [(60, 0.48, 0.40, 0.10), (0, 0.50, 0.44, 0.20)])
+    A.evaluate(cfg, None, NOW)
+    A.evaluate(cfg, None, NOW)
+    out = _capture(lambda: cli.cmd_alloc(cfg))
+    assert "step 1/5" in out and "advisory count -1" in out, out
+    for want in ("bucket", "fable", "weekly", "five_hour", "resets at",
+                 "reason: ", "ceiling (configured): workers x10"):
+        assert want in out, (want, out)
+    assert "advisory " in out and "x2 (cfg x3)" in out, out
+    assert "effort high" in out, out
+    # `graph` prints the ceiling AND what is allocated out of it.
+    out = _capture(lambda: cli.cmd_graph(cfg, None))
+    assert "allocated now: step 1" in out and "advisory x2 (cfg x3)" in out, out
+    assert G.allocated_line(cfg) in out, out
+    # The one-line form the status command prints: the rung and the top
+    # reason, the count deltas being the ladder's own columns to carry.
+    line = A.status_line(cfg)
+    assert line.startswith("ALLOCATION step 1: "), line
+    assert "advisory 3->2" in line and "ahead of pace at reset" in line, line
+
+
+# --------------------------------------------------------------- the clock
+# Everything stored is ISO UTC; everything shown is the operator's zone. These
+# pin both halves, and both resolution paths: zoneinfo when a tz database is
+# installed, and the fixed offset when it is not (which is this Windows box).
+
+def _tz_cfg(name="America/Chicago", offset=-5.0, tz_label="") -> Config:
+    cfg = make_cfg()
+    cfg.timezone = name
+    cfg.tz_offset_hours = offset
+    cfg.tz_label = tz_label
+    return cfg
+
+
+def test_clock_to_local_with_the_fixed_offset_fallback():
+    """No tz database (the shipped state of this box): the offset does the work."""
+    cfg = _tz_cfg(offset=-5.0)
+    # Force the fallback whether or not tzdata is installed, so the test says
+    # the same thing on a box that has it.
+    clock._ZONE_CACHE.clear()
+    real = clock.zone
+    clock.zone = lambda c=None: (timezone(timedelta(hours=-5.0)), False)
+    try:
+        moment = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+        local = clock.to_local(moment, cfg)
+        assert local.utcoffset() == timedelta(hours=-5), local
+        assert local.hour == 7 and local.day == 4, local
+        assert clock.fmt_local(moment, "%a %H:%M", cfg) == "Fri 07:00"
+        # The label survives the missing database: it comes off the zone NAME,
+        # which is what the operator set, not off a tzname the fallback cannot
+        # produce.
+        assert clock.label(cfg) == "CT", clock.label(cfg)
+        assert clock.fmt_local(moment, "%H:%M", cfg, with_label=True) == "07:00 CT"
+        assert "fixed offset" in clock.describe(cfg), clock.describe(cfg)
+        assert not clock.uses_zoneinfo(cfg)
+    finally:
+        clock.zone = real
+        clock._ZONE_CACHE.clear()
+
+
+def test_clock_to_local_with_zoneinfo():
+    """With a tz database the zone wins, and it is DST-correct."""
+    cfg = _tz_cfg(offset=999.0)  # an offset that would be obviously wrong
+    try:
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo("America/Chicago")
+    except Exception:
+        # No tz database here (the ordinary case on Windows), so stand one in:
+        # the point under test is that `zone()` returning from_zoneinfo=True
+        # makes every helper read it instead of `tz_offset_hours`.
+        zone = timezone(timedelta(hours=-5), "CDT")
+    clock._ZONE_CACHE.clear()
+    real = clock.zone
+    clock.zone = lambda c=None: (zone, True)
+    try:
+        summer = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+        assert clock.fmt_local(summer, "%a %H:%M", cfg) == "Fri 07:00"
+        assert clock.label(cfg) == "CT", clock.label(cfg)
+        assert "via zoneinfo" in clock.describe(cfg), clock.describe(cfg)
+        # A zone name the table does not carry falls back to collapsing the
+        # live abbreviation across DST: CDT and CST both read "CT".
+        other = _tz_cfg(name="Some/Zone")
+        clock.zone = lambda c=None: (timezone(timedelta(hours=-5), "CST"), True)
+        assert clock.label(other) == "CT", clock.label(other)
+    finally:
+        clock.zone = real
+        clock._ZONE_CACHE.clear()
+
+
+def test_clock_never_raises_and_config_label_wins():
+    cfg = _tz_cfg(name="Not/AZone", offset="junk")
+    # A junk offset falls back to the built-in default rather than raising.
+    assert clock.tz_offset_hours(cfg) == clock.DEFAULT_OFFSET_HOURS
+    assert clock.to_local("not a time", cfg) is None
+    assert clock.to_local(None, cfg) is None
+    assert clock.fmt_local(None, "%H:%M", cfg) == "?"
+    assert clock.fmt_local(NOW, "%Q%", cfg) or True  # a bad format cannot raise
+    # An explicit tz_label outranks every derivation.
+    assert clock.label(_tz_cfg(tz_label="ZULU")) == "ZULU"
+    # A naive datetime is read as UTC, never as machine-local: everything this
+    # project stores is UTC, and the other reading would shift it silently.
+    naive = datetime(2026, 9, 4, 12, 0)
+    aware = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+    cfg2 = _tz_cfg()
+    assert clock.to_local(naive, cfg2) == clock.to_local(aware, cfg2)
+
+
+def test_status_lines_carry_the_zone_label():
+    """The verifier's own check: `status` renders local and says which zone."""
+    from tokentracker import cli
+    cfg = make_cfg()
+    cfg.timezone = "America/Chicago"
+    cfg.tz_offset_hours = -5.0
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.4)
+    try:
+        out = _capture(lambda: cli.cmd_status(cfg))
+    finally:
+        usage.fetch_usage = real_fetch
+    assert "timezone: America/Chicago (CT)" in out, out
+    weekly = [l for l in out.splitlines() if l.startswith("weekly  ")][0]
+    assert "CT)" in weekly, weekly
+    five = [l for l in out.splitlines() if l.startswith("5-hour  ")][0]
+    assert five.rstrip().endswith("CT"), five
+    # The state file it read from is still on UTC.
+    assert clock.now_utc().tzinfo is timezone.utc
+
+
+# ------------------------------------------------------- the snapshot policy
+
+def _shot_cfg(**over) -> Config:
+    """A Config with the screenshot policy on and a graph to take a model from."""
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg(workers=4, surge=8, advisory=3)
+    cfg.timezone = "America/Chicago"
+    cfg.tz_offset_hours = -5.0
+    cfg.report_repo = "C:/repo"
+    cfg.main_session_ids = []
+    cfg.local_enabled = False
+    cfg.snapshot = {"enabled": True, "eod_local": "23:00", "lead_minutes": 45,
+                    "reserve_fraction": 0.02, "repo": "C:/repo",
+                    "min_gap_minutes": 120, **over}
+    G.apply_graph(cfg)
+    return cfg
+
+
+def _buckets(fable=0.5, weekly=0.5, five=0.2, rate=0.0, stop_fable=0.97,
+             goal=0.90, hours=48.0):
+    """The dict shape the allocator writes, which is what the policy reads."""
+    return {
+        "fable": {"utilization": fable, "rate": rate, "stop": stop_fable,
+                  "goal": goal, "hours_to_reset": hours},
+        "weekly": {"utilization": weekly, "rate": rate, "stop": goal,
+                   "goal": goal, "hours_to_reset": hours},
+        "five_hour": {"utilization": five, "rate": 0.0, "stop": 0.95,
+                      "goal": 0.95, "hours_to_reset": 2.0},
+    }
+
+
+def test_snapshot_policy_ships_enabled():
+    """make_cfg turns it off; the shipped default must be on."""
+    from tokentracker import snapshot as S
+
+    bare = Config(root=Path("."), credentials_path=Path("."),
+                  projects_dir=Path("."), sessions_dir=Path("."),
+                  state_dir=Path("."), logs_dir=Path("."),
+                  tasks_file=Path("."))
+    assert S.enabled(bare), bare.snapshot
+    assert S.setting(bare, "eod_local") == "23:00"
+    assert S.reserve_fraction(bare) == 0.02
+    # And the real config.json ships the block.
+    shipped = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    assert shipped["snapshot"]["enabled"] is True, shipped.get("snapshot")
+
+
+def test_snapshot_eod_fires_once_a_day():
+    """The first poll at or after eod_local, and not the eleven polls after it."""
+    from tokentracker import snapshot as S
+
+    cfg = _shot_cfg()
+    d, _launched = _gate_dispatcher(cfg)
+    buckets = _buckets()
+    # 22:00 CT = 03:00 UTC next day. First sight seeds the slot and fires
+    # nothing: a fresh install cannot know whether today's already ran.
+    before = datetime(2026, 9, 5, 3, 0, tzinfo=timezone.utc)
+    assert S.maybe_enqueue(cfg, d, buckets, before) is None
+    seeded = parse_iso(S.read_state(cfg)["next_eod"])
+    assert clock.fmt_local(seeded, "%H:%M", cfg) == "23:00", seeded
+    assert seeded > before
+
+    # 23:01 CT: the slot is past, so it fires exactly once.
+    at_eod = datetime(2026, 9, 5, 4, 1, tzinfo=timezone.utc)
+    line = S.maybe_enqueue(cfg, d, buckets, at_eod)
+    assert line and S.REASON_EOD in line, line
+    queued = [t for t in d.tasks() if S.is_snapshot(t.id)]
+    assert len(queued) == 1, queued
+    # The slot advanced to tomorrow, so the next eleven polls of the same
+    # evening add nothing.
+    nxt = parse_iso(S.read_state(cfg)["next_eod"])
+    assert nxt.date() > at_eod.date(), nxt
+    for minute in range(2, 14):
+        later = at_eod + timedelta(minutes=minute)
+        assert S.maybe_enqueue(cfg, d, buckets, later) is None, minute
+    assert len([t for t in d.tasks() if S.is_snapshot(t.id)]) == 1, d.tasks()
+
+    # A loop that slept for three days lands on the next slot, not on the
+    # three it missed.
+    far = at_eod + timedelta(days=3)
+    assert S.next_eod_after(cfg, far) > far
+    assert (S.next_eod_after(cfg, far) - far) <= timedelta(days=1)
+
+
+def test_snapshot_pre_exhaustion_trigger_from_a_forecast():
+    """Any bucket forecast to hit its own stop inside lead_minutes fires it."""
+    from tokentracker import snapshot as S
+
+    cfg = _shot_cfg(lead_minutes=45)
+    d, _launched = _gate_dispatcher(cfg)
+    now = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+    S.write_state(cfg, {"next_eod": (now + timedelta(hours=8)).isoformat()})
+
+    # Fable at 96%, burning 2%/h: 0.5h to the 97% stop - inside the 45 min lead.
+    close = _buckets(fable=0.96, rate=0.02)
+    when, which = S.forecast_hits(cfg, close, now)
+    assert which == "fable" and 0.4 < (when - now).total_seconds() / 3600 < 0.6
+    line = S.maybe_enqueue(cfg, d, close, now)
+    assert line and S.REASON_FORECAST in line, line
+    assert len([t for t in d.tasks() if S.is_snapshot(t.id)]) == 1
+
+    # Far from the stop at the same rate: nothing, and the forecast is still
+    # recorded so the panel can count down to it.
+    cfg2 = _shot_cfg(lead_minutes=45)
+    d2, _l2 = _gate_dispatcher(cfg2)
+    far = _buckets(fable=0.10, weekly=0.10, rate=0.02)
+    S.write_state(cfg2, {"next_eod": (now + timedelta(hours=8)).isoformat()})
+    assert S.maybe_enqueue(cfg2, d2, far, now) is None
+    assert not [t for t in d2.tasks() if S.is_snapshot(t.id)]
+    assert S.read_state(cfg2)["forecast_trigger_at"], S.read_state(cfg2)
+
+    # A bucket already past its stop is not "about to be" exhausted, it IS:
+    # the forecast is now, and the pass is overdue.
+    past = _buckets(fable=0.99, rate=0.0)
+    when, which = S.forecast_hits(cfg, past, now)
+    assert when == now and which == "fable", (when, which)
+    # No rate at all forecasts nothing rather than guessing.
+    assert S.forecast_hits(cfg, _buckets(rate=0.0), now) == (None, "")
+
+
+def test_snapshot_min_gap_suppresses_and_consumes_the_slot():
+    from tokentracker import snapshot as S
+
+    cfg = _shot_cfg(min_gap_minutes=120)
+    d, _launched = _gate_dispatcher(cfg)
+    now = datetime(2026, 9, 5, 4, 1, tzinfo=timezone.utc)   # 23:01 CT
+    # One ran 30 minutes ago, and the end-of-day slot is due.
+    S.write_state(cfg, {"last_run": (now - timedelta(minutes=30)).isoformat(),
+                        "next_eod": (now - timedelta(minutes=1)).isoformat()})
+    line = S.maybe_enqueue(cfg, d, _buckets(), now)
+    assert line and "suppressed" in line, line
+    assert not [t for t in d.tasks() if S.is_snapshot(t.id)], d.tasks()
+    # The slot is still consumed: a gallery refreshed half an hour ago does not
+    # need refreshing again, and re-arming would only fire it at the next poll.
+    assert parse_iso(S.read_state(cfg)["next_eod"]) > now
+
+    # Past the gap, the same trigger goes through.
+    cfg2 = _shot_cfg(min_gap_minutes=120)
+    d2, _l2 = _gate_dispatcher(cfg2)
+    S.write_state(cfg2, {"last_run": (now - timedelta(minutes=200)).isoformat(),
+                         "next_eod": (now - timedelta(minutes=1)).isoformat()})
+    assert S.maybe_enqueue(cfg2, d2, _buckets(), now) is not None
+    assert len([t for t in d2.tasks() if S.is_snapshot(t.id)]) == 1
+
+
+def test_snapshot_task_runs_on_the_workers_model_never_fable():
+    from tokentracker import snapshot as S
+
+    cfg = _shot_cfg()
+    task = S.build_task(cfg, NOW)
+    assert task.model == "claude-opus-5", task.model
+    assert "fable" not in str(task.model).lower()
+    assert task.weight == "heavy" and task.cwd == "C:/repo"
+    # Above the director fork's own priority, so the launch batch starts it
+    # first when both are pending.
+    from tokentracker import cli
+    assert task.priority > 100 == cli.TaskSpec(id="x", prompt="", cwd=".",
+                                               priority=100).priority
+    assert task.id.startswith(S.PREFIX)
+    # The brief is the fixed text, with the repo expanded and nothing else.
+    assert "Tools/verify.sh shots" in task.prompt
+    assert "C:/repo/docs/screenshots/beta/" in task.prompt
+    assert "Co-Authored-By: Claude Opus 5" in task.prompt
+    assert "{repo}" not in task.prompt
+
+    # A graph that somehow puts Fable at the worker tier takes the fallback
+    # rather than spending the bucket the allocator exists to protect.
+    from tokentracker import graph as G
+    cfg.graph[G.WORKERS]["model"] = "claude-fable-5-1"
+    cfg.graph[G.WORKERS]["fallback"] = "claude-opus-4-8"
+    G.apply_graph(cfg)
+    assert S.worker_model(cfg) == "claude-opus-4-8", S.worker_model(cfg)
+
+
+def test_snapshot_holds_the_fork_off_while_it_is_queued():
+    from tokentracker import cli
+    from tokentracker import snapshot as S
+
+    cfg = _shot_cfg()
+    cfg.main_session_ids = [MAIN_ID]
+    d, _launched = _gate_dispatcher(cfg)
+    args = ("pace", "running", False)
+    assert cli._fork_wanted(cfg, *args, d) is True
+    d.add(S.build_task(cfg, NOW))
+    # Pending: the fork is not re-armed, so the snapshot gets the lane and the
+    # reserve the pacer set aside for it.
+    assert S.pending_or_running(d) is not None
+    assert cli._fork_wanted(cfg, *args, d) is False
+    # Running: still held.
+    d.set_status(S.task_id(NOW, cfg), "running")
+    assert cli._fork_wanted(cfg, *args, d) is False
+    # Finished: the fork is armed again on the next poll.
+    d.set_status(S.task_id(NOW, cfg), "done")
+    assert S.pending_or_running(d) is None
+    assert cli._fork_wanted(cfg, *args, d) is True
+
+
+def test_snapshot_reserve_is_subtracted_from_the_pacing_target():
+    cfg = make_cfg(snapshot={"enabled": True, "reserve_fraction": 0.05})
+    off = make_cfg(snapshot={"enabled": False, "reserve_fraction": 0.05})
+    s = snap(0.40, left_h=100.0)
+    with_reserve = scheduler.pacing(s, cfg, NOW)
+    without = scheduler.pacing(s, off, NOW)
+    assert with_reserve["snapshot_reserve"] == 0.05
+    assert without["snapshot_reserve"] == 0.0
+    # The week-pacing reserve is untouched; the target is the thing that moves.
+    assert with_reserve["reserve"] == without["reserve"]
+    assert with_reserve["required_total_pct_per_hr"] < \
+        without["required_total_pct_per_hr"]
+    expected = (1 - without["reserve"] - 0.05 - 0.40) / 100.0 * 100
+    assert abs(with_reserve["required_total_pct_per_hr"] - expected) < 1e-9
+
+    # And it survives the endgame, where the week-pacing reserve is dropped:
+    # the hour the pacer stops saving for later is exactly the hour the
+    # screenshot pass matters most.
+    end = scheduler.pacing(snap(0.40, left_h=6.0), cfg, NOW)
+    assert end["reserve"] == 0.0 and end["snapshot_reserve"] == 0.05
+    end_off = scheduler.pacing(snap(0.40, left_h=6.0), off, NOW)
+    assert end["required_total_pct_per_hr"] < end_off["required_total_pct_per_hr"]
+
+
+def test_snapshot_status_line_and_state_file():
+    from tokentracker import snapshot as S
+
+    cfg = _shot_cfg()
+    assert "shots never" in S.status_line(cfg, _buckets(), NOW)
+    now = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+    S.write_state(cfg, {"next_eod": (now + timedelta(hours=8)).isoformat(),
+                        "last_run": (now - timedelta(hours=3)).isoformat(),
+                        "last_commit": "abcdef1234567890"})
+    line = S.status_line(cfg, _buckets(fable=0.96, rate=0.02), now)
+    assert line.startswith("shots 3h ago - next: eod "), line
+    # A pass still queued or running does not report a freshness the gallery
+    # has not got: `last_run` is when it was QUEUED.
+    d, _l = _gate_dispatcher(cfg)
+    d.add(S.build_task(cfg, now))
+    assert S.queued_state(cfg) == "pending", S.queued_state(cfg)
+    assert S.age(cfg, now) == "shots queued", S.age(cfg, now)
+    d.set_status(S.task_id(now, cfg), "running")
+    assert S.age(cfg, now) == "shots running", S.age(cfg, now)
+    d.set_status(S.task_id(now, cfg), "done")
+    assert S.queued_state(cfg) is None
+    assert S.age(cfg, now) == "shots 3h ago", S.age(cfg, now)
+    assert "CT" in line and "pre-limit in 30 min" in line, line
+    assert "last commit abcdef12" in line, line
+    # Reading a status line must never consume the day's end-of-day slot.
+    before = S.read_state(cfg)["next_eod"]
+    S.status_line(cfg, _buckets(), now + timedelta(days=1))
+    assert S.read_state(cfg)["next_eod"] == before
+    # The file keeps exactly the contracted keys, all of them ISO UTC.
+    assert set(S.read_state(cfg)) <= set(S.STATE_KEYS), S.read_state(cfg)
+    assert S.read_state(cfg)["last_run"].endswith("+00:00")
+    # Off, the line says so rather than pretending a schedule exists.
+    assert "policy off" in S.status_line(make_cfg(), None, now)
+
+
+def test_snapshot_fires_from_the_tick_and_reaches_state_json():
+    """End to end through cli._tick: enqueued, launched first, recorded."""
+    from tokentracker import cli
+    from tokentracker import snapshot as S
+
+    cfg = _shot_cfg(lead_minutes=600)
+    cfg.report_repo = ""
+    cfg.report_on_stop = False
+    cfg.report_on_milestone = False
+    d, launched = _gate_dispatcher(cfg)
+    history = usage.UsageHistory(cfg)
+    real_fetch = usage.fetch_usage
+    # Fable climbing hard toward its own 97% stop while the weekly window
+    # stays behind pace: the forecast trigger fires, and the loop is still in a
+    # mode with a lane to launch into.
+    series = [(0.90, 40), (0.94, 0)]
+    try:
+        for fable, minutes in series:
+            stamp = NOW - timedelta(minutes=minutes)
+            usage.fetch_usage = lambda _c, f=fable, s=stamp: UsageSnapshot(
+                fetched_at=s,
+                five_hour=WindowUsage(0.2, NOW + timedelta(hours=2)),
+                seven_day=WindowUsage(0.30, NOW + timedelta(hours=40)),
+                extra={"fable": WindowUsage(f, NOW + timedelta(hours=40))})
+            if minutes == 0:
+                # An ordinary worker row waiting for the same lane, queued
+                # before the poll that fires the trigger.
+                d.add(TaskSpec(id="pod", prompt="p", cwd=str(cfg.root),
+                               weight="heavy", priority=50))
+            cli._tick(cfg, d, history)
+    finally:
+        usage.fetch_usage = real_fetch
+    queued = [t for t in d.tasks() if S.is_snapshot(t.id)]
+    assert len(queued) == 1, d.tasks()
+    # Priority 200 beats the pod's 50, so the pass took the first lane.
+    assert launched and launched[0][0] == queued[0].id, launched
+    state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
+    assert state["snapshot"]["enabled"] is True, state["snapshot"]
+    assert "shots" in state["snapshot"]["line"], state["snapshot"]
+    assert state["snapshot"]["last_reason"], state["snapshot"]
+    # A second tick does not stack a second pass onto the first.
+    real_fetch2 = usage.fetch_usage
+    usage.fetch_usage = lambda _c: snap(0.80, left_h=40.0)
+    try:
+        cli._tick(cfg, d, history)
+    finally:
+        usage.fetch_usage = real_fetch2
+    assert len([t for t in d.tasks() if S.is_snapshot(t.id)]) == 1, d.tasks()
+
+
+def test_snapshot_commit_is_recorded_and_marks_the_milestone():
+    from tokentracker import ledger
+    from tokentracker import snapshot as S
+
+    cfg = _shot_cfg()
+    d, _launched = _gate_dispatcher(cfg)
+    task = S.build_task(cfg, NOW)
+    d.add(task)
+    d.set_status(task.id, "done")
+    (cfg.logs_dir / f"{task.id}.out.json").write_text(
+        json.dumps({"result": "8 frames, commit 4f3a91b2c7d5e6f001122334455667788990aabb"}),
+        encoding="utf-8")
+    line = S.note_finished(cfg, d)
+    assert line and "4f3a91b2" in line, line
+    assert S.read_state(cfg)["last_commit"].startswith("4f3a91b2")
+    # Recorded once: a second pass over the same finished row adds nothing.
+    assert S.note_finished(cfg, d) is None
+    assert len(S.recorded_commits(cfg)) == 1
+
+    # The ledger's milestone table marks that row as a gallery refresh, and
+    # leaves every other commit alone.
+    commits = [
+        {"commit": "4f3a91b2c7d5e6f001122334455667788990aabb",
+         "at": NOW - timedelta(hours=1), "subject": "Snapshot: galleries"},
+        {"commit": "beef0001beef0002beef0003beef0004beef0005",
+         "at": NOW, "subject": "Wave 2: the player lives there"},
+    ]
+    rows = ledger.bucket_milestones(commits, [], NOW - timedelta(hours=3),
+                                    S.recorded_commits(cfg))
+    assert [r["snapshot"] for r in rows] == [True, False], rows
+    # With no snapshot set at all, nothing is marked.
+    plain = ledger.bucket_milestones(commits, [], NOW - timedelta(hours=3))
+    assert [r["snapshot"] for r in plain] == [False, False], plain
+
+
+# ------------------------------------------------------------ queue integrity
+# Proven failure, 2026-09-03 21:45 UTC: a task added with `tracker.py add`
+# while the loop ran vanished at the next poll, because the loop was started
+# without supervision and its own save clobbered the file underneath.
+
+def test_external_add_survives_two_ticks_and_launches_above_the_fork():
+    from tokentracker import cli
+    cfg = _gate_cfg()
+    cfg.main_session_ids = [MAIN_ID]
+    cfg.snapshot = {"enabled": False}
+    # The loop's dispatcher: supervising, as `cmd_run` builds it.
+    d = dispatch.Dispatcher(cfg, supervise=True)
+    launched: list[tuple[str, str]] = []
+
+    def fake_launch(task, now, lane="cloud"):
+        task.status = "running"
+        task.lane = lane
+        launched.append((task.id, lane))
+        return f"task {task.id}: launched {lane}"
+
+    d.launch = fake_launch
+    d.local_engine_up = lambda: True
+    history = usage.UsageHistory(cfg)
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.2, left_h=100.0)
+    try:
+        # Tick one: the loop arms the fork and holds the queue in memory.
+        cli._tick(cfg, d, history)
+        # A SECOND process adds a row, exactly as `tracker.py add` does.
+        other = dispatch.Dispatcher(cfg)
+        other.add(TaskSpec(id="urgent", prompt="p", cwd=str(cfg.root),
+                           weight="heavy", priority=500))
+        mark = len(launched)
+        # Two more ticks. Without supervision the first of them would write the
+        # loop's own memory back over the file and the row would be gone -
+        # which is the 2026-09-03 21:45 UTC failure, exactly.
+        cli._tick(cfg, d, history)
+        cli._tick(cfg, d, history)
+    finally:
+        usage.fetch_usage = real_fetch
+
+    on_disk = json.loads(cfg.tasks_file.read_text(encoding="utf-8"))
+    ids = [t["id"] for t in on_disk["tasks"]]
+    assert "urgent" in ids, ids
+    assert d.get("urgent") is not None, d.tasks()
+    # And it ran, ahead of the director fork: with one lane on offer, priority
+    # 500 takes it and the fork's 100 waits.
+    after = [tid for tid, _lane in launched[mark:]]
+    assert after and after[0] == "urgent", launched
+    assert cli.THROTTLE_TASK_ID not in after[:1], launched
+    assert d.get("urgent").status == "running", d.get("urgent")
+
+
+def test_run_loop_supervises_by_default_and_no_supervise_opts_out():
+    from tokentracker import cli
+    cfg = make_cfg()
+    assert cfg.supervise is True
+    assert cli.supervising(cfg) is True
+    assert cli.supervising(cfg, no_supervise=True) is False
+    cfg.supervise = False
+    assert cli.supervising(cfg) is False
+    # The flag reaches cmd_run through the real argument parser.
+    real_run = cli.cmd_run
+    seen: dict = {}
+    cli.cmd_run = lambda c, once, no_sup=False: seen.update(
+        once=once, no_supervise=no_sup) or 0
+    try:
+        cli.main(["--root", str(cfg.root), "run", "--once", "--no-supervise"])
+        assert seen == {"once": True, "no_supervise": True}, seen
+        seen.clear()
+        cli.main(["--root", str(cfg.root), "run", "--once"])
+        assert seen == {"once": True, "no_supervise": False}, seen
+    finally:
+        cli.cmd_run = real_run
+
+
+def test_tasks_file_is_a_wake_signal_and_add_reports_the_loop():
+    from tokentracker import cli
+    cfg = _gate_cfg()
+    cfg.poll_seconds = 300
+    before = cli._wake_sig(cfg)
+    dispatch.Dispatcher(cfg).add(TaskSpec(id="w", prompt="p",
+                                          cwd=str(cfg.root)))
+    assert cli._wake_sig(cfg) != before, "tasks.json must cut the sleep short"
+
+    # `add` says whether a live loop will pick the row up. No heartbeat yet:
+    live, note = cli.loop_liveness(cfg)
+    assert live is False and "no loop heartbeat" in note, note
+    # A fresh state.json is the loop's heartbeat.
+    cfg.state_file.write_text(json.dumps({"at": utcnow().isoformat()}),
+                              encoding="utf-8")
+    live, note = cli.loop_liveness(cfg)
+    assert live is True and "picks it up within seconds" in note, note
+    # A stale one is not.
+    old = (utcnow() - timedelta(hours=2)).isoformat()
+    cfg.state_file.write_text(json.dumps({"at": old}), encoding="utf-8")
+    live, note = cli.loop_liveness(cfg)
+    assert live is False and "stale" in note, note
+
+    # And the command prints it, so a silent vanish is impossible to miss.
+    args = types.SimpleNamespace(id="q1", prompt="p", cwd=str(cfg.root),
+                                 weight="light", model=None, priority=0,
+                                 max_minutes=90)
+    cfg.state_file.write_text(json.dumps({"at": utcnow().isoformat()}),
+                              encoding="utf-8")
+    out = _capture(lambda: cli.cmd_add(cfg, args))
+    assert "added task q1" in out and "picks it up within seconds" in out, out
+    assert dispatch.Dispatcher(cfg).get("q1") is not None
 
 
 def main() -> int:

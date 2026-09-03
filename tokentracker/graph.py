@@ -487,13 +487,24 @@ def write_graph(cfg: Config, patch: dict[str, dict[str, Any]]) -> dict[str, dict
 
 
 def apply_graph(cfg: Config) -> dict[str, dict[str, Any]]:
-    """Derive the legacy scalar keys from the graph, onto the live Config.
+    """Derive the legacy scalar keys from the ALLOCATED graph, onto the Config.
 
     This is the single derivation site: after it runs, `cfg.max_concurrency`
     and friends *are* the graph, so the scheduler, the dispatcher and the fork
     all follow it without importing this module.
+
+    What it applies is the graph `allocator.allocate` hands back - the
+    configured graph as the operator's ceiling, stepped down (or the worker
+    lanes stepped up) by whatever the loop's last poll decided. With no
+    state/allocation.json - a fresh install, a Config that never polls - the
+    allocation *is* the configured graph, so this returns exactly what it
+    always did. config.json and state/graph.json are never written here: the
+    ceiling stays the operator's.
     """
-    graph, _source = read_graph_source(cfg)
+    from .allocator import allocate
+
+    configured, _source = read_graph_source(cfg)
+    graph = allocate(cfg, configured).graph
     executive, _advisory, workers = tiers_of(graph)
     # cfg.graph is deliberately left alone: it holds what config.json declared,
     # and folding the override back into it would make a deleted state/graph.json
@@ -673,27 +684,52 @@ def _with_fallback(block: dict[str, Any]) -> str:
     return f"{model} (fallback {fallback})" if fallback else model
 
 
-def graph_line(graph: dict[str, dict[str, Any]]) -> str:
+def graph_line(graph: dict[str, dict[str, Any]], allocation: Any = None) -> str:
     """The one line the fork prompt's {graph} placeholder expands into.
 
     It carries the fallbacks as well as the primaries, because the fork runs
     its own Workflow agents: when one of them dies on a 529 or a limit, the
     fork - not this process - is the thing that has to re-run it, and it can
     only do that on the right model if it was told which one.
+
+    `graph` is the ALLOCATED graph, not the configured one, and the line says
+    so: the numbers in it are what TokenDistributor has budgeted for this poll
+    out of the operator's ceiling. The advisory tier also carries its review
+    effort (the rung the allocator gives up before it touches a model), and the
+    reasons behind any step follow at the end, so the fork can see why its
+    lenses just went from three to two rather than guessing.
     """
     e, a, w = tiers_of(graph)
+    effort = getattr(allocation, "advisory_effort", None) or "high"
+    reasons = [str(r) for r in (getattr(allocation, "reasons", None) or [])]
+    tail = f" Allocation reasons: {'; '.join(reasons)}." if reasons else ""
     return (
-        "Agentic graph (from TokenDistributor config): "
+        "Agentic graph (allocated by TokenDistributor from your configured "
+        "ceiling): "
         f"executive {_with_fallback(e)} x{e['count']}; "
-        f"advisory/reviewers {_with_fallback(a)} x{a['count']}; "
+        f"advisory/reviewers {_with_fallback(a)} x{a['count']} effort {effort}; "
         f"workers {_with_fallback(w)} x{w['count']} (surge {w['surge_count']}). "
         "Set these models explicitly on every Workflow agent; never exceed the "
         "worker count as concurrent lanes; use the advisory count as the number "
-        "of review lenses. If a Workflow agent fails on a 529, an overload or a "
+        "of review lenses, at the review effort named above. If a Workflow "
+        "agent fails on a 529, an overload or a "
         "rate/session/usage limit, re-run that agent on its own tier's fallback "
         "model above and keep going; never move an agent UP a tier's model (a "
-        "worker never runs on the executive's)."
+        "worker never runs on the executive's)." + tail
     )
+
+
+def allocated_line(cfg: Config) -> str:
+    """`graph_line` for the graph in force right now: the fork's {graph} text.
+
+    One function so the two launch paths - `cli._fork_prompt` for the fork row
+    and `Dispatcher._task_prompt` for every other row carrying the placeholder
+    - can never expand it differently.
+    """
+    from .allocator import allocate
+
+    allocation = allocate(cfg)
+    return graph_line(allocation.graph, allocation)
 
 
 def overlay_label(graph: dict[str, dict[str, Any]]) -> str:

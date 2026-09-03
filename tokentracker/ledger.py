@@ -904,8 +904,18 @@ def repo_commits(cfg: Config, start: datetime, end: datetime) -> list[dict]:
             if start <= c["at"] <= end]
 
 
+def _snapshot_commits(cfg: Config) -> set[str]:
+    """Hashes the screenshot policy's runs reported. Never raises."""
+    try:
+        from .snapshot import recorded_commits
+
+        return recorded_commits(cfg)
+    except Exception:
+        return set()
+
+
 def bucket_milestones(commits: list[dict], events: Iterable[tuple], start: datetime,
-                      ) -> list[dict]:
+                      snapshot_commits: set[str] | None = None) -> list[dict]:
     """USD spent on the way to each commit: [{commit, subject, usd, minutes}].
 
     One row per commit, covering the span that ended with it - the previous
@@ -913,7 +923,14 @@ def bucket_milestones(commits: list[dict], events: Iterable[tuple], start: datet
     has no milestone to belong to and is deliberately not invented into one;
     the row totals are therefore <= the window total, which is what the page
     says on the table.
+
+    `snapshot_commits` are the hashes the screenshot policy's own runs reported
+    (state/snapshot.json); those rows carry `snapshot: true` so the table can
+    say which milestones were gallery refreshes rather than feature work. They
+    are ordinary commits in the repo either way - the flag is a label, not a
+    filter, and a gallery refresh costs real budget that belongs in the total.
     """
+    marked = {str(c).strip().lower() for c in (snapshot_commits or set())}
     rows: list[dict] = []
     ordered = sorted(commits, key=lambda c: c["at"])
     turns = sorted((e for e in events if e and e[0] is not None),
@@ -928,11 +945,16 @@ def bucket_milestones(commits: list[dict], events: Iterable[tuple], start: datet
             if isinstance(usd, (int, float)) and turns[index][0] > previous:
                 spent += float(usd)
             index += 1
+        full = str(commit.get("commit") or "").strip().lower()
         rows.append({
-            "commit": str(commit.get("commit") or "")[:8],
+            "commit": full[:8],
             "subject": str(commit.get("subject") or ""),
             "usd": round(spent, 4),
             "minutes": round(max(0.0, (at - previous).total_seconds()) / 60.0, 1),
+            # Prefix match both ways: the worker reports a short hash, git
+            # returns the full one, and neither knows what the other printed.
+            "snapshot": any(full.startswith(m) or m.startswith(full)
+                            for m in marked if m and full),
         })
         previous = at
     return rows
@@ -1264,7 +1286,8 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
         "per_hour": [{"hour": hour, "usd_by_model": usd_hours[hour]}
                      for hour in sorted(usd_hours)],
         "per_milestone": bucket_milestones(repo_commits(cfg, start, end),
-                                           overall.events, start),
+                                           overall.events, start,
+                                           _snapshot_commits(cfg)),
         "pricing_used": pricing_used,
     }
     exec_hands = tiers[EXEC_TIER].hands_on_share()
