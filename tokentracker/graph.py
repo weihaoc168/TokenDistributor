@@ -18,6 +18,17 @@ from the graph whenever one is present: `apply_graph` writes them back onto the
 live Config, which is what makes the scheduler read the graph's worker counts
 without knowing the graph exists.
 
+Each tier also names a `fallback`: the model it drops to while its primary is
+limited or overloaded. Two rules hold the shape together, and both are
+warnings rather than refusals (`order_warnings`):
+
+    rank(executive) >= rank(advisory) >= rank(workers)   the superiority rule
+    rank(tier.fallback) <= rank(tier.model)              never fall back UP
+
+`MODEL_RANK` is the capability order they are measured on, most capable first;
+the local engine is appended to it and anything unranked sits below that, so a
+fallback can never be a promotion onto a model of unknown capability.
+
 Nothing here raises on bad input: it is called from inside the run loop, from
 every overlay refresh and from `load_config`, so an unknown model id is a
 warning and a nonsense count is clamped. That promise covers every read path -
@@ -34,40 +45,66 @@ import os
 from typing import Any
 
 from .config import Config
-from .models import utcnow
+from .models import parse_iso, utcnow
 
 EXECUTIVE = "executive"
 ADVISORY = "advisory"
 WORKERS = "workers"
 TIERS = (EXECUTIVE, ADVISORY, WORKERS)
 # workers carry a second count: the lane budget during surge / endgame.
+# `fallback` is the model the tier drops to while its primary is limited or
+# overloaded; it is a model id or null, never a count.
 TIER_FIELDS = {
-    EXECUTIVE: ("model", "count"),
-    ADVISORY: ("model", "count"),
-    WORKERS: ("model", "count", "surge_count"),
+    EXECUTIVE: ("model", "fallback", "count"),
+    ADVISORY: ("model", "fallback", "count"),
+    WORKERS: ("model", "fallback", "count", "surge_count"),
 }
+MODEL_FIELDS = ("model", "fallback")
 COUNT_MIN = 1
 COUNT_MAX = 40
 SURGE_MAX = 80
 FALLBACK_MODEL = "claude-opus-5"
-# The last-resort tier when even the Config is unreadable; the worker model
-# stays empty on purpose (see default_graph).
-TIER_DEFAULTS: dict[str, dict[str, Any]] = {
-    EXECUTIVE: {"model": FALLBACK_MODEL, "count": 1},
-    ADVISORY: {"model": FALLBACK_MODEL, "count": 3},
-    WORKERS: {"model": "", "count": 3, "surge_count": 4},
-}
-SOURCE_CONFIG = "config.json"
-SOURCE_OVERRIDE = "state/graph.json"
-# The ids `tracker.py graph set` accepts without complaint. Anything else is
-# still written (a new model id must not need a code change) but is reported.
-DEFAULT_KNOWN_MODELS = (
+# Capability order, most capable first. The executive decides, so it takes the
+# most capable model; the advisory lenses judge, so they may sit one step down;
+# the workers build, so they may sit lower still. Anything not named here -
+# including the local engine, which is appended by `rank_order` - ranks below
+# everything that is (`RANK_UNKNOWN`), so a fallback can never climb onto a
+# model nobody ranked.
+MODEL_RANK = (
     "claude-fable-5-1",
+    "claude-fable-5",
     "claude-opus-5",
     "claude-opus-4-8",
     "claude-sonnet-5",
     "claude-haiku-4-5-20251001",
 )
+RANK_UNKNOWN = 0
+ORDER_RULE = (
+    "rule: executive >= advisory >= workers by model capability ("
+    + " > ".join(MODEL_RANK) + " > local model > unknown ids)")
+# The last-resort tier when even the Config is unreadable; the worker model
+# stays empty on purpose (see default_graph). The fallbacks are the directive's
+# defaults - the executive and advisory step down to Fable 5, the workers to
+# Opus 4.8 - and are only applied to a tier whose primary they do not outrank.
+TIER_DEFAULTS: dict[str, dict[str, Any]] = {
+    EXECUTIVE: {"model": FALLBACK_MODEL, "fallback": "claude-fable-5", "count": 1},
+    ADVISORY: {"model": FALLBACK_MODEL, "fallback": "claude-fable-5", "count": 3},
+    WORKERS: {"model": "", "fallback": "claude-opus-4-8", "count": 3,
+              "surge_count": 4},
+}
+SOURCE_CONFIG = "config.json"
+SOURCE_OVERRIDE = "state/graph.json"
+# The ids `tracker.py graph set` accepts without complaint. Anything else is
+# still written (a new model id must not need a code change) but is reported.
+# Same list as the ranking: a model worth naming is a model worth ranking.
+DEFAULT_KNOWN_MODELS = MODEL_RANK
+# state/limited.json: written when a launch fails because the model - not the
+# task - was limited or overloaded, and read on every launch for as long as
+# `fallback_minutes`, so the tier keeps using its fallback instead of walking
+# back into the same wall once a poll.
+LIMITED_FILE_KEYS = ("model", "since", "reason")
+FALLBACK_MINUTES = 30.0
+_MISSING = object()
 
 
 def _int(value: Any, fallback: int) -> int:
@@ -100,6 +137,65 @@ def _model(value: Any, fallback: str) -> str:
     return text or fallback
 
 
+def rank_order(cfg: Any = None) -> tuple[str, ...]:
+    """MODEL_RANK, with the local engine appended as the least capable known."""
+    order = list(MODEL_RANK)
+    local = str(getattr(cfg, "local_model", "") or "") if cfg is not None else ""
+    if local and local not in order:
+        order.append(local)
+    return tuple(order)
+
+
+def model_rank(model: Any, cfg: Any = None) -> int:
+    """Capability score for a model id: higher is more capable. Never raises.
+
+    An empty id (the account default) and an id nobody has ranked both come
+    back as RANK_UNKNOWN, which is below every ranked model - that is what
+    makes "never fall back upward" refuse a step onto a model of unknown
+    capability rather than guess.
+    """
+    name = str(model or "").strip()
+    if not name:
+        return RANK_UNKNOWN
+    order = rank_order(cfg)
+    if name not in order:
+        return RANK_UNKNOWN
+    return len(order) - order.index(name)
+
+
+def may_fall_back(primary: Any, fallback: Any, cfg: Any = None) -> bool:
+    """True when `fallback` is a real step *down* from `primary`.
+
+    The whole point of the fallback is to keep working with less capability,
+    never to promote a worker onto the executive's model because its own was
+    busy - so a fallback that ranks above the primary (or that ranks above an
+    unrankable primary) is refused.
+    """
+    if not str(fallback or "").strip():
+        return False
+    return model_rank(fallback, cfg) <= model_rank(primary, cfg)
+
+
+def _clean_fallback(value: Any) -> str | None:
+    """A fallback model id, or None when the field says "no fallback"."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return None if text.lower() in ("", "none", "null", "-") else text
+
+
+def _default_fallback(tier: str, primary: Any) -> str | None:
+    """The tier's stock fallback, unless it would outrank this primary.
+
+    A config that predates the fallback field (or one whose executive already
+    runs on Opus) must not have Fable invented under it as a "fallback": that
+    would be a promotion, and validate would warn about a value the operator
+    never chose.
+    """
+    stock = TIER_DEFAULTS[tier].get("fallback")
+    return stock if may_fall_back(primary, stock) else None
+
+
 def _block(base: Any, tier: str) -> dict[str, Any]:
     """One complete tier, read out of `base` as tolerantly as it can be.
 
@@ -112,15 +208,21 @@ def _block(base: Any, tier: str) -> dict[str, Any]:
     raw = base.get(tier) if isinstance(base, dict) else None
     if not isinstance(raw, dict):
         raw = {}
-    fallback = TIER_DEFAULTS[tier]
+    defaults = TIER_DEFAULTS[tier]
     out: dict[str, Any] = {}
     for fieldname in TIER_FIELDS[tier]:
         if fieldname == "model":
-            out[fieldname] = _model(raw.get(fieldname), fallback[fieldname])
+            out[fieldname] = _model(raw.get(fieldname), defaults[fieldname])
+        elif fieldname == "fallback":
+            # Absent means "take the stock fallback"; present-and-null means
+            # "this tier has none", and that is kept rather than re-defaulted.
+            value = raw.get(fieldname, _MISSING)
+            out[fieldname] = (_default_fallback(tier, out["model"])
+                              if value is _MISSING else _clean_fallback(value))
         else:
             high = SURGE_MAX if fieldname == "surge_count" else COUNT_MAX
             out[fieldname] = _clamp(
-                _int(raw.get(fieldname), fallback[fieldname]), high)
+                _int(raw.get(fieldname), defaults[fieldname]), high)
     return out
 
 
@@ -137,10 +239,15 @@ def default_graph(cfg: Config) -> dict[str, dict[str, Any]]:
     count = _clamp(_int(getattr(cfg, "max_concurrency", 3), 3))
     surge = _clamp(_int(getattr(cfg, "surge_concurrency", count), count), SURGE_MAX)
     return {
-        EXECUTIVE: {"model": executive, "count": 1},
-        ADVISORY: {"model": executive, "count": 3},
-        WORKERS: {"model": worker, "count": count,
-                  "surge_count": max(surge, count)},
+        EXECUTIVE: {"model": executive,
+                    "fallback": _default_fallback(EXECUTIVE, executive),
+                    "count": 1},
+        ADVISORY: {"model": executive,
+                   "fallback": _default_fallback(ADVISORY, executive),
+                   "count": 3},
+        WORKERS: {"model": worker,
+                  "fallback": _default_fallback(WORKERS, worker),
+                  "count": count, "surge_count": max(surge, count)},
     }
 
 
@@ -165,6 +272,8 @@ def normalize(raw: Any, base: dict[str, dict[str, Any]]) -> dict[str, dict[str, 
             value = block[fieldname]
             if fieldname == "model":
                 out[tier]["model"] = _model(value, out[tier]["model"])
+            elif fieldname == "fallback":
+                out[tier]["fallback"] = _clean_fallback(value)
             else:
                 high = SURGE_MAX if fieldname == "surge_count" else COUNT_MAX
                 out[tier][fieldname] = _clamp(
@@ -329,11 +438,64 @@ def known_models(cfg: Config) -> list[str]:
     return models
 
 
-def validate_graph(graph: dict[str, dict[str, Any]], models: list[str]) -> list[str]:
+def order_warnings(graph: Any, cfg: Any = None) -> list[str]:
+    """The superiority rule, as words: rank(exec) >= rank(advisory) >= rank(workers).
+
+    The executive makes the crucial calls and the advisory lenses judge the
+    work, so neither may run on a model less capable than the tier under it.
+    Warnings only - the loop calls this every startup and the CLI on every
+    `graph`, and a graph that breaks the rule still has to run.
+
+    A tier whose model nobody ranks is skipped rather than accused: an id the
+    ranking has never heard of is far more often a new model than a demotion,
+    and it already draws the known_models warning. Fallbacks are compared with
+    the tier below's *fallback*, not its primary: both tiers degrade together
+    (they are usually limited by the same model), so it is the degraded ladder
+    that has to hold.
+    """
+    warnings: list[str] = []
+    if not isinstance(graph, dict):
+        return warnings
+    blocks = {tier: graph.get(tier) for tier in TIERS}
+    if not all(isinstance(b, dict) for b in blocks.values()):
+        # A missing tier is validate_graph's warning to make, not this one's.
+        return warnings
+    for upper, lower in ((EXECUTIVE, ADVISORY), (ADVISORY, WORKERS)):
+        up, low = blocks[upper], blocks[lower]
+        up_model, low_model = up.get("model"), low.get("model")
+        if (model_rank(up_model, cfg) != RANK_UNKNOWN
+                and model_rank(low_model, cfg) != RANK_UNKNOWN
+                and model_rank(up_model, cfg) < model_rank(low_model, cfg)):
+            warnings.append(
+                f"warning: {upper} model '{up_model}' ranks below {lower} "
+                f"model '{low_model}'; {ORDER_RULE}")
+        up_fb, low_fb = up.get("fallback"), low.get("fallback")
+        if (up_fb and low_fb and model_rank(up_fb, cfg) != RANK_UNKNOWN
+                and model_rank(low_fb, cfg) != RANK_UNKNOWN
+                and model_rank(up_fb, cfg) < model_rank(low_fb, cfg)):
+            warnings.append(
+                f"warning: {upper} fallback '{up_fb}' ranks below {lower} "
+                f"fallback '{low_fb}'; {ORDER_RULE}")
+    for tier in TIERS:
+        block = blocks[tier]
+        fallback = block.get("fallback")
+        model = block.get("model")
+        if (fallback and model_rank(model, cfg) != RANK_UNKNOWN
+                and not may_fall_back(model, fallback, cfg)):
+            warnings.append(
+                f"warning: {tier} fallback '{fallback}' outranks its primary "
+                f"'{model}'; a fallback never promotes a tier")
+    return warnings
+
+
+def validate_graph(graph: dict[str, dict[str, Any]], models: list[str],
+                   cfg: Any = None) -> list[str]:
     """Warnings, never exceptions: an unknown model id is reported, not refused.
 
     A model id the allow-list has never heard of is far more often a new model
-    than a typo, and refusing it would mean a code change every release.
+    than a typo, and refusing it would mean a code change every release. The
+    superiority rule (`order_warnings`) is reported the same way, so a graph
+    that puts the workers above the executive still runs - loudly.
     """
     warnings: list[str] = []
     for tier in TIERS:
@@ -347,7 +509,11 @@ def validate_graph(graph: dict[str, dict[str, Any]], models: list[str]) -> list[
         if model and model not in models:
             warnings.append(
                 f"warning: {tier} model '{model}' is not in known_models")
-    return warnings
+        fallback = block.get("fallback")
+        if fallback and fallback not in models:
+            warnings.append(
+                f"warning: {tier} fallback '{fallback}' is not in known_models")
+    return warnings + order_warnings(graph, cfg)
 
 
 def parse_assignments(items: list[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
@@ -377,7 +543,7 @@ def parse_assignments(items: list[str]) -> tuple[dict[str, dict[str, Any]], list
                           + ", ".join(TIER_FIELDS[tier]))
             continue
         value = value.strip()
-        if fieldname != "model":
+        if fieldname not in MODEL_FIELDS:
             try:
                 value = int(value)
             except ValueError:
@@ -422,17 +588,33 @@ def tiers_of(graph: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]
     return tuple(_block(graph, tier) for tier in TIERS)  # type: ignore[return-value]
 
 
+def _with_fallback(block: dict[str, Any]) -> str:
+    """"<model> (fallback <model>)", or just the model when there is none."""
+    model = _named(block.get("model"))
+    fallback = block.get("fallback")
+    return f"{model} (fallback {fallback})" if fallback else model
+
+
 def graph_line(graph: dict[str, dict[str, Any]]) -> str:
-    """The one line the fork prompt's {graph} placeholder expands into."""
+    """The one line the fork prompt's {graph} placeholder expands into.
+
+    It carries the fallbacks as well as the primaries, because the fork runs
+    its own Workflow agents: when one of them dies on a 529 or a limit, the
+    fork - not this process - is the thing that has to re-run it, and it can
+    only do that on the right model if it was told which one.
+    """
     e, a, w = tiers_of(graph)
     return (
         "Agentic graph (from TokenDistributor config): "
-        f"executive {_named(e['model'])} x{e['count']}; "
-        f"advisory/reviewers {_named(a['model'])} x{a['count']}; "
-        f"workers {_named(w['model'])} x{w['count']} (surge {w['surge_count']}). "
+        f"executive {_with_fallback(e)} x{e['count']}; "
+        f"advisory/reviewers {_with_fallback(a)} x{a['count']}; "
+        f"workers {_with_fallback(w)} x{w['count']} (surge {w['surge_count']}). "
         "Set these models explicitly on every Workflow agent; never exceed the "
         "worker count as concurrent lanes; use the advisory count as the number "
-        "of review lenses."
+        "of review lenses. If a Workflow agent fails on a 529, an overload or a "
+        "rate/session/usage limit, re-run that agent on its own tier's fallback "
+        "model above and keep going; never move an agent UP a tier's model (a "
+        "worker never runs on the executive's)."
     )
 
 
@@ -455,8 +637,100 @@ def format_tiers(graph: dict[str, dict[str, Any]]) -> list[str]:
         counts = f"x{block['count']}"
         if tier == WORKERS:
             counts += f" (surge x{block['surge_count']})"
-        lines.append(f"  {tier:<9} {_named(block['model']):<28} {counts}")
+        fallback = block.get("fallback")
+        named = _named(block["model"])
+        if fallback:
+            named += f" (fallback: {fallback})"
+        lines.append(f"  {tier:<9} {named:<52} {counts}")
     return lines
+
+
+# ------------------------------------------------------- state/limited.json
+
+def read_limited(cfg: Config, minutes: float | None = None,
+                 now: Any = None) -> dict[str, Any] | None:
+    """The standing "this model is limited" record, or None. Never raises.
+
+    None also covers an *expired* record: past `minutes` (config's
+    `fallback_minutes`) the primary is due another try, which is the whole
+    difference between a fallback and a demotion.
+    """
+    try:
+        data = json.loads(cfg.limited_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(data, dict) or not data.get("model"):
+        return None
+    if minutes is None:
+        minutes = fallback_minutes(cfg)
+    if minutes <= 0:
+        return data
+    since = parse_iso(data.get("since"))
+    if since is None:
+        return data
+    now = now or utcnow()
+    try:
+        age = (now - since).total_seconds()
+    except TypeError:
+        return data
+    return None if age > minutes * 60 else data
+
+
+def fallback_minutes(cfg: Config) -> float:
+    try:
+        value = float(getattr(cfg, "fallback_minutes", FALLBACK_MINUTES))
+    except (TypeError, ValueError):
+        return FALLBACK_MINUTES
+    return value if math.isfinite(value) and value >= 0 else FALLBACK_MINUTES
+
+
+def limited_model(cfg: Config, now: Any = None) -> str | None:
+    """The model id currently marked limited, or None."""
+    record = read_limited(cfg, now=now)
+    return str(record.get("model")) if record else None
+
+
+def write_limited(cfg: Config, model: Any, reason: Any,
+                  now: Any = None) -> dict[str, Any]:
+    """Mark `model` limited from now. Returns the record written."""
+    record = {"model": str(model or ""), "since": (now or utcnow()).isoformat(),
+              "reason": str(reason or "")[:200]}
+    body = json.dumps(record, indent=2)
+    path = cfg.limited_file
+    tmp = path.parent / f"{path.name}.tmp"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            path.write_text(body, encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return record
+
+
+def clear_limited(cfg: Config, model: Any = None) -> bool:
+    """Drop the record - the primary worked again. True when a file went away.
+
+    With `model` given, only a record naming that model is cleared: a worker
+    finishing on Opus says nothing about the executive's Fable being free.
+    """
+    try:
+        data = json.loads(cfg.limited_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    if model is not None and isinstance(data, dict) and data.get("model") != model:
+        return False
+    try:
+        cfg.limited_file.unlink()
+    except OSError:
+        return False
+    return True
 
 
 def migrate_config_file(cfg: Config) -> bool:

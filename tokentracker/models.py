@@ -109,6 +109,19 @@ class TaskSpec:
     # Minted by `claude -p --output-format json` and printed in its result at
     # exit; the ledger needs it to find the fork's own transcript.
     fork_session_id: str | None = None
+    # The model this run actually went out on, which is not always `model`: a
+    # tier whose primary is limited launches on its fallback instead.
+    model_used: str | None = None
+    # Set on the one relaunch a limited primary is allowed: the model that was
+    # limited. Its presence is what stops a second fallback hop.
+    fallback_from: str | None = None
+    # The model forced for the next launch of this row, after its tier's
+    # primary died on a limit. Kept apart from `model` on purpose: `model` is
+    # the row's standing intent, and overwriting it made the fallback
+    # permanent - a requeue would still have gone out on the fallback, and the
+    # bookkeeping could no longer tell which model the tier actually wanted.
+    # Cleared by `set_status(pending)`, so a requeue tries the primary again.
+    fallback_model: str | None = None
     session_tokens: int | None = None
     cost_usd: float | None = None
     error: str | None = None

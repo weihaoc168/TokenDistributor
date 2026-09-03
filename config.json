@@ -17,20 +17,25 @@
   "graph": {
     "executive": {
       "model": "claude-fable-5-1",
+      "fallback": "claude-fable-5",
       "count": 1
     },
     "advisory": {
       "model": "claude-fable-5-1",
+      "fallback": "claude-fable-5",
       "count": 3
     },
     "workers": {
       "model": "claude-opus-5",
+      "fallback": "claude-opus-4-8",
       "count": 10,
       "surge_count": 20
     }
   },
+  "fallback_minutes": 30,
   "known_models": [
     "claude-fable-5-1",
+    "claude-fable-5",
     "claude-opus-5",
     "claude-opus-4-8",
     "claude-sonnet-5",
@@ -43,6 +48,15 @@
       "cache_write": 12.5,
       "cache_write_1h": 20.0,
       "cache_read": 0.25,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "checked": "2026-09-03"
+    },
+    "claude-fable-5": {
+      "input": 10.0,
+      "output": 50.0,
+      "cache_write": 12.5,
+      "cache_write_1h": 20.0,
+      "cache_read": 1.0,
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
       "checked": "2026-09-03"
     },
@@ -109,7 +123,7 @@
   "throttle_fork_enabled": true,
   "fork_in_pace": true,
   "fork_cooldown_seconds": 120,
-  "throttle_prompt": "You are the forked acting technical director of StarGTA, running on the executive model of the agentic graph below, via TokenDistributor. The parent Fable session has handed over and is now monitor-only.\n\nContinue exactly from the parent's state. Read first: C:/Users/chenw/.claude/projects/C--Users-chenw/memory/project_stargta.md and feedback_fable_executive_only.md; C:/Users/chenw/StarGTA/dev_JSON/beta/B1.md and dev_JSON/BETA_CITYSAMPLE_PLAN.md; and the parent's scratchpad workflow scripts under C:/Users/chenw/AppData/Local/Temp/claude/C--Users-chenw/329cb798-b055-4f92-ba8d-96174a22413d/scratchpad/ (wave1_pods.js, wave_a2_look.js, assembly_brief.md).\n\nBEFORE starting any work, check for the parent's still-running workflows: journals under C:/Users/chenw/.claude/projects/C--Users-chenw/329cb798-b055-4f92-ba8d-96174a22413d/subagents/workflows/*/journal.jsonl with 'started' entries lacking a 'result', and running UnrealEditor*/UnrealBuildTool processes. Never kill them, never edit the same lanes; wait or pick disjoint work.\n\nDispatch development as Workflow graphs with the graph's models set explicitly on every agent: workers on the workers model, reviewers/judges on the advisory model, never more concurrent lanes than the workers count. You yourself decide, dispatch and gate; never do the hands-on building, log forensics or ladder runs in your own turns. {graph} Work in long thorough passes. All dev_JSON and Tools paths here are relative to C:/Users/chenw/StarGTA. Verify results with Tools/verify.sh, reading exit codes directly, never through a pipe. Commit by explicit paths with the message trailer 'Co-Authored-By: Claude <the model you run on, e.g. Fable 5.1> <noreply@anthropic.com>'; push only StarGTA (origin weihaoc168). Keep dev_JSON/PROGRESS_REPORT.json and the memory file updated at every milestone so the monitor can report.\n\nStop when C:/Users/chenw/TokenDistributor/state/stop.json exists, the weekly goal is reached, or Beta-0 is built (plan section 1.3); when you stop, write dev_JSON/HANDOFF.md.",
+  "throttle_prompt": "You are the forked acting technical director of StarGTA, running on the executive model of the agentic graph below, via TokenDistributor. The parent Fable session has handed over and is now monitor-only.\n\nContinue exactly from the parent's state. Read first: C:/Users/chenw/.claude/projects/C--Users-chenw/memory/project_stargta.md and feedback_fable_executive_only.md; C:/Users/chenw/StarGTA/dev_JSON/beta/B1.md and dev_JSON/BETA_CITYSAMPLE_PLAN.md; and the parent's scratchpad workflow scripts under C:/Users/chenw/AppData/Local/Temp/claude/C--Users-chenw/329cb798-b055-4f92-ba8d-96174a22413d/scratchpad/ (wave1_pods.js, wave_a2_look.js, assembly_brief.md).\n\nBEFORE starting any work, check for the parent's still-running workflows: journals under C:/Users/chenw/.claude/projects/C--Users-chenw/329cb798-b055-4f92-ba8d-96174a22413d/subagents/workflows/*/journal.jsonl with 'started' entries lacking a 'result', and running UnrealEditor*/UnrealBuildTool processes. Never kill them, never edit the same lanes; wait or pick disjoint work.\n\nDispatch development as Workflow graphs with the graph's models set explicitly on every agent: workers on the workers model, reviewers/judges on the advisory model, never more concurrent lanes than the workers count. You yourself decide, dispatch and gate; never do the hands-on building, log forensics or ladder runs in your own turns. {graph} Work in long thorough passes. All dev_JSON and Tools paths here are relative to C:/Users/chenw/StarGTA. Verify results with Tools/verify.sh, reading exit codes directly, never through a pipe. Commit by explicit paths with the message trailer 'Co-Authored-By: Claude <the model you run on, e.g. Fable 5.1> <noreply@anthropic.com>'; push only StarGTA (origin weihaoc168). Keep dev_JSON/PROGRESS_REPORT.json and the memory file updated at every milestone so the monitor can report.\n\nStop when C:/Users/chenw/TokenDistributor/state/stop.json exists, the weekly goal is reached, or Beta-0 is built - Beta-0 per plan §1.3 means BOTH part A (Wave 1: the world boots on Small_City_LVL, beta rung green) AND part B (Wave 2: the player lives there). Part A landed on 2026-09-03 (dev_JSON/HANDOFF.md is the Wave-1 record, not a stop signal); continue with HANDOFF.md §3 in order, then Wave 2, then beta-warm/beta-shots. When you stop, write dev_JSON/HANDOFF.md (a new dated section).",
   "claude_cmd": "claude",
   "permission_mode": "acceptEdits",
   "main_session_ids": [

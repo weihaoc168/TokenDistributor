@@ -57,6 +57,9 @@ class Config:
     # graph.apply_graph; see tokentracker/graph.py.
     graph: dict[str, Any] = field(default_factory=dict)
     known_models: list[str] = field(default_factory=list)
+    # How long state/limited.json keeps a tier on its fallback model before the
+    # primary is tried again (graph.read_limited).
+    fallback_minutes: float = 30.0
     # Published list prices per model, USD per 1M tokens, each row carrying the
     # source and the date it was read (tokentracker/pricing.py). A model that is
     # missing here is reported as "unpriced"; nothing is ever guessed.
@@ -130,6 +133,16 @@ class Config:
     def graph_file(self) -> Path:
         """Per-user agentic-graph override; wins over config.json like goal.json."""
         return self.state_dir / "graph.json"
+
+    @property
+    def limited_file(self) -> Path:
+        """Which model is currently limited/overloaded, and since when.
+
+        Written by the dispatcher when a launch fails on a 529 or a limit;
+        read on every launch, so the tier keeps using its fallback instead of
+        walking back into the same wall once a poll.
+        """
+        return self.state_dir / "limited.json"
 
     @property
     def pricing_file(self) -> Path:

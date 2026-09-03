@@ -1840,10 +1840,15 @@ def test_graph_derives_legacy_keys_from_config():
     # With no graph section the legacy keys imply one, and applying it back is
     # a no-op: an old config.json keeps behaving exactly as it did.
     g = G.default_graph(cfg)
-    assert g[G.EXECUTIVE] == {"model": "claude-opus-5", "count": 1}, g
-    assert g[G.ADVISORY] == {"model": "claude-opus-5", "count": 3}, g
-    assert g[G.WORKERS] == {"model": "claude-sonnet-5", "count": 7,
-                            "surge_count": 12}, g
+    # Every fallback here is None: the stock ones (Fable 5 above the executive,
+    # Opus 4.8 above a Sonnet worker) would all be promotions, and a config
+    # that predates the field must never have one invented over its own models.
+    assert g[G.EXECUTIVE] == {"model": "claude-opus-5", "fallback": None,
+                              "count": 1}, g
+    assert g[G.ADVISORY] == {"model": "claude-opus-5", "fallback": None,
+                             "count": 3}, g
+    assert g[G.WORKERS] == {"model": "claude-sonnet-5", "fallback": None,
+                            "count": 7, "surge_count": 12}, g
     assert G.apply_graph(cfg) == g
     assert (cfg.max_concurrency, cfg.surge_concurrency) == (7, 12)
     assert cfg.worker_model == "claude-sonnet-5"
@@ -1931,7 +1936,8 @@ def test_graph_override_is_a_patch_not_a_snapshot():
                              "surge_count": 8}}
     g = G.read_graph(cfg)
     assert g[G.EXECUTIVE]["model"] == "claude-opus-4-8", g
-    assert g[G.ADVISORY] == {"model": "claude-sonnet-5", "count": 5}, g
+    assert g[G.ADVISORY] == {"model": "claude-sonnet-5", "fallback": None,
+                             "count": 5}, g
     assert g[G.WORKERS]["model"] == "claude-haiku-4-5-20251001", g
     assert g[G.WORKERS]["count"] == 12, g       # the tap, and only the tap
     assert g[G.WORKERS]["surge_count"] == 12, g  # never under the lane count
@@ -2043,8 +2049,12 @@ def test_graph_migration_writes_the_section_once():
     cfg = load_config(tmp)
     raw = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
     assert "graph" in raw, raw
-    assert raw["graph"]["workers"] == {"model": "claude-opus-5", "count": 6,
-                                       "surge_count": 9}, raw["graph"]
+    # The migration writes the fallback too, but only the one that is a step
+    # down from the model already configured (Opus 4.8 under an Opus 5 lane).
+    assert raw["graph"]["workers"] == {"model": "claude-opus-5",
+                                       "fallback": "claude-opus-4-8",
+                                       "count": 6, "surge_count": 9}, raw["graph"]
+    assert raw["graph"]["executive"]["fallback"] is None, raw["graph"]
     # The legacy keys are kept for compatibility, not replaced.
     assert raw["worker_model"] == "claude-opus-5" and raw["max_concurrency"] == 6
     assert cfg.max_concurrency == 6 and cfg.throttle_model == "claude-opus-4-8"
@@ -2109,22 +2119,48 @@ def test_cli_graph_shows_and_sets():
 
     out = _capture(lambda: cli_main(
         ["--root", str(tmp), "graph", "set", "workers.count=20",
-         "advisory.model=claude-opus-4-8"]))
+         "workers.model=claude-opus-4-8"]))
     assert f"agentic graph (source: {G.SOURCE_OVERRIDE})" in out, out
     cfg = load_config(tmp)
     assert cfg.max_concurrency == 20, cfg.max_concurrency
-    assert G.read_graph(cfg)[G.ADVISORY]["model"] == "claude-opus-4-8"
+    assert G.read_graph(cfg)[G.WORKERS]["model"] == "claude-opus-4-8"
     # config.json is never rewritten by a set; the override file carries it.
     raw = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
     assert raw["graph"]["workers"]["count"] == 10, raw["graph"]
     # And it carries only what was assigned, so the models config.json declares
     # keep applying to every tier the operator did not name.
     stored = json.loads(cfg.graph_file.read_text(encoding="utf-8"))["graph"]
-    assert stored == {G.ADVISORY: {"model": "claude-opus-4-8"},
-                      G.WORKERS: {"count": 20}}, stored
+    assert stored == {G.WORKERS: {"model": "claude-opus-4-8", "count": 20}}, stored
     # An unparseable assignment is refused without touching the override.
     assert cli_main(["--root", str(tmp), "graph", "set", "workers.count=lots"]) == 1
     assert G.read_graph(load_config(tmp))[G.WORKERS]["count"] == 20
+
+    # An assignment that would break the superiority rule is refused, with the
+    # rule printed - and goes through when --force says it was deliberate.
+    out = _capture(lambda: cli_main(
+        ["--root", str(tmp), "graph", "set", "advisory.model=claude-haiku-4-5-20251001"]))
+    assert "refusing to break the order" in out, out
+    assert "executive >= advisory >= workers" in out, out
+    assert G.read_graph(load_config(tmp))[G.ADVISORY]["model"] == "claude-opus-5"
+    out = _capture(lambda: cli_main(
+        ["--root", str(tmp), "graph", "set", "--force",
+         "advisory.model=claude-haiku-4-5-20251001"]))
+    graph = G.read_graph(load_config(tmp))
+    assert graph[G.ADVISORY]["model"] == "claude-haiku-4-5-20251001", graph
+    # Forced, but not silent: printing the graph still says it is upside down.
+    assert "ranks below" in out, out
+    # A standing violation must not lock the whole command: only what THIS
+    # assignment breaks is refused, and a count breaks no order at all.
+    out = _capture(lambda: cli_main(
+        ["--root", str(tmp), "graph", "set", "workers.count=5"]))
+    assert "refusing to break the order" not in out, out
+    assert G.read_graph(load_config(tmp))[G.WORKERS]["count"] == 5, out
+    # ... and it still says so after the write.
+    assert "ranks below" in out, out
+    # A NEW violation on top of the standing one is still refused.
+    assert cli_main(["--root", str(tmp), "graph", "set",
+                     "workers.model=claude-fable-5-1"]) == 1
+    assert G.read_graph(load_config(tmp))[G.WORKERS]["model"] == "claude-opus-4-8"
 
 
 def test_scheduler_reads_the_graph_worker_counts():
@@ -2162,6 +2198,481 @@ def test_repo_config_ships_the_graph():
     # The legacy keys the scheduler and dispatcher read are the graph's.
     assert cfg.max_concurrency == 10 and cfg.surge_concurrency == 20
     assert cfg.worker_model == "claude-opus-5"
+    # The directive's fallbacks ship with it, and none of them is a promotion.
+    assert g[G.EXECUTIVE]["fallback"] == "claude-fable-5", g
+    assert g[G.ADVISORY]["fallback"] == "claude-fable-5", g
+    assert g[G.WORKERS]["fallback"] == "claude-opus-4-8", g
+    assert G.order_warnings(g, cfg) == []
+    for tier in G.TIERS:
+        assert G.may_fall_back(g[tier]["model"], g[tier]["fallback"], cfg), tier
+    # Every fallback is a model the report can price, not just one it can name.
+    from tokentracker import pricing as P
+    assert P.unpriced(P.read_pricing(cfg),
+                      [g[t]["fallback"] for t in G.TIERS]) == []
+
+
+# ------------------------------------------- model ranking and the fallbacks
+
+def test_model_ranking_orders_the_tiers():
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    cfg.local_model = "Qwen3.8-27B-NVFP4"
+    ranked = [G.model_rank(m, cfg) for m in G.MODEL_RANK]
+    assert ranked == sorted(ranked, reverse=True), ranked   # most capable first
+    assert G.MODEL_RANK[0] == "claude-fable-5-1", G.MODEL_RANK
+    assert G.model_rank("claude-fable-5-1", cfg) > G.model_rank("claude-fable-5", cfg)
+    assert G.model_rank("claude-fable-5", cfg) > G.model_rank("claude-opus-5", cfg)
+    assert G.model_rank("claude-opus-5", cfg) > G.model_rank("claude-opus-4-8", cfg)
+    # The local engine ranks last of the known ids; anything unranked (and the
+    # account default, which names no model at all) sits below even that.
+    assert G.rank_order(cfg)[-1] == cfg.local_model
+    assert (G.model_rank("claude-haiku-4-5-20251001", cfg)
+            > G.model_rank(cfg.local_model, cfg) > G.RANK_UNKNOWN)
+    assert G.model_rank("claude-mythos-9", cfg) == G.RANK_UNKNOWN
+    assert G.model_rank("", cfg) == G.model_rank(None, cfg) == G.RANK_UNKNOWN
+    # Never upward is the whole point of the ranking.
+    assert G.may_fall_back("claude-fable-5-1", "claude-fable-5", cfg)
+    assert G.may_fall_back("claude-opus-5", "claude-opus-5", cfg)
+    assert not G.may_fall_back("claude-opus-5", "claude-fable-5-1", cfg)
+    assert not G.may_fall_back("claude-opus-5", None, cfg)
+    assert not G.may_fall_back("claude-mythos-9", "claude-opus-5", cfg)
+
+
+def test_order_rule_warns_and_never_raises():
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    ok = {G.EXECUTIVE: {"model": "claude-fable-5-1", "fallback": "claude-fable-5",
+                        "count": 1},
+          G.ADVISORY: {"model": "claude-fable-5", "fallback": "claude-opus-5",
+                       "count": 3},
+          G.WORKERS: {"model": "claude-opus-5", "fallback": "claude-opus-4-8",
+                      "count": 4, "surge_count": 8}}
+    assert G.order_warnings(ok, cfg) == []
+    assert G.validate_graph(ok, G.known_models(cfg), cfg) == []
+
+    # Workers above the advisory tier: reported, never raised, and the graph
+    # still holds what the operator wrote.
+    upside_down = json.loads(json.dumps(ok))
+    upside_down[G.WORKERS]["model"] = "claude-fable-5-1"
+    warnings = G.order_warnings(upside_down, cfg)
+    assert len(warnings) == 1 and "advisory" in warnings[0], warnings
+    assert "executive >= advisory >= workers" in warnings[0], warnings
+    assert warnings == [w for w in G.validate_graph(
+        upside_down, G.known_models(cfg), cfg) if "ranks below" in w]
+
+    # A fallback that outranks its own primary is a promotion, not a fallback.
+    promoted = json.loads(json.dumps(ok))
+    promoted[G.WORKERS]["fallback"] = "claude-fable-5-1"
+    warnings = G.order_warnings(promoted, cfg)
+    assert any("outranks its primary" in w for w in warnings), warnings
+    # It breaks the degraded ladder as well, and both halves are said.
+    assert len(warnings) == 2, warnings
+
+    # The degraded ladder has to hold too: the executive's fallback may not
+    # sit under the fallback the tier below drops to.
+    crossed = json.loads(json.dumps(ok))
+    crossed[G.EXECUTIVE]["fallback"] = "claude-opus-4-8"
+    warnings = G.order_warnings(crossed, cfg)
+    assert len(warnings) == 1 and "fallback" in warnings[0], warnings
+
+    # An id nobody ranks is not accused of anything (it already draws the
+    # known_models warning), and neither is a graph missing a tier.
+    unknown = json.loads(json.dumps(ok))
+    unknown[G.EXECUTIVE]["model"] = "claude-mythos-9"
+    unknown[G.EXECUTIVE]["fallback"] = None
+    assert G.order_warnings(unknown, cfg) == []
+    for junk in (None, {}, [1], "graph", {G.WORKERS: 5},
+                 {G.EXECUTIVE: {}, G.ADVISORY: {}, G.WORKERS: {}}):
+        assert G.order_warnings(junk, cfg) == [], junk
+    assert len(G.validate_graph({G.WORKERS: 5}, ["claude-opus-5"], cfg)) == 3
+
+
+def test_graph_fallback_defaults_and_override():
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    cfg.throttle_model = "claude-fable-5-1"
+    cfg.worker_model = "claude-opus-5"
+    g = G.read_graph(cfg)
+    # Stock defaults, applied only where they are a step down.
+    assert g[G.EXECUTIVE]["fallback"] == "claude-fable-5", g
+    assert g[G.ADVISORY]["fallback"] == "claude-fable-5", g
+    assert g[G.WORKERS]["fallback"] == "claude-opus-4-8", g
+
+    # The override carries fallbacks like any other field, as a patch.
+    G.write_graph(cfg, {G.WORKERS: {"fallback": "claude-sonnet-5"}})
+    stored = json.loads(cfg.graph_file.read_text(encoding="utf-8"))["graph"]
+    assert stored == {G.WORKERS: {"fallback": "claude-sonnet-5"}}, stored
+    g = G.read_graph(cfg)
+    assert g[G.WORKERS]["fallback"] == "claude-sonnet-5", g
+    assert g[G.EXECUTIVE]["fallback"] == "claude-fable-5", g
+
+    # An explicit null means "this tier has no fallback" and is kept as one,
+    # rather than being re-filled from the defaults on the next read.
+    for cleared in (None, "", "none", "null", "-"):
+        G.write_graph(cfg, {G.WORKERS: {"fallback": cleared}})
+        assert G.read_graph(cfg)[G.WORKERS]["fallback"] is None, cleared
+    # config.json's own null is honoured the same way.
+    cfg.graph_file.unlink()
+    cfg.graph = {G.WORKERS: {"model": "claude-opus-5", "fallback": None}}
+    assert G.read_graph(cfg)[G.WORKERS]["fallback"] is None
+    # Junk degrades to "no fallback" rather than raising inside the poll.
+    for junk in (5, [], {}, True):
+        cfg.graph = {G.WORKERS: {"model": "claude-opus-5", "fallback": junk}}
+        assert G.read_graph(cfg)[G.WORKERS]["fallback"] is None, junk
+    assert G.parse_assignments(["executive.fallback=claude-fable-5"])[1] == []
+
+
+def test_graph_line_carries_the_fallbacks():
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    cfg.throttle_model = "claude-fable-5-1"
+    cfg.worker_model = "claude-opus-5"
+    cfg.max_concurrency = 10
+    cfg.surge_concurrency = 20
+    line = G.graph_line(G.read_graph(cfg))
+    assert "executive claude-fable-5-1 (fallback claude-fable-5) x1" in line, line
+    assert "advisory/reviewers claude-fable-5-1 (fallback claude-fable-5) x3" in line, line
+    assert ("workers claude-opus-5 (fallback claude-opus-4-8) x10 (surge 20)"
+            in line), line
+    # The fork runs its own Workflow agents, so it is told what to do when one
+    # of them dies on a limit - and told never to promote it.
+    assert "529" in line and "fallback model" in line, line
+    assert "never move an agent UP" in line, line
+    # A tier with no fallback says nothing rather than "(fallback None)".
+    bare = G.normalize({G.WORKERS: {"fallback": None}}, G.read_graph(cfg))
+    assert "workers claude-opus-5 x10" in G.graph_line(bare), G.graph_line(bare)
+
+
+def test_limited_record_expires_and_clears():
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    cfg.fallback_minutes = 30.0
+    assert G.read_limited(cfg) is None and G.limited_model(cfg) is None
+    record = G.write_limited(cfg, "claude-fable-5-1", "529", NOW)
+    assert list(record) == list(G.LIMITED_FILE_KEYS), record
+    assert G.limited_model(cfg, now=NOW) == "claude-fable-5-1"
+    # Younger than fallback_minutes: the tier stays on its fallback.
+    assert G.read_limited(cfg, now=NOW + timedelta(minutes=29)) is not None
+    # Older: the primary is due another try, without anyone clearing the file.
+    assert G.read_limited(cfg, now=NOW + timedelta(minutes=31)) is None
+    # Clearing is per model: a worker finishing says nothing about Fable.
+    assert not G.clear_limited(cfg, "claude-opus-5")
+    assert G.limited_model(cfg, now=NOW) == "claude-fable-5-1"
+    assert G.clear_limited(cfg, "claude-fable-5-1")
+    assert G.read_limited(cfg, now=NOW) is None
+    # Junk on disk is "no record", not an exception in the middle of a poll.
+    for junk in ("{not json", "[]", "null", "{}", '{"model": ""}'):
+        cfg.limited_file.write_text(junk, encoding="utf-8")
+        assert G.read_limited(cfg, now=NOW) is None, junk
+        assert G.limited_model(cfg) is None, junk
+
+
+def test_limit_error_classification():
+    # The strings a limited or overloaded model actually comes back with.
+    for text in ('API Error: 529 {"type":"overloaded_error"}',
+                 "Overloaded",
+                 "429 rate limit exceeded",
+                 "rate_limit_error",
+                 "Claude usage limit reached",
+                 "You've hit your session limit",
+                 "hit your weekly limit"):
+        assert dispatch.limited_reason(text), text
+    # ... and the ordinary failures that must NOT cost a model its tier.
+    for text in ("", None, "exit code 1", "Error: file not found",
+                 "task 1529 failed", "5290 tokens", "limited edition"):
+        assert dispatch.limited_reason(text) is None, text
+
+
+def _limit_cfg() -> Config:
+    cfg = make_cfg()
+    cfg.main_session_ids = [MAIN_ID]
+    cfg.throttle_model = "claude-fable-5-1"
+    cfg.worker_model = "claude-opus-5"
+    cfg.fallback_minutes = 30.0
+    cfg.graph = {
+        "executive": {"model": "claude-fable-5-1", "fallback": "claude-fable-5",
+                      "count": 1},
+        "advisory": {"model": "claude-fable-5-1", "fallback": "claude-fable-5",
+                     "count": 3},
+        "workers": {"model": "claude-opus-5", "fallback": "claude-opus-4-8",
+                    "count": 4, "surge_count": 8},
+    }
+    return cfg
+
+
+def _stub_launcher(captured: list):
+    """Patch dispatch's subprocess/shutil; returns the restore callable."""
+    real_sub, real_shutil = dispatch.subprocess, dispatch.shutil
+    dispatch.subprocess = _fake_subprocess(captured)
+    dispatch.shutil = types.SimpleNamespace(which=lambda _n: "C:/fake/claude.exe")
+
+    def restore():
+        dispatch.subprocess, dispatch.shutil = real_sub, real_shutil
+    return restore
+
+
+def _die(d, cfg, task_id: str, payload: dict, now, code: int = 1,
+         decision=None):
+    """Let the stubbed process for `task_id` exit with `payload` as its result.
+
+    With `decision`, the exit is processed through a whole `apply()` tick,
+    which is what a fallback needs: reap only requeues the row, and it is the
+    same tick's launch batch that starts it - under that decision's budget.
+    """
+    proc = d._procs[task_id]
+    proc.out.close()
+    (cfg.logs_dir / f"{task_id}.out.json").write_text(
+        json.dumps(payload), encoding="utf-8")
+    proc.popen.returncode = code
+    proc.popen.poll = lambda: code
+    if decision is not None:
+        return d.apply(decision, now)
+    return d.reap(now)
+
+
+PACE = Decision("pace", 3, True, "test")
+STOP = Decision("stopped", 0, False, "operator STOP")
+
+
+def test_dispatch_falls_back_once_on_a_limited_primary():
+    from tokentracker import graph as G
+    cfg = _limit_cfg()
+    d = dispatch.Dispatcher(cfg)
+    d.add(TaskSpec(id="pod", prompt="p", cwd=str(cfg.root)))
+    task = d.get("pod")
+    captured: list[list[str]] = []
+    restore = _stub_launcher(captured)
+    try:
+        d.launch(task, NOW)
+        assert task.model_used == "claude-opus-5", task
+        argv = captured[0]
+        assert argv[argv.index("--model") + 1] == "claude-opus-5", argv
+
+        # The run dies on a 529: the model was the problem, not the task.
+        actions = _die(d, cfg, "pod", {
+            "is_error": True,
+            "result": 'API Error: 529 {"type":"overloaded_error"}',
+        }, NOW + timedelta(minutes=1), decision=PACE)
+        record = G.read_limited(cfg)
+        assert record["model"] == "claude-opus-5", record
+        assert record["reason"] == "529" and record["since"], record
+        # Relaunched once, on the workers tier's fallback, and the row says
+        # which model actually ran.
+        assert len(captured) == 2, captured
+        argv = captured[1]
+        assert argv[argv.index("--model") + 1] == "claude-opus-4-8", argv
+        assert task.status == "running" and task.model_used == "claude-opus-4-8"
+        assert task.fallback_from == "claude-opus-5", task
+        assert any("requeued on workers fallback" in a for a in actions), actions
+        # The row's own intent is untouched: only the launch was forced, so a
+        # later requeue goes back to asking for the tier's primary.
+        assert task.model is None and task.fallback_model == "claude-opus-4-8"
+
+        # A second task launched inside fallback_minutes skips the primary.
+        d.add(TaskSpec(id="pod2", prompt="p", cwd=str(cfg.root)))
+        assert d._task_model(d.get("pod2"), "cloud") == "claude-opus-4-8"
+        # ... and the fork does the same on the executive tier's fallback.
+        fork = TaskSpec(id=dispatch.FORK_TASK_ID, prompt="p", cwd=str(cfg.root),
+                        resume_session=MAIN_ID)
+        assert d._task_model(fork, "cloud") == "claude-fable-5-1"   # not limited
+        G.write_limited(cfg, "claude-fable-5-1", "usage limit")
+        assert d._task_model(fork, "cloud") == "claude-fable-5"
+        assert d._task_model(d.get("pod2"), "cloud") == "claude-opus-5"
+
+        # Past the window the primary is tried again, without anyone clearing
+        # the file: a fallback is a detour, not a demotion.
+        G.write_limited(cfg, "claude-opus-5", "529",
+                        utcnow() - timedelta(minutes=45))
+        assert d._task_model(d.get("pod2"), "cloud") == "claude-opus-5"
+        # ... and when that retry finishes, the mark is dropped outright.
+        d.launch(d.get("pod2"), NOW)
+        assert d.get("pod2").model_used == "claude-opus-5"
+        _die(d, cfg, "pod2", {"is_error": False,
+                              "usage": {"output_tokens": 1}},
+             NOW + timedelta(minutes=2), code=0)
+        assert d.get("pod2").status == "done", d.get("pod2")
+        assert not cfg.limited_file.exists()
+    finally:
+        restore()
+
+
+def test_fallback_is_never_a_promotion_and_never_hops_twice():
+    from tokentracker import graph as G
+    cfg = _limit_cfg()
+    # A fallback that outranks the primary is refused: a worker whose model is
+    # busy waits, it is never promoted onto the executive's model.
+    cfg.graph["workers"]["fallback"] = "claude-fable-5-1"
+    d = dispatch.Dispatcher(cfg)
+    d.add(TaskSpec(id="pod", prompt="p", cwd=str(cfg.root)))
+    captured: list[list[str]] = []
+    restore = _stub_launcher(captured)
+    try:
+        d.launch(d.get("pod"), NOW)
+        actions = _die(d, cfg, "pod", {"is_error": True, "result": "Overloaded"},
+                       NOW + timedelta(minutes=1))
+        assert len(captured) == 1, captured           # nothing relaunched
+        assert d.get("pod").status == "failed"
+        assert any("refusing to fall back UP" in a for a in actions), actions
+        # The mark still stands, so the next launch is not aimed at it either -
+        # but with no legal fallback it stays on the primary rather than up.
+        assert G.limited_model(cfg) == "claude-opus-5"
+        assert d._task_model(d.get("pod"), "cloud") == "claude-opus-5"
+
+        # With a legal fallback the mark routes the next launch to it, and the
+        # row's own intent is left asking for the primary.
+        cfg.graph["workers"]["fallback"] = "claude-opus-4-8"
+        d.set_status("pod", "pending")
+        assert d.get("pod").fallback_from is None
+        assert d.get("pod").fallback_model is None
+        d.launch(d.get("pod"), NOW)
+        assert d.get("pod").model_used == "claude-opus-4-8"  # mark still fresh
+        assert d.get("pod").model is None, d.get("pod")
+        # When the FALLBACK is the one that dies, the primary's record must
+        # survive: it is the only thing holding the tier off the primary, and
+        # replacing it with the fallback's id sent the next launch straight
+        # back into the model the account refused a minute ago.
+        before = len(captured)
+        actions = _die(d, cfg, "pod", {"is_error": True, "result": "Overloaded"},
+                       NOW + timedelta(minutes=2), decision=PACE)
+        assert d.get("pod").status == "failed", d.get("pod")
+        assert any("also limited" in a for a in actions), actions
+        assert len(captured) == before, captured        # no second hop
+        assert G.limited_model(cfg) == "claude-opus-5", G.read_limited(cfg)
+        d.add(TaskSpec(id="pod3", prompt="p", cwd=str(cfg.root)))
+        assert d._task_model(d.get("pod3"), "cloud") == "claude-opus-4-8"
+        # A tier with no fallback at all says so and leaves the row failed.
+        cfg.graph["workers"]["fallback"] = None
+        d.set_status("pod", "pending")
+        d.launch(d.get("pod"), NOW)
+        actions = _die(d, cfg, "pod", {"is_error": True, "result": "Overloaded"},
+                       NOW + timedelta(minutes=4))
+        assert any("no workers fallback configured" in a for a in actions), actions
+    finally:
+        restore()
+
+
+def test_fallback_requeue_obeys_the_launch_budget():
+    """A limit exit must not spend budget the pacer just decided not to spend.
+
+    The relaunch is a requeue, so it goes through the same `target_concurrency`
+    / `allow_heavy` gate as every other launch: under operator STOP (both
+    budgets zeroed) the row waits, and it starts on the next tick that allows
+    a launch at all.
+    """
+    from tokentracker import graph as G
+    cfg = _limit_cfg()
+    d = dispatch.Dispatcher(cfg)
+    d.add(TaskSpec(id="pod", prompt="p", cwd=str(cfg.root)))
+    captured: list[list[str]] = []
+    restore = _stub_launcher(captured)
+    try:
+        d.launch(d.get("pod"), NOW)
+        actions = _die(d, cfg, "pod", {"is_error": True, "result": "Overloaded"},
+                       NOW + timedelta(minutes=1), decision=STOP)
+        # Marked and requeued, but nothing started: STOP is the last word.
+        assert G.limited_model(cfg) == "claude-opus-5", actions
+        assert d.get("pod").status == "pending", d.get("pod")
+        assert len(captured) == 1, captured
+        # The next tick that has room starts it, on the fallback it was
+        # requeued for.
+        d.apply(PACE, NOW + timedelta(minutes=2))
+        assert len(captured) == 2, captured
+        argv = captured[1]
+        assert argv[argv.index("--model") + 1] == "claude-opus-4-8", argv
+    finally:
+        restore()
+
+
+def test_fork_fallback_requeue_waits_for_the_rearm_gate():
+    """The loop's fork gate covers the requeue, not just a fresh arm.
+
+    `_fork_wanted` and the re-arm cooldown are evaluated before `apply()`, so
+    without the gate a fork that died on a usage limit was started again in
+    the same tick - in a mode that wants no fork, and inside the cooldown.
+    """
+    from tokentracker import cli
+    cfg = _limit_cfg()
+    d = dispatch.Dispatcher(cfg)
+    cli._ensure_throttle_task(cfg, d, NOW)
+    captured: list[list[str]] = []
+    restore = _stub_launcher(captured)
+    try:
+        d.current_mode = "pace"
+        d.launch(d.get(cli.THROTTLE_TASK_ID), NOW)
+        # The handover is not armed in this mode: the requeue stands, nothing
+        # starts, and the next tick's stale-pending check kills the row.
+        d.launch_gate = cli._fork_launch_gate(cfg, False, NOW + timedelta(minutes=1))
+        _die(d, cfg, cli.THROTTLE_TASK_ID,
+             {"is_error": True, "result": "You've hit your usage limit"},
+             NOW + timedelta(minutes=1), decision=PACE)
+        assert d.get(cli.THROTTLE_TASK_ID).status == "pending"
+        assert len(captured) == 1, captured
+        # Armed again, but the cooldown since that exit has not elapsed.
+        d.launch_gate = cli._fork_launch_gate(cfg, True, NOW + timedelta(minutes=1))
+        d.apply(PACE, NOW + timedelta(minutes=1))
+        assert len(captured) == 1, captured
+        # Past the cooldown it goes, on the executive tier's fallback.
+        d.launch_gate = cli._fork_launch_gate(cfg, True, NOW + timedelta(minutes=9))
+        d.apply(PACE, NOW + timedelta(minutes=9))
+        assert len(captured) == 2, captured
+        argv = captured[1]
+        assert argv[argv.index("--model") + 1] == "claude-fable-5", argv
+    finally:
+        restore()
+
+
+def test_fork_falls_back_on_the_executive_tier():
+    from tokentracker import cli, graph as G, handover
+    cfg = _limit_cfg()
+    cfg.throttle_prompt = "director brief"
+    d = dispatch.Dispatcher(cfg)
+    cli._ensure_throttle_task(cfg, d, NOW)
+    task = d.get(cli.THROTTLE_TASK_ID)
+    captured: list[list[str]] = []
+    restore = _stub_launcher(captured)
+    try:
+        d.current_mode = "pace"
+        d.launch(task, NOW)
+        assert handover.read_handover(cfg)["model"] == "claude-fable-5-1"
+        actions = _die(d, cfg, cli.THROTTLE_TASK_ID, {
+            "is_error": True, "result": "You've hit your usage limit"},
+            NOW + timedelta(minutes=1), decision=PACE)
+        assert G.limited_model(cfg) == "claude-fable-5-1", actions
+        argv = captured[1]
+        assert argv[argv.index("--model") + 1] == "claude-fable-5", argv
+        assert argv[argv.index("--resume") + 1] == MAIN_ID, argv
+        # The handover the monitor session reads names the model that RAN.
+        record = handover.read_handover(cfg)
+        assert record["status"] == "started" and record["model"] == "claude-fable-5"
+        assert task.model_used == "claude-fable-5", task
+    finally:
+        restore()
+
+
+def test_overlay_ladder_shows_fallbacks_and_limited_tags():
+    import inspect
+    try:
+        import tkinter  # noqa: F401  - absent on headless builds
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    ladder = inspect.getsource(overlay.Overlay._draw_graph_ladder)
+    # The fallback rides in the rung's own text line, dimmed after the model.
+    assert 'f"->{short_model(fallback)}"' in ladder, ladder
+    assert "fill=DIM" in ladder and 'f"fallback_{tier}"' in ladder, ladder
+    # The LIMITED tag takes its width out of the model column, so it can never
+    # land on top of the model id or the count.
+    assert '"LIMITED"' in ladder and 'f"limited_{tier}"' in ladder, ladder
+    assert "right -= self._font_small.measure(tag)" in ladder, ladder
+    assert "P = self._px" in ladder and "self._pxf(" in ladder, ladder
+    # Both are read fresh every refresh, like the graph itself.
+    refresh = inspect.getsource(overlay.Overlay._refresh)
+    assert "limited_model(self.cfg)" in refresh, refresh
+    # The ladder is no taller for either of them.
+    height = inspect.getsource(overlay.Overlay._ladder_height)
+    assert "3 * P(LADDER_RUNG_H)" in height, height
 
 
 # -------------------------------------------------------------- the ledger

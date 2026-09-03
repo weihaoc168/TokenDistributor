@@ -127,6 +127,28 @@ def _fork_wanted(cfg: Config, mode: str, control: str, throttle: bool) -> bool:
     return True if throttle else bool(getattr(cfg, "fork_in_pace", True))
 
 
+def _fork_launch_gate(cfg: Config, fork_wanted: bool, now):
+    """The gate the dispatcher asks before it starts a pending row.
+
+    Only the director fork is ever held. A fallback requeue is written inside
+    `dispatcher.apply()`, i.e. *after* this tick already decided whether the
+    handover is armed, so without this a fork that died on a usage limit would
+    be started again in a mode that wants no fork at all - and inside the
+    re-arm cooldown that exists to stop exactly that kind of relaunch storm.
+    Everything else is the decision's own business (target_concurrency and
+    allow_heavy already gate it), so the gate says nothing about it.
+    """
+    def gate(task: TaskSpec) -> str | None:
+        if task.id != THROTTLE_TASK_ID:
+            return None
+        if not fork_wanted:
+            return "fork not armed in this mode"
+        if not _rearm_ready(cfg, task, now):
+            return "fork re-arm cooldown has not elapsed"
+        return None
+    return gate
+
+
 def _ensure_throttle_task(cfg: Config, dispatcher: Dispatcher, now=None) -> None:
     # With forking disabled, full throttle still surges queued workers but the
     # executive continuation runs inside the main session itself (its agent
@@ -298,7 +320,12 @@ def _tick(
     # The handover is armed in normal pace mode too, not only under full
     # throttle: the fork is the acting director for as long as the loop is
     # dispatching at all. read_stop is current here - apply_goal_stop ran above.
-    if _fork_wanted(cfg, decision.mode, control, throttle):
+    fork_wanted = _fork_wanted(cfg, decision.mode, control, throttle)
+    # apply() below may requeue the fork onto its tier's fallback (a limit
+    # exit), which happens after this decision is made; the gate carries the
+    # decision into the launch batch so that requeue obeys it too.
+    dispatcher.launch_gate = _fork_launch_gate(cfg, fork_wanted, now)
+    if fork_wanted:
         _ensure_throttle_task(cfg, dispatcher, now)
     else:
         stale_task = dispatcher.get(THROTTLE_TASK_ID)
@@ -397,8 +424,9 @@ def _run_loop(cfg: Config, once: bool) -> int:
     ignored = override_warning(cfg)
     if ignored:
         print(ignored)
-    # A warning, not a refusal: an unknown id is usually a new model.
-    for warning in validate_graph(graph, known_models(cfg)):
+    # A warning, not a refusal: an unknown id is usually a new model, and a
+    # graph that breaks the superiority rule still has to run.
+    for warning in validate_graph(graph, known_models(cfg), cfg):
         print(warning)
     next_fetch_ts = 0.0
     backoff = 0.0
@@ -570,12 +598,22 @@ def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_graph(cfg: Config, assignments: list[str] | None) -> int:
-    """Print the agentic graph, or set tiers from `tier.field=value` pairs."""
+def cmd_graph(cfg: Config, assignments: list[str] | None,
+              force: bool = False) -> int:
+    """Print the agentic graph, or set tiers from `tier.field=value` pairs.
+
+    A `set` that would break the superiority rule (executive >= advisory >=
+    workers, and no fallback above its own primary) is refused: printing the
+    graph warns about a violation that is already on disk, but there is no
+    reason to *write* one by accident. `--force` says it was not an accident.
+    """
     from .graph import (
+        ORDER_RULE,
         format_tiers,
         graph_line,
         known_models,
+        normalize,
+        order_warnings,
         override_warning,
         parse_assignments,
         read_graph_source,
@@ -594,6 +632,20 @@ def cmd_graph(cfg: Config, assignments: list[str] | None) -> int:
             print(f"error: {error}")
         if errors:
             return 1
+        # Only what THIS assignment breaks. A violation already standing on
+        # disk (set with --force, or hand-edited into config.json) used to
+        # refuse every later set, including `graph set workers.count=20` -
+        # which breaks no order at all - and left the operator with no way
+        # back except another --force.
+        standing = set(order_warnings(graph, cfg))
+        violations = [w for w in order_warnings(normalize(patch, graph), cfg)
+                      if w not in standing]
+        if violations and not force:
+            for warning in violations:
+                print(f"error: {warning.removeprefix('warning: ')}")
+            print(ORDER_RULE)
+            print("refusing to break the order; pass --force to set it anyway")
+            return 1
         write_graph(cfg, patch)
         graph, source = read_graph_source(cfg)
     print(f"agentic graph (source: {source})")
@@ -603,7 +655,7 @@ def cmd_graph(cfg: Config, assignments: list[str] | None) -> int:
         print(ignored)
     for line in format_tiers(graph):
         print(line)
-    for warning in validate_graph(graph, known_models(cfg)):
+    for warning in validate_graph(graph, known_models(cfg), cfg):
         print(warning)
     print(f"fork prompt line: {graph_line(graph)}")
     return 0
@@ -717,7 +769,11 @@ def main(argv: list[str] | None = None) -> int:
     graph_p.add_argument("action", nargs="?", choices=("set",), default=None,
                          help="'set' to assign tiers; omit to print the graph")
     graph_p.add_argument("assignments", nargs="*", metavar="tier.field=value",
-                         help="e.g. workers.count=20 advisory.model=claude-opus-5")
+                         help="e.g. workers.count=20 advisory.model=claude-opus-5 "
+                              "executive.fallback=claude-fable-5")
+    graph_p.add_argument("--force", action="store_true",
+                         help="set an assignment that breaks the superiority "
+                              "rule (executive >= advisory >= workers)")
 
     price_p = sub.add_parser(
         "pricing", help="show or set the per-model list prices the report bills at")
@@ -760,7 +816,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.action != "set" and args.assignments:
                 print("error: use 'graph set tier.field=value'")
                 return 1
-            return cmd_graph(cfg, args.assignments if args.action == "set" else None)
+            return cmd_graph(cfg, args.assignments if args.action == "set" else None,
+                             force=bool(getattr(args, "force", False)))
         if args.cmd == "pricing":
             if args.action != "set" and args.assignments:
                 print("error: use 'pricing set model.field=usd'")

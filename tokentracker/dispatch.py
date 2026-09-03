@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -10,6 +11,16 @@ from datetime import datetime
 from typing import IO
 
 from .config import Config
+from .graph import (
+    EXECUTIVE,
+    WORKERS,
+    clear_limited,
+    limited_model,
+    may_fall_back,
+    read_graph,
+    read_limited,
+    write_limited,
+)
 from .handover import (
     FORK_FALLBACK_MODEL,
     FORK_MODES,
@@ -20,6 +31,40 @@ from .handover import (
 from .models import Decision, QueueStats, TaskSpec, parse_iso, utcnow
 
 LOCAL_HEALTH_TIMEOUT = 4.0
+# "the model is busy", not "the task is wrong": a 529, an overload, or any of
+# the limit wordings the CLI prints when the account, the session or the
+# five-hour window is out of room. Matched against the `claude -p` result JSON
+# and the run's stderr; 529 needs digit boundaries so a token count or a task
+# id carrying those three digits is not read as a status code.
+LIMIT_PATTERN = re.compile(
+    r"(?<!\d)529(?!\d)"
+    r"|overloaded"
+    r"|rate[ _-]?limit"
+    r"|session limit"
+    r"|usage limit"
+    r"|hit your",
+    re.IGNORECASE,
+)
+# How much of a stderr file is worth reading back: the limit wording is in the
+# last few lines, and these files can hold a whole session's chatter.
+ERR_TAIL_BYTES = 8000
+
+
+def limited_reason(text: object) -> str | None:
+    """The marker saying the *model* was the problem, or None. Never raises."""
+    match = LIMIT_PATTERN.search(str(text or ""))
+    return match.group(0).lower() if match else None
+
+
+def task_tier(task: TaskSpec) -> str:
+    """Which tier of the agentic graph a task row belongs to.
+
+    Only two of the three can own a row: the director fork is the executive,
+    everything else the loop launches is a worker lane. The advisory tier runs
+    as review lenses *inside* the fork's own workflows, so it never has a row
+    here - which is also why its fallback is carried in the fork's prompt.
+    """
+    return EXECUTIVE if task.id == FORK_TASK_ID else WORKERS
 _PROCESS_QUERY = 0x00101000
 _WAIT_TIMEOUT = 0x102
 
@@ -96,10 +141,19 @@ class Dispatcher:
         self._local_start_ts: float | None = None
         self.local_engine_healthy: bool | None = None
         self._adopted: dict[str, int] = {}
+        # task id -> the limit wording its last exit carried; drained by reap
+        # (never inside _finalize_record, which runs while the finished process
+        # is still in self._procs and would have its relaunch deleted again).
+        self._pending_fallback: dict[str, str] = {}
         # Mode of the decision currently being applied; the handover record has
         # to say whether the director fork was launched in pace or under full
         # throttle, and apply() is the only place that knows.
         self.current_mode: str | None = None
+        # Set by the run loop each tick: (task) -> a reason to hold this row
+        # back, or None to let it start. The fork's re-arm cooldown and
+        # `_fork_wanted` live in cli, not here, and a fallback requeue has to
+        # obey them exactly like a fresh arm does. None = no gate (CLI use).
+        self.launch_gate = None
         self.load()
         if not supervise:
             return
@@ -184,6 +238,12 @@ class Dispatcher:
         if status == "pending":
             task.error = None
             task.pid = None
+            # A requeue is a fresh attempt: it gets its own one relaunch, and
+            # the forced fallback is dropped so the primary is tried again -
+            # `_while_limited` still routes it to the fallback for as long as
+            # the mark stands, which is a detour rather than a demotion.
+            task.fallback_from = None
+            task.fallback_model = None
         self.save()
 
     def queue_stats(self) -> QueueStats:
@@ -216,6 +276,7 @@ class Dispatcher:
         # the exit code is unknowable, so judge by the output file alone.
         out_path = self.cfg.logs_dir / f"{task.id}.out.json"
         result: dict = {}
+        text = ""
         try:
             text = out_path.read_text(encoding="utf-8", errors="replace")
             start = text.find("{")
@@ -247,6 +308,22 @@ class Dispatcher:
             task.status = "failed"
             task.error = str(result.get("result", ""))[:200] or f"exit code {exit_code}"
 
+        # The same exit, read a second way: was it the task that failed, or the
+        # model that was unavailable? Only the second earns a fallback.
+        self._pending_fallback.pop(task.id, None)
+        if task.status == "done":
+            # The model that just finished answered fine, so if it was the one
+            # marked limited the tier stops being demoted now rather than when
+            # fallback_minutes runs out. Only ever for a run whose model is
+            # known: an adopted row from a prior loop must not clear a mark
+            # that was made for some other model.
+            if task.model_used:
+                clear_limited(self.cfg, task.model_used)
+        else:
+            reason = limited_reason(self._failure_text(task, text))
+            if reason:
+                self._pending_fallback[task.id] = reason
+
         self._note_fork_finish(task, now, tokens=tokens, cost_usd=task.cost_usd,
                                fork_session_id=result.get("session_id"))
 
@@ -263,6 +340,93 @@ class Dispatcher:
                 pass
         lane = " local" if task.lane == "local" else ""
         return f"task {task.id}: {task.status}{lane} ({tokens} tokens, {minutes:.1f} min)"
+
+    def _failure_text(self, task: TaskSpec, out_text: str = "") -> str:
+        """Everything this exit said, for the limit classifier to read.
+
+        The result JSON is the usual carrier ("Overloaded", "You've hit your
+        usage limit"), but a 529 that killed the CLI before it printed any
+        JSON only ever shows up on stderr, so both are read.
+        """
+        parts = [str(task.error or ""), out_text[-ERR_TAIL_BYTES:]]
+        try:
+            err = (self.cfg.logs_dir / f"{task.id}.err.txt").read_text(
+                encoding="utf-8", errors="replace")
+            parts.append(err[-ERR_TAIL_BYTES:])
+        except OSError:
+            pass
+        return "\n".join(parts)
+
+    def _fallback_relaunch(self, task: TaskSpec, now: datetime) -> str | None:
+        """Requeue `task` onto its tier's fallback after a limit exit, or say why not.
+
+        Two very different exits arrive here and confusing them is what broke
+        the mark's whole purpose:
+
+          * the tier's PRIMARY died. Mark it limited and requeue this row with
+            the fallback forced for its next launch.
+          * the row's FALLBACK died. The primary's record must survive
+            untouched - it is the only thing holding the tier off the primary,
+            and overwriting it with the fallback's id sent the very next launch
+            straight back into the model the account refused minutes ago. No
+            second hop either: walking the ladder is how a tier ends up on a
+            model nobody chose.
+
+        Requeue, not launch: the row goes back to `pending` and the same
+        `apply()` tick's `_launch_batch` starts it, under the decision's
+        `target_concurrency` and `allow_heavy` and behind `launch_gate`. A
+        direct `self.launch` here bypassed operator STOP, the weekly-goal stop,
+        the blocked mode (which is exactly the state a "usage limit" exit
+        arrives in) and, for the fork, the re-arm cooldown.
+
+        Called from reap once the finished process is out of `_procs`.
+        """
+        reason = self._pending_fallback.pop(task.id, None)
+        if reason is None:
+            return None
+        tier = task_tier(task)
+        primary = self._primary_model(task, task.lane or "cloud") or ""
+        # What this exit actually ran on. `model_used` is stamped by launch, so
+        # it is the truth even when the graph moved underneath the row.
+        failed_on = task.model_used or primary
+        fallback = read_graph(self.cfg)[tier].get("fallback")
+
+        if primary and failed_on and failed_on != primary:
+            # Not the primary: leave the primary's mark exactly as it stands
+            # (expiring on its own schedule) and leave this row failed.
+            label = "fallback" if failed_on == fallback else "model"
+            held = (f"; {primary} keeps its mark"
+                    if limited_model(self.cfg, now) == primary else "")
+            return (f"task {task.id}: {tier} {label} {failed_on} also limited "
+                    f"({reason}){held}; leaving it failed")
+        if primary:
+            write_limited(self.cfg, primary, reason, now)
+        if task.fallback_from:
+            # Already had the one relaunch this row gets.
+            return (f"task {task.id}: fallback {failed_on} also limited "
+                    f"({reason}); leaving it failed")
+        if not fallback:
+            return (f"task {task.id}: {primary} limited ({reason}); "
+                    f"no {tier} fallback configured")
+        if fallback == failed_on or fallback == primary:
+            # `may_fall_back` allows equal ranks (two ids of the same
+            # capability), so it does not catch a tier whose fallback IS its
+            # primary; relaunching there is a relaunch onto the limited model.
+            return (f"task {task.id}: {primary} limited ({reason}); the {tier} "
+                    f"fallback is the same model, leaving it failed")
+        if not may_fall_back(primary, fallback, self.cfg):
+            # Never upward: a worker whose model is busy waits, it does not get
+            # promoted onto the executive's.
+            return (f"task {task.id}: {primary} limited ({reason}); refusing "
+                    f"to fall back UP to {tier} fallback {fallback}")
+        task.fallback_from = primary
+        task.fallback_model = fallback
+        task.status = "pending"
+        task.error = None
+        task.pid = None
+        self.save()
+        return (f"task {task.id}: {primary} limited ({reason}); requeued on "
+                f"{tier} fallback {fallback}")
 
     def _note_fork_finish(self, task: TaskSpec, now: datetime,
                           tokens: int | None = None,
@@ -297,7 +461,13 @@ class Dispatcher:
                 continue
             if proc.popen.poll() is not None:
                 actions.append(self._finalize(task, proc, now))
+                # Out of _procs *before* the fallback relaunch: the relaunch
+                # puts a new entry under the same id, and deleting after it
+                # would drop the live process this loop just started.
                 del self._procs[task_id]
+                note = self._fallback_relaunch(task, now)
+                if note:
+                    actions.append(note)
                 continue
             started = parse_iso(task.started_at)
             limit_minutes = task.max_minutes * (
@@ -323,6 +493,9 @@ class Dispatcher:
                 del self._adopted[task_id]
                 actions.append(
                     self._finalize_record(task, None, now) + " [adopted]")
+                note = self._fallback_relaunch(task, now)
+                if note:
+                    actions.append(note)
                 continue
             started = parse_iso(task.started_at)
             limit_minutes = task.max_minutes * (
@@ -388,8 +561,12 @@ class Dispatcher:
         task.status = "running"
         task.lane = lane
         task.started_at = now.isoformat()
+        task.finished_at = None
         task.pid = popen.pid
         task.error = None
+        # What this run actually went out on: `task.model` is the intent, and
+        # the two differ whenever the tier is on its fallback.
+        task.model_used = self._task_model(task, lane)
         self._procs[task.id] = _Proc(popen, out, err)
         self.save()
         if task.id == FORK_TASK_ID:
@@ -406,16 +583,58 @@ class Dispatcher:
         suffix = f" -> {self.cfg.local_model}" if lane == "local" else ""
         return f"task {task.id}: launched {lane}{suffix} ({task.weight}, pid {popen.pid})"
 
-    def _task_model(self, task: TaskSpec, lane: str) -> str | None:
+    def _primary_model(self, task: TaskSpec, lane: str) -> str | None:
+        """The model this row *wants*, before any limited-mark detour.
+
+        Its own `model` first, then its tier's model straight out of the graph.
+        The graph rather than only `cfg.throttle_model`/`cfg.worker_model`
+        because those scalars are re-synced by `apply_graph` (once a poll in
+        the loop, never in a bare CLI Dispatcher), and a stale one here would
+        make `_fallback_relaunch` mark the wrong model limited.
+        """
         if lane == "local":
             return self.cfg.local_model
+        if task.model:
+            return task.model
+        tier_model = str(read_graph(self.cfg)[task_tier(task)].get("model") or "")
         if task.id == FORK_TASK_ID:
             # Never None for the director fork: a model-less launch silently
             # drops it onto the account default (a Fable model), which is
             # exactly what this fork exists not to be.
-            return (task.model or self.cfg.throttle_model
+            return (tier_model or self.cfg.throttle_model
                     or self.cfg.worker_model or FORK_FALLBACK_MODEL)
-        return task.model or self.cfg.worker_model or None
+        return tier_model or self.cfg.worker_model or None
+
+    def _task_model(self, task: TaskSpec, lane: str) -> str | None:
+        if lane == "local":
+            return self.cfg.local_model
+        primary = self._primary_model(task, lane)
+        forced = task.fallback_model
+        if (forced and forced != primary
+                and may_fall_back(primary, forced, self.cfg)):
+            # The one forced launch a limited primary buys this row. Re-checked
+            # against the ranking every time, so a graph edited between the
+            # requeue and the launch can never turn it into a promotion.
+            return forced
+        return self._while_limited(task, primary)
+
+    def _while_limited(self, task: TaskSpec, primary: str | None) -> str | None:
+        """`primary`, or the tier's fallback while state/limited.json names it.
+
+        This is what stops the loop from spending the next poll - and the one
+        after that - relaunching onto a model the account has already been told
+        it cannot have. Once the record ages past `fallback_minutes`
+        `read_limited` returns None again and the primary gets another try.
+        """
+        if not primary:
+            return primary
+        record = read_limited(self.cfg)
+        if record is None or record.get("model") != primary:
+            return primary
+        fallback = read_graph(self.cfg)[task_tier(task)].get("fallback")
+        if not may_fall_back(primary, fallback, self.cfg):
+            return primary
+        return fallback
 
     def _task_prompt(self, task: TaskSpec, lane: str) -> str:
         prompt = task.prompt
@@ -501,6 +720,11 @@ class Dispatcher:
         for task in candidates:
             if running >= target:
                 break
+            if self.launch_gate is not None and self.launch_gate(task):
+                # Held back, not failed: the row stays pending and the gate is
+                # asked again next poll. Silent on purpose - a fork waiting out
+                # its cooldown would otherwise write a line every poll.
+                continue
             try:
                 actions.append(self.launch(task, now, lane=lane))
                 running += 1
@@ -509,6 +733,17 @@ class Dispatcher:
                 task.error = str(exc)[:200]
                 self.save()
                 actions.append(f"task {task.id}: launch failed ({exc})")
+                # A launch that never started can still have failed *because*
+                # the model was unavailable; classify it the same way.
+                reason = limited_reason(exc)
+                if reason:
+                    self._pending_fallback[task.id] = reason
+                    # Requeues rather than launching, so the retry happens on
+                    # the next poll under a fresh decision - this batch is
+                    # already past this row.
+                    note = self._fallback_relaunch(task, now)
+                    if note:
+                        actions.append(note)
 
     def apply(self, decision: Decision, now: datetime) -> list[str]:
         self.current_mode = decision.mode

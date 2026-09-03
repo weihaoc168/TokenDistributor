@@ -15,10 +15,11 @@ The overlay: three rings (5-hour, weekly with the gear mascot and an amber goal 
 - **Surges on FULL THROTTLE.** The amber button writes `state/throttle.json`, overriding pacing to spend the remaining weekly budget on the project's highest-value work until the weekly limit itself stops it.
 - **Falls back to a local lane.** While `blocked`, queued tasks are re-dispatched to a local FreeToken engine (Qwen on the 5090) that burns zero cloud budget. A GPU guard refuses to auto-start the engine while a listed process (the Unreal editor, a game) owns the card, since the engine pins about 31.5 GB of it.
 - **Runs a configured agentic graph.** `config.json`'s `graph` names the model and headcount at each tier (executive, advisory, workers); the legacy `worker_model` / `max_concurrency` keys are derived from it, the fork brief is handed the same line through its `{graph}` placeholder, and `state/graph.json` (the overlay's `-` / `+`) overrides it without touching the config.
+- **Keeps the tiers in capability order, with a fallback under each.** The executive makes the crucial calls and the advisory lenses judge the work, so the graph must read `executive >= advisory >= workers` on `MODEL_RANK` (Fable 5.1 > Fable 5 > Opus 5 > Opus 4.8 > Sonnet 5 > Haiku 4.5 > the local model); a violation is a warning everywhere it is printed, and `tracker.py graph set` refuses to write a **new** one without `--force` (a violation already standing on disk is reprinted, not re-refused, so a later `workers.count=20` still goes through). Each tier also names a `fallback` (Fable 5 for the executive and advisory, Opus 4.8 for the workers): when a launch dies on a 529, an overload, or a rate / session / usage limit, the dispatcher marks `state/limited.json`, requeues that one task with the tier's fallback forced for its next launch, and keeps new launches for that tier on the fallback for `fallback_minutes` before trying the primary again. The requeue is a queue entry, not a launch, so it still passes the tick's concurrency budget, STOP and the fork's re-arm gate. When the **fallback** is the one that dies, the primary's mark is left exactly as it stands and the row stays failed: overwriting it with the fallback's id would send the next launch straight back into the model the account just refused. It never falls back **upward** - a worker never lands on the executive's model - and the row records the model that actually ran (`model_used`) while `model` keeps holding what the row asked for.
 - **Reports where the work went.** It parses the session, fork and Workflow-agent transcripts for a window, splits every turn by tier (by model id, or by transcript role when the graph names one model at every tier) and by what it did (DECIDE / DELEGATE / READ / AUTHOR / OPS), and writes `reports/latest.html`: a page whose verdict says whether the executive tier stayed executive-only (the 60% hands-on rule). It runs itself when a fork finishes a milestone and when dispatch stops, and on demand from the CLI or the overlay's **VIEW REPORT**.
 - **Prices that work in dollars.** `config.json`'s `pricing` block carries each model's published list price (input / output / cache write 5m / cache write 1h / cache read, USD per 1M tokens) with the source URL and the date it was read, and the report's **What it cost** section bills the window's own usage records at it: total USD, a stacked bar per model of the five components, by tier, by lane role, per hour, and the cost between consecutive commits. A model with no published price is shown as `unpriced` and named in a caveat, never billed at a guessed rate; the local FreeToken lane is priced at 0. `state/pricing.json` (`tracker.py pricing set`) overrides one field at a time without touching the config.
 - **Bills both cache-write durations.** `usage.cache_creation` splits every creation figure into 5-minute and 1-hour writes, and the published table charges the 1-hour ones at 2&times; base input against the 5-minute ones' 1.25&times;. So the price table carries both numbers and `cost_usd` has five terms, not four. On this machine's traffic the 1-hour share runs 10-40% of creation per model, which a single-rate formula would quietly understate by about 3.5% of the total and by the same bias in every cut below it.
-- **Draws that graph as a ladder chart.** The panel's **AGENTIC GRAPH** block is one rung per tier, executive over advisory over workers, each a bar as wide as its headcount and hung off a spine on the left, with the tier, the short model id and `xN` in aligned columns; the worker rung is the emphasis and carries its surge budget as a ghost extension, and its `-` / `+` still write `state/graph.json`.
+- **Draws that graph as a ladder chart.** The panel's **AGENTIC GRAPH** block is one rung per tier, executive over advisory over workers, each a bar as wide as its headcount and hung off a spine on the left, with the tier, the short model id and `xN` in aligned columns; the worker rung is the emphasis and carries its surge budget as a ghost extension, and its `-` / `+` still write `state/graph.json`. Each rung also carries its tier's fallback dimmed after the model (`fable-5-1 ->fable-5`) and a red **LIMITED** tag while `state/limited.json` names that rung's primary.
 - **Shows an always-on-top overlay.** A Tk card docked near the Sundial widget, refreshed every few seconds, with minimize (collapse to a bar) and close buttons and its own live session, distribution, graph, goal, control, and report rows.
 
 ## Setup
@@ -37,8 +38,9 @@ The keys in `config.json` that matter most, with this machine's current values:
 
 | Key | Current value | Meaning |
 |---|---|---|
-| `graph` | opus-5: E x1, A x3, W x10/20 | the agentic graph; `worker_model`, `throttle_model`, `max_concurrency` and `surge_concurrency` are derived from it (`state/graph.json` overrides) |
-| `known_models` | five `claude-*` ids | allow-list for graph model ids; an unknown id warns, it never refuses |
+| `graph` | E fable-5.1 x1, A fable-5.1 x3, W opus-5 x10/20, each with a `fallback` | the agentic graph; `worker_model`, `throttle_model`, `max_concurrency` and `surge_concurrency` are derived from it (`state/graph.json` overrides) |
+| `fallback_minutes` | `30` | how long `state/limited.json` keeps a tier on its fallback before the primary is tried again |
+| `known_models` | six `claude-*` ids | allow-list for graph model and fallback ids; an unknown id warns, it never refuses |
 | `pricing` | list prices for the five `claude-*` ids + the local model | USD per 1M tokens per model: `input`, `output`, `cache_write` (5m), `cache_write_1h`, `cache_read`, each row with its `source` and `checked` date (`state/pricing.json` overrides). A model missing here, or missing any one of the five, reports as `unpriced` |
 | `pricing_default` | `null` | price for a model the table does not name; null on purpose, so nothing is billed at a stand-in rate |
 | `report_repo` | `C:/Users/chenw/StarGTA` | repo watched for the fork-milestone report trigger |
@@ -57,8 +59,9 @@ py  -3.13 tracker.py run                 # start the control loop (leave running
 pyw -3.13 tracker.py overlay             # open the always-on-top panel
 py  -3.13 tracker.py goal 85             # set the weekly goal (0.85, 85 or 85% all mean 85%)
 py  -3.13 tracker.py status              # live rings, pacing, queue
-py  -3.13 tracker.py graph               # print the executive / advisory / worker tiers
-py  -3.13 tracker.py graph set workers.count=20 advisory.model=claude-opus-5
+py  -3.13 tracker.py graph               # print the tiers, their fallbacks and the order warnings
+py  -3.13 tracker.py graph set workers.count=20 workers.fallback=claude-opus-4-8
+py  -3.13 tracker.py graph set --force advisory.model=claude-sonnet-5   # only way past the order rule
 py  -3.13 tracker.py pricing             # print the per-model list prices the report bills at
 py  -3.13 tracker.py pricing set claude-opus-5.output=25 claude-opus-5.checked=2026-09-03
 py  -3.13 tracker.py pricing set claude-opus-5.cache_write_1h=10   # 1-hour writes bill at 2x base input
@@ -80,6 +83,7 @@ State files under `state/`:
 | `stop.json` | written once the weekly goal is reached, the main session's stop point |
 | `throttle.json` | the FULL THROTTLE flag (`{"active": ...}`) |
 | `graph.json` | per-user agentic-graph override the ladder chart's `-` / `+` writes; a patch, so only the fields set here stop following `config.json` |
+| `limited.json` | `{model, since, reason}` for the model a launch last failed on with a 529 or a limit; expires after `fallback_minutes`, and is cleared as soon as that model completes a run |
 | `pricing.json` | per-user price override `tracker.py pricing set` writes; a patch, so only the fields set here stop following `config.json` |
 | `report.json` | the last work-distribution report: path, reason, window |
 | `overlay.json` | the overlay's collapsed / expanded state |

@@ -18,6 +18,7 @@ from .graph import (
     COUNT_MIN,
     TIERS,
     WORKERS,
+    limited_model,
     read_graph,
     short_model,
     tiers_of,
@@ -97,6 +98,11 @@ LADDER_BAND_H = 4
 LADDER_BAR_MIN = 10
 LADDER_BAR_RADIUS = 2
 LADDER_TEXT_PAD = 6
+# The dimmed "->fallback" after a rung's model, and the red LIMITED tag beside
+# its count, both live inside the rung's existing text line - the ladder's
+# height is unchanged. Narrower than this and the fallback label is dropped
+# rather than ellipsised.
+LADDER_FALLBACK_MIN_W = 26
 # The -/+ taps on the worker count, in a gutter every rung reserves so the
 # "xN" column lands on the same x down all three.
 LADDER_STEP_W = 17
@@ -433,6 +439,7 @@ class Overlay:
         self._stop = read_stop(cfg)
         self._fork = fork_active(cfg)
         self._graph = read_graph(cfg)
+        self._limited = limited_model(cfg)
         self._report = latest_report(cfg)
         self._report_age = report_age(cfg)
         self._after_id: str | None = None
@@ -937,13 +944,45 @@ class Overlay:
             # tier name, which is wider at some DPIs than at others.
             left = name_x + self._font_small.measure(name)
             right = num_x - self._font_bold.measure(counts)
-            model_x = max(bar_x + (num_x - bar_x) / 2, left + P(LADDER_TEXT_PAD))
+            # "LIMITED" takes its space out of the model column rather than
+            # overprinting it: the model label below is fitted to what is left.
+            limited = bool(self._limited and self._limited == block["model"])
+            if limited:
+                tag = "LIMITED"
+                self.canvas.create_text(right - P(4), mid, text=tag,
+                                        font=FONT_SMALL, fill=RED, anchor="e",
+                                        tags=("ladder", f"limited_{tier}"))
+                right -= self._font_small.measure(tag) + P(6)
+            # One shared column for all three model ids, so they can be read
+            # down the rungs the way the counts are - placed as far left as the
+            # longest tier name allows rather than at mid-span, because the
+            # dimmed "->fallback" that follows needs the width that buys.
+            label_w = max(self._font_small.measure(t.upper()) for t in TIERS)
+            model_x = min(bar_x + (num_x - bar_x) / 2,
+                          name_x + label_w + P(LADDER_TEXT_PAD))
+            model_x = max(model_x, left + P(LADDER_TEXT_PAD))
             model = self._fit(short_model(block["model"]), self._font_small,
                               (right - model_x) - P(LADDER_TEXT_PAD))
             self.canvas.create_text(model_x, mid, text=model, anchor="w",
                                     font=FONT_SMALL,
                                     fill=SILVER if is_workers else DIM,
                                     tags="ladder")
+            # The tier's fallback, dimmed, immediately after the primary: where
+            # this rung goes when its model is limited ("fable-5-1 ->fable-5").
+            fallback = block.get("fallback")
+            fb_x = model_x + self._font_small.measure(model) + P(4)
+            fb_room = right - fb_x - P(LADDER_TEXT_PAD)
+            # Dropped entirely rather than drawn as an ellipsis: a rung reading
+            # "fable-5-1 ->..." says less than one reading "fable-5-1". The
+            # threshold is measured, not assumed, so it holds at any DPI.
+            fb_min = max(self._font_small.measure("->xxxx"),
+                         P(LADDER_FALLBACK_MIN_W))
+            if fallback and fb_room >= fb_min:
+                fb = self._fit(f"->{short_model(fallback)}", self._font_small,
+                               fb_room)
+                self.canvas.create_text(fb_x, mid, text=fb, anchor="w",
+                                        font=FONT_SMALL, fill=DIM,
+                                        tags=("ladder", f"fallback_{tier}"))
 
             if is_workers:
                 for tag, label, bx0 in (("graph_minus", "-", x1 - gutter),
@@ -1120,6 +1159,9 @@ class Overlay:
         # The graph and the last report are both files another process writes
         # (the CLI, the loop's report thread), so they are re-read every pass.
         self._graph = read_graph(self.cfg)
+        # Which model the dispatcher has marked limited, if any: it expires on
+        # its own (fallback_minutes), so it is re-read rather than remembered.
+        self._limited = limited_model(self.cfg)
         self._report = latest_report(self.cfg)
         self._report_age = report_age(self.cfg)
         self.canvas.delete("all")
