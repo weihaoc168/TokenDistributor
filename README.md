@@ -4,7 +4,7 @@ Spend Claude Code's weekly token budget before it resets, without ever starving 
 
 <p align="center"><img src="docs/overlay.png" width="360" alt="TokenDistributor overlay"></p>
 
-The overlay: three rings (5-hour, weekly with the gear mascot and an amber goal tick, Fable), live sessions with the main session pinned, token distribution and the current mode, a `- GOAL 90% +` stepper row, START / STOP, and FULL THROTTLE.
+The overlay: three rings (5-hour, weekly with the gear mascot and an amber goal tick, Fable), live sessions with the main session pinned, token distribution and the current mode, an **AGENTIC GRAPH** ladder chart, a `- GOAL 90% +` stepper row, START / STOP, FULL THROTTLE, and VIEW REPORT / REPORT NOW.
 
 ## What it does
 
@@ -14,7 +14,10 @@ The overlay: three rings (5-hour, weekly with the gear mascot and an amber goal 
 - **Gates dispatch with START / STOP.** The overlay buttons write `state/control.json`; STOP zeroes every launch budget so nothing new starts, while already-running work keeps going and is still reaped.
 - **Surges on FULL THROTTLE.** The amber button writes `state/throttle.json`, overriding pacing to spend the remaining weekly budget on the project's highest-value work until the weekly limit itself stops it.
 - **Falls back to a local lane.** While `blocked`, queued tasks are re-dispatched to a local FreeToken engine (Qwen on the 5090) that burns zero cloud budget. A GPU guard refuses to auto-start the engine while a listed process (the Unreal editor, a game) owns the card, since the engine pins about 31.5 GB of it.
-- **Shows an always-on-top overlay.** A Tk card docked near the Sundial widget, refreshed every few seconds, with minimize (collapse to a bar) and close buttons and its own live session, distribution, goal, and control rows.
+- **Runs a configured agentic graph.** `config.json`'s `graph` names the model and headcount at each tier (executive, advisory, workers); the legacy `worker_model` / `max_concurrency` keys are derived from it, the fork brief is handed the same line through its `{graph}` placeholder, and `state/graph.json` (the overlay's `-` / `+`) overrides it without touching the config.
+- **Reports where the work went.** It parses the session, fork and Workflow-agent transcripts for a window, splits every turn by tier and by what it did (DECIDE / DELEGATE / READ / AUTHOR / OPS), and writes `reports/latest.html`: a page whose verdict says whether the executive tier stayed executive-only (the 60% hands-on rule). It runs itself when a fork finishes a milestone and when dispatch stops, and on demand from the CLI or the overlay's **VIEW REPORT**.
+- **Draws that graph as a ladder chart.** The panel's **AGENTIC GRAPH** block is one rung per tier, executive over advisory over workers, each a bar as wide as its headcount and hung off a spine on the left, with the tier, the short model id and `xN` in aligned columns; the worker rung is the emphasis and carries its surge budget as a ghost extension, and its `-` / `+` still write `state/graph.json`.
+- **Shows an always-on-top overlay.** A Tk card docked near the Sundial widget, refreshed every few seconds, with minimize (collapse to a bar) and close buttons and its own live session, distribution, graph, goal, control, and report rows.
 
 ## Setup
 
@@ -32,10 +35,9 @@ The keys in `config.json` that matter most, with this machine's current values:
 
 | Key | Current value | Meaning |
 |---|---|---|
-| `worker_model` | `claude-opus-5` | `--model` for dispatched cloud tasks |
-| `throttle_model` | `claude-opus-5` | model for the full-throttle main-session fork |
-| `max_concurrency` | `10` | parallel headless cloud sessions while pacing |
-| `surge_concurrency` | `20` | parallel sessions during surge / endgame |
+| `graph` | opus-5: E x1, A x3, W x10/20 | the agentic graph; `worker_model`, `throttle_model`, `max_concurrency` and `surge_concurrency` are derived from it (`state/graph.json` overrides) |
+| `known_models` | five `claude-*` ids | allow-list for graph model ids; an unknown id warns, it never refuses |
+| `report_repo` | `C:/Users/chenw/StarGTA` | repo watched for the fork-milestone report trigger |
 | `weekly_goal` | `0.9` | weekly utilization the week stops at (`state/goal.json` overrides) |
 | `local_enabled` | `true` | turn on the local FreeToken / Qwen lane |
 | `local_model` | `Qwen3.8-27B-NVFP4` | served model name for local dispatch |
@@ -51,6 +53,9 @@ py  -3.13 tracker.py run                 # start the control loop (leave running
 pyw -3.13 tracker.py overlay             # open the always-on-top panel
 py  -3.13 tracker.py goal 85             # set the weekly goal (0.85, 85 or 85% all mean 85%)
 py  -3.13 tracker.py status              # live rings, pacing, queue
+py  -3.13 tracker.py graph               # print the executive / advisory / worker tiers
+py  -3.13 tracker.py graph set workers.count=20 advisory.model=claude-opus-5
+py  -3.13 tracker.py report --open       # build the work-distribution page and open it
 
 # queue real work
 py  -3.13 tracker.py add --id my-task --prompt "..." --cwd C:\path\to\project --weight heavy --priority 5
@@ -67,13 +72,17 @@ State files under `state/`:
 | `goal.json` | per-user weekly-goal override the `- / +` steppers write |
 | `stop.json` | written once the weekly goal is reached, the main session's stop point |
 | `throttle.json` | the FULL THROTTLE flag (`{"active": ...}`) |
+| `graph.json` | per-user agentic-graph override the ladder chart's `-` / `+` writes |
+| `report.json` | the last work-distribution report: path, reason, window |
 | `overlay.json` | the overlay's collapsed / expanded state |
 | `history.jsonl` | the log of usage snapshots the pacer reads back |
+
+Reports land in `reports/`: `<UTC timestamp>-ledger.html`, the `<timestamp>-summary.json` it was built from, and `latest.html` (a copy of the newest, the one **VIEW REPORT** opens).
 
 ## Tests
 
 ```powershell
-py -3.13 tests/test_all.py               # 69/69
+py -3.13 tests/test_all.py               # 106/106
 ```
 
 ## Acknowledgements

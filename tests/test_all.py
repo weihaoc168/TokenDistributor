@@ -552,6 +552,15 @@ def test_local_prompt_preamble():
     cfg.local_prompt_preamble = "no GPU work"
     assert d._task_prompt(task, "local") == "no GPU work\n\nfix the bug"
     assert d._task_prompt(task, "cloud") == "fix the bug"
+    # The {graph} placeholder is expanded at launch, on both lanes, so a row
+    # queued before a graph change still goes out with the current counts.
+    from tokentracker import graph as graph_mod
+    cfg.max_concurrency = 12
+    task.prompt = "brief. {graph} end."
+    line = graph_mod.graph_line(graph_mod.read_graph(cfg))
+    assert "x12" in line, line
+    assert d._task_prompt(task, "cloud") == f"brief. {line} end."
+    assert d._task_prompt(task, "local").endswith(f"brief. {line} end.")
 
 
 def test_task_model_selection():
@@ -606,6 +615,355 @@ def test_throttle_task_respec_on_requeue():
     task = d.get(cli.THROTTLE_TASK_ID)
     assert task.status == "pending", task
     assert task.model == "claude-fable-5-1" and task.resume_session == MAIN_ID, task
+
+
+def _fork_cfg() -> Config:
+    cfg = _local_cfg()
+    cfg.main_session_ids = [MAIN_ID]
+    cfg.throttle_model = "claude-opus-5"
+    cfg.throttle_fork_enabled = True
+    cfg.fork_in_pace = True
+    cfg.throttle_prompt = "director brief"
+    return cfg
+
+
+def test_fork_wanted_in_pace_and_surge():
+    # The handover is armed in normal pace mode, not only under full throttle.
+    from tokentracker import cli, control
+    cfg = _fork_cfg()
+    for mode in ("pace", "surge"):
+        assert cli._fork_wanted(cfg, mode, control.RUNNING, False), mode
+        assert cli._fork_wanted(cfg, mode, control.RUNNING, True), mode
+    cfg.fork_in_pace = False
+    assert not cli._fork_wanted(cfg, "pace", control.RUNNING, False)
+    assert cli._fork_wanted(cfg, "surge", control.RUNNING, True)
+
+
+def test_fork_not_wanted_when_stopped_or_goal_reached():
+    from tokentracker import cli, control, goal
+    cfg = _fork_cfg()
+    assert not cli._fork_wanted(cfg, "pace", control.STOPPED, False)
+    assert not cli._fork_wanted(cfg, "surge", control.STOPPED, True)
+    goal.write_goal(cfg, 0.50)
+    goal.apply_goal_stop(cfg, 0.90, NOW)
+    assert cfg.stop_file.exists()
+    assert not cli._fork_wanted(cfg, "pace", control.RUNNING, False)
+    assert not cli._fork_wanted(cfg, "surge", control.RUNNING, True)
+    goal.clear_stop(cfg)
+    assert cli._fork_wanted(cfg, "pace", control.RUNNING, False)
+    cfg.throttle_fork_enabled = False
+    assert not cli._fork_wanted(cfg, "pace", control.RUNNING, False)
+    cfg.throttle_fork_enabled = True
+    cfg.main_session_ids = []
+    assert not cli._fork_wanted(cfg, "pace", control.RUNNING, False)
+
+
+def test_fork_not_wanted_in_blocked_yield_coast():
+    from tokentracker import cli, control
+    cfg = _fork_cfg()
+    for mode in ("blocked", "yield", "coast", "stopped"):
+        assert not cli._fork_wanted(cfg, mode, control.RUNNING, False), mode
+        assert not cli._fork_wanted(cfg, mode, control.RUNNING, True), mode
+
+
+def test_tick_ensures_fork_in_pace_and_retires_it_when_stopped():
+    from tokentracker import cli, control
+    cfg = _fork_cfg()
+    d, launched = _gate_dispatcher(cfg)
+    history = usage.UsageHistory(cfg)
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.2, left_h=100.0)
+    try:
+        decision, _a, _e, _s, _r = cli._tick(cfg, d, history)
+        assert decision.mode == "pace", decision
+        task = d.get(cli.THROTTLE_TASK_ID)
+        assert task is not None, d.tasks()
+        assert task.prompt == "director brief" and task.priority == 100, task
+        assert task.resume_session == MAIN_ID and task.model == "claude-opus-5", task
+        assert launched == [(cli.THROTTLE_TASK_ID, "cloud")], launched
+        # STOP retires a fork that has not launched yet, and arms nothing new.
+        d.set_status(cli.THROTTLE_TASK_ID, "pending")
+        control.write_control(cfg, control.STOPPED)
+        cli._tick(cfg, d, history)
+        assert d.get(cli.THROTTLE_TASK_ID).status == "killed", d.tasks()
+    finally:
+        usage.fetch_usage = real_fetch
+
+
+def test_fork_rearm_waits_for_cooldown():
+    from tokentracker import cli
+    cfg = _fork_cfg()
+    cfg.fork_cooldown_seconds = 120
+    d = dispatch.Dispatcher(cfg)
+    cli._ensure_throttle_task(cfg, d, NOW)
+    task = d.get(cli.THROTTLE_TASK_ID)
+    task.status = "failed"
+    task.finished_at = NOW.isoformat()
+    cli._ensure_throttle_task(cfg, d, NOW + timedelta(seconds=60))
+    assert d.get(cli.THROTTLE_TASK_ID).status == "failed"
+    cli._ensure_throttle_task(cfg, d, NOW + timedelta(seconds=121))
+    assert d.get(cli.THROTTLE_TASK_ID).status == "pending"
+    # A pending or running fork is never disturbed by a later tick.
+    d.get(cli.THROTTLE_TASK_ID).status = "running"
+    cli._ensure_throttle_task(cfg, d, NOW + timedelta(hours=1))
+    assert d.get(cli.THROTTLE_TASK_ID).status == "running"
+
+
+def test_fork_argv_never_launches_model_less():
+    from tokentracker import cli, handover
+    cfg = _fork_cfg()
+    d = dispatch.Dispatcher(cfg)
+    cli._ensure_throttle_task(cfg, d, NOW)
+    task = d.get(cli.THROTTLE_TASK_ID)
+    argv = d._argv(task, "cloud", "claude.exe")
+    assert argv[argv.index("--model") + 1] == "claude-opus-5", argv
+    assert argv[argv.index("--resume") + 1] == MAIN_ID, argv
+    assert "--fork-session" in argv, argv
+    # Every model source emptied: the fork still names one (the audited launch
+    # that went out with model=None must not be reachable again).
+    task.model = None
+    cfg.throttle_model = ""
+    cfg.worker_model = ""
+    assert d._task_model(task, "cloud") == handover.FORK_FALLBACK_MODEL
+    argv = d._argv(task, "cloud", "claude.exe")
+    assert argv[argv.index("--model") + 1] == handover.FORK_FALLBACK_MODEL, argv
+    # An ordinary worker keeps the old behaviour (no --model at all).
+    plain = TaskSpec(id="pod", prompt="p", cwd=str(cfg.root))
+    assert d._task_model(plain, "cloud") is None
+    assert "--model" not in d._argv(plain, "cloud", "claude.exe")
+
+
+def _fake_subprocess(capture: list) -> object:
+    """Stand-in for the subprocess module inside dispatch (no real process)."""
+    import io as _io
+    import subprocess as _sp
+
+    def fake_popen(cmd, **_kwargs):
+        capture.append(list(cmd))
+        return types.SimpleNamespace(pid=4242, stdin=_io.StringIO(),
+                                     returncode=None, poll=lambda: None)
+
+    return types.SimpleNamespace(
+        PIPE=_sp.PIPE, Popen=fake_popen,
+        CREATE_NEW_PROCESS_GROUP=getattr(_sp, "CREATE_NEW_PROCESS_GROUP", 0),
+        CREATE_NO_WINDOW=getattr(_sp, "CREATE_NO_WINDOW", 0))
+
+
+def test_fork_handover_written_on_launch_and_updated_on_finish():
+    from tokentracker import cli, handover
+    cfg = _fork_cfg()
+    d = dispatch.Dispatcher(cfg)
+    cli._ensure_throttle_task(cfg, d, NOW)
+    task = d.get(cli.THROTTLE_TASK_ID)
+    d.current_mode = "pace"
+    captured: list[list[str]] = []
+    real_sub, real_shutil = dispatch.subprocess, dispatch.shutil
+    dispatch.subprocess = _fake_subprocess(captured)
+    dispatch.shutil = types.SimpleNamespace(which=lambda _n: "C:/fake/claude.exe")
+    try:
+        line = d.launch(task, NOW)
+    finally:
+        dispatch.subprocess, dispatch.shutil = real_sub, real_shutil
+    assert "launched cloud" in line, line
+    argv = captured[0]
+    assert argv[argv.index("--model") + 1] == "claude-opus-5", argv
+    assert argv[argv.index("--resume") + 1] == MAIN_ID, argv
+    assert "--fork-session" in argv, argv
+
+    rec = handover.read_handover(cfg)
+    assert list(rec) == list(handover.START_KEYS), rec
+    assert rec["task_id"] == cli.THROTTLE_TASK_ID and rec["status"] == "started"
+    assert rec["mode"] == "pace" and rec["model"] == "claude-opus-5", rec
+    assert rec["parent_session"] == MAIN_ID and rec["fork_session_id"] is None
+    assert rec["started_at"] == NOW.isoformat(), rec
+    assert handover.fork_active(cfg)
+
+    (cfg.logs_dir / f"{task.id}.out.json").write_text(json.dumps({
+        "is_error": False, "total_cost_usd": 2.25, "session_id": "fork-sid-9",
+        "usage": {"input_tokens": 100, "output_tokens": 50,
+                  "cache_creation_input_tokens": 10}}), encoding="utf-8")
+    end = NOW + timedelta(minutes=5)
+    d._finalize_record(task, 0, end)
+    done = handover.read_handover(cfg)
+    assert set(done) == set(handover.HANDOVER_KEYS), done
+    assert done["status"] == "done" and done["tokens"] == 160, done
+    assert done["cost_usd"] == 2.25, done
+    assert done["fork_session_id"] == "fork-sid-9", done
+    assert done["finished_at"] == end.isoformat(), done
+    # The launch half is preserved in place, not rewritten.
+    assert done["mode"] == "pace" and done["started_at"] == NOW.isoformat(), done
+    assert not handover.fork_active(cfg)
+
+
+def test_fork_kill_paths_close_the_handover():
+    # Both timeout kills - the loop's own process and an adopted session from a
+    # previous loop - must close the record, or the monitor keeps reporting a
+    # director that was just killed.
+    from tokentracker import cli, handover
+    for adopted in (False, True):
+        cfg = _fork_cfg()
+        d = dispatch.Dispatcher(cfg)
+        cli._ensure_throttle_task(cfg, d, NOW)
+        task = d.get(cli.THROTTLE_TASK_ID)
+        task.status = "running"
+        task.started_at = (NOW - timedelta(hours=9)).isoformat()  # max 240 min
+        pid = __import__("os").getpid() if adopted else 999999
+        task.pid = pid
+        handover.write_handover(cfg, task_id=task.id, mode="surge",
+                                model="claude-opus-5", parent_session=MAIN_ID,
+                                started_at=task.started_at)
+        assert handover.fork_active(cfg)
+        killed: list[int] = []
+        d._kill_tree = killed.append
+        if adopted:
+            d._adopted[task.id] = pid
+        else:
+            out = open(cfg.logs_dir / "k.out", "w")
+            err = open(cfg.logs_dir / "k.err", "w")
+            fake = types.SimpleNamespace(pid=pid, returncode=None,
+                                         poll=lambda: None,
+                                         wait=lambda timeout=None: 0)
+            d._procs[task.id] = dispatch._Proc(fake, out, err)
+        actions = d.reap(NOW)
+        assert killed == [pid], (adopted, killed, actions)
+        assert d.get(cli.THROTTLE_TASK_ID).status == "killed", d.tasks()
+        rec = handover.read_handover(cfg)
+        assert set(rec) == set(handover.HANDOVER_KEYS), (adopted, rec)
+        assert rec["status"] == "failed", (adopted, rec)
+        assert rec["finished_at"] == NOW.isoformat(), (adopted, rec)
+        # The launch half survives the close.
+        assert rec["mode"] == "surge" and rec["model"] == "claude-opus-5", rec
+        assert not handover.fork_active(cfg), (adopted, rec)
+
+
+def test_orphaned_fork_closes_the_handover():
+    # Loop and fork die together (reboot): on restart the fork row is
+    # orphan-marked, and the handover has to close with it. Otherwise `status`
+    # and the overlay chip keep announcing a director that no longer exists -
+    # forever, if a stop point means the fork is never re-armed.
+    from tokentracker import cli, handover
+    from tokentracker.models import parse_iso
+    cfg = _fork_cfg()
+    started = (NOW - timedelta(hours=2)).isoformat()
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": handover.FORK_TASK_ID, "prompt": "p", "cwd": str(cfg.root),
+         "weight": "heavy", "status": "running", "pid": 999999,
+         "started_at": started},
+    ]}), encoding="utf-8")
+    handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                            model="claude-opus-5", parent_session=MAIN_ID,
+                            started_at=started)
+    assert handover.fork_active(cfg)
+    d = dispatch.Dispatcher(cfg, supervise=True)
+    task = d.get(handover.FORK_TASK_ID)
+    assert task.status == "failed" and "orphaned" in (task.error or ""), task
+    rec = handover.read_handover(cfg)
+    assert set(rec) == set(handover.HANDOVER_KEYS), rec
+    assert rec["status"] == "failed" and rec["mode"] == "pace", rec
+    assert rec["started_at"] == started and rec["finished_at"], rec
+    assert not handover.fork_active(cfg), rec
+    assert handover.fork_status_line(cfg).startswith("fork: failed since")
+    # finished_at is stamped too, so the re-arm cooldown actually applies to
+    # the first post-restart relaunch (the launch-crash-loop case).
+    finished = parse_iso(task.finished_at)
+    assert finished is not None, task
+    assert not cli._rearm_ready(cfg, task, finished + timedelta(seconds=60))
+    assert cli._rearm_ready(cfg, task, finished + timedelta(seconds=121))
+
+
+def test_handover_finish_maps_killed_and_survives_a_missing_record():
+    from tokentracker import handover
+    cfg = make_cfg()
+    assert handover.read_handover(cfg) is None
+    assert handover.fork_status_line(cfg) is None
+    assert not handover.fork_active(cfg)
+    rec = handover.finish_handover(cfg, status="killed", finished_at=NOW.isoformat())
+    assert set(rec) == set(handover.HANDOVER_KEYS), rec
+    assert rec["status"] == "failed" and rec["task_id"] is None, rec
+    for junk in ("{not json", "[]", "", '"started"'):
+        cfg.handover_file.write_text(junk, encoding="utf-8")
+        assert handover.read_handover(cfg) is None, junk
+        assert not handover.fork_active(cfg), junk
+        assert handover.fork_status_line(cfg) is None, junk
+
+
+def test_status_prints_fork_line():
+    from tokentracker import cli, handover
+    cfg = make_cfg()
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.4)
+    try:
+        assert "fork:" not in _capture(lambda: cli.cmd_status(cfg))
+        handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                                model="claude-opus-5", parent_session=MAIN_ID,
+                                started_at=NOW.isoformat())
+        out = _capture(lambda: cli.cmd_status(cfg))
+        assert (f"fork: started since {NOW.isoformat()} (pace, claude-opus-5)"
+                in out.splitlines()), out
+        handover.finish_handover(cfg, status="done",
+                                 finished_at=NOW.isoformat(), tokens=5)
+        out = _capture(lambda: cli.cmd_status(cfg))
+        assert (f"fork: done since {NOW.isoformat()} (pace, claude-opus-5)"
+                in out.splitlines()), out
+    finally:
+        usage.fetch_usage = real_fetch
+
+
+def test_repo_config_arms_the_fork_on_opus_5():
+    # The shipped config.json is what actually revives the handover.
+    from tokentracker import cli, handover
+    from tokentracker.config import load_config
+    cfg = load_config(ROOT)
+    assert cfg.throttle_fork_enabled and cfg.fork_in_pace
+    assert cfg.throttle_model == "claude-opus-5", cfg.throttle_model
+    assert cfg.fork_cooldown_seconds == 120
+    assert cfg.main_session_ids[0].startswith("329cb798"), cfg.main_session_ids
+    prompt = cfg.throttle_prompt
+    assert 0 < len(prompt) < 2500, len(prompt)
+    assert "acting technical director" in prompt and "claude-opus-5" in prompt
+    assert "monitor-only" in prompt and "dev_JSON/HANDOFF.md" in prompt
+    # The stop rule the brief gives the fork must name the file the tracker
+    # actually writes: the fork runs with cwd=~, so a relative state/stop.json
+    # would resolve under the home directory and never exist.
+    stop_path = str(cfg.stop_file).replace("\\", "/")
+    assert f"Stop when {stop_path} exists" in prompt, prompt
+    assert "state/stop.json" not in prompt.replace(stop_path, ""), prompt
+    # dev_JSON / Tools paths stay short, so the brief has to name their root.
+    assert "relative to C:/Users/chenw/StarGTA" in prompt, prompt
+    # The brief carries the agentic graph as a placeholder, expanded at launch
+    # so the fork is told the counts that are actually in force this poll.
+    from tokentracker import graph as graph_mod
+    assert "{graph}" in prompt, prompt
+    expanded = cli._fork_prompt(cfg)
+    assert "{graph}" not in expanded, expanded
+    assert graph_mod.graph_line(graph_mod.read_graph(cfg)) in expanded, expanded
+    assert expanded == prompt.replace(
+        "{graph}", graph_mod.graph_line(graph_mod.read_graph(cfg)))
+    task = TaskSpec(id=handover.FORK_TASK_ID, prompt=prompt, cwd=str(ROOT),
+                    model=cfg.throttle_model,
+                    resume_session=cfg.main_session_ids[0])
+    argv = dispatch.Dispatcher(cfg)._argv(task, "cloud", "claude.exe")
+    assert argv[argv.index("--model") + 1] == "claude-opus-5", argv
+    assert argv[argv.index("--resume") + 1].startswith("329cb798"), argv
+    assert "--fork-session" in argv, argv
+
+
+def test_overlay_exposes_fork_chip():
+    import inspect
+    try:
+        import tkinter  # noqa: F401  - absent on headless builds
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    assert callable(overlay.Overlay._draw_fork_chip)
+    src = inspect.getsource(overlay.Overlay._draw_fork_chip)
+    assert "FORK ACTIVE" in src, src
+    # Scaled geometry only: raw design pixels would break on a 2x display.
+    assert "P = self._px" in src and "self._pxf(" in src, src
+    refresh = inspect.getsource(overlay.Overlay._refresh)
+    assert "_draw_fork_chip" in refresh and "fork_active" in refresh, refresh
 
 
 def test_gpu_guard():
@@ -1224,7 +1582,7 @@ except Exception as exc:
     print("SKIP tkinter:", exc)
     raise SystemExit(0)
 
-from tokentracker import control, goal, overlay
+from tokentracker import control, goal, graph, handover, overlay
 from tokentracker.config import Config
 
 cfg = Config(
@@ -1246,6 +1604,16 @@ cfg.state_file.write_text(json.dumps({
 control.write_control(cfg, control.STOPPED)
 goal.write_goal(cfg, 0.90)
 goal.apply_goal_stop(cfg, 1.0, overlay.utcnow())
+# 1 / 3 / 10 (surge 20): the counts the ladder chart is measured against below.
+graph.write_graph(cfg, {
+    graph.EXECUTIVE: {"model": "claude-opus-5", "count": 1},
+    graph.ADVISORY: {"model": "claude-opus-5", "count": 3},
+    graph.WORKERS: {"model": "claude-haiku-4-5-20251001", "count": 10,
+                    "surge_count": 20},
+})
+handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                        model="claude-opus-5", parent_session="329cb798",
+                        started_at=overlay.utcnow().isoformat())
 
 try:
     ov = overlay.Overlay(cfg)
@@ -1282,6 +1650,12 @@ def check_collapsed(tag, expect_mode=True):
                for i in ov.canvas.find_withtag(t)]
     assert box and buttons, (tag, box, buttons)
     assert box[2] <= min(b[0] for b in buttons), (tag, box, buttons)
+    # Collapsed omits the ladder chart entirely rather than squeezing it into
+    # a one-line bar: nothing it draws may be on the canvas at all.
+    for absent in ("ladder", "ladder_spine", "graph_minus", "graph_plus",
+                   "rung_executive", "rung_advisory", "rung_workers"):
+        assert not ov.canvas.find_withtag(absent), (tag, absent)
+    assert "AGENTIC GRAPH" not in labels, (tag, labels)
     for i, (ta, a0, a1) in enumerate(drawn):
         for tb, b0, b1 in drawn[i + 1:]:
             assert a1 <= b0 or b1 <= a0, (tag, ta, tb, a0, a1, b0, b1)
@@ -1321,11 +1695,82 @@ ov.root.update()
 
 # Expanded: the goal row taps and the red stop band must all be on the canvas,
 # and no two texts may overlap now that two rows were added under the footer.
-for tag in ("goal_minus", "goal_plus"):
+for tag in ("goal_minus", "goal_plus", "graph_minus", "graph_plus",
+            "view_report", "report_now"):
     assert ov.canvas.find_withtag(tag), tag
 texts = [t for t, _a, _b in spans()]
 assert any(t.startswith("GOAL ") for t in texts), texts
 assert any(t.startswith("STOPPED: weekly goal") for t in texts), texts
+# The ladder chart and the report row are the two newest blocks; neither may
+# overlap the rows it was wedged between, at any DPI.
+assert "no report yet" in texts, texts
+boxes = {t: ov.canvas.bbox(t) for t in
+         ("graph_minus", "graph_plus", "view_report", "report_now")}
+assert all(boxes.values()), boxes
+assert boxes["graph_minus"][2] <= boxes["graph_plus"][0], boxes
+assert boxes["view_report"][2] <= boxes["report_now"][0], boxes
+goal_box = ov.canvas.bbox("goal_minus")
+throttle_box = ov.canvas.bbox("throttle_btn")
+assert boxes["graph_minus"][3] <= goal_box[1], (boxes, goal_box)
+assert throttle_box[3] <= boxes["view_report"][1], (throttle_box, boxes)
+
+# ------------------------------------------------- the AGENTIC GRAPH ladder
+# Three rungs, executive / advisory / workers top to bottom, under the label.
+assert "AGENTIC GRAPH" in texts, texts
+for tier in ("EXECUTIVE", "ADVISORY", "WORKERS"):
+    assert tier in texts, (tier, texts)
+# The graph written above is 1 / 3 / 10 with a surge of 20.
+for want in ("x1", "x3", "x10", "surge x20", "opus-5", "haiku-4-5"):
+    assert want in texts, (want, texts)
+rungs = [(t, ov.canvas.bbox(f"rung_{t}"))
+         for t in ("executive", "advisory", "workers")]
+assert all(b for _t, b in rungs), rungs
+# Ordered top to bottom, and no two rungs share a pixel of height.
+for (ta, a), (tb, b) in zip(rungs, rungs[1:]):
+    assert a[3] <= b[1], (ta, tb, a, b)
+# Width is the headcount: 10 >= 3 >= 1, and every rung is a visible bar.
+widths = [b[2] - b[0] for _t, b in rungs]
+assert widths[2] >= widths[1] >= widths[0] > 0, (rungs, widths)
+assert widths[2] > widths[0], (rungs, widths)
+# The surge ghost extends past the solid worker rung, and stays inside the card.
+ghost = ov.canvas.bbox("ladder_ghost")
+assert ghost and ghost[2] >= rungs[2][1][2], (ghost, rungs[2])
+assert ghost[2] <= ov.width, (ghost, ov.width)
+# The whole chart is wedged between the footer above and the goal row below.
+chart = ov.canvas.bbox("ladder")
+label_y = [ov.canvas.bbox(i)[1] for i in ov.canvas.find_all()
+           if ov.canvas.type(i) == "text"
+           and ov.canvas.itemcget(i, "text") == "AGENTIC GRAPH"]
+assert chart and label_y, (chart, label_y)
+assert label_y[0] >= chart[1] - 2, (label_y, chart)
+assert chart[3] <= goal_box[1], (chart, goal_box)
+spine = ov.canvas.bbox("ladder_spine")
+assert spine[0] <= chart[0] + ov._px(4), (spine, chart)
+# The spine runs the height of the rungs, which is what makes it read as one
+# ladder rather than three loose bars.
+assert spine[1] <= rungs[0][1][1] + 2 and spine[3] >= rungs[2][1][3] - 2, (
+    spine, rungs)
+# The xN column is tabular: one right edge shared down all three rungs, and
+# the model ids share one left edge the same way.
+count_right = sorted({round(x1) for t, _x0, x1 in spans()
+                      if t in ("x1", "x3", "x10")})
+assert len(count_right) == 1, count_right
+model_left = sorted({round(a) for t, a, _b in spans()
+                     if t in ("opus-5", "haiku-4-5")})
+assert len(model_left) == 1, model_left
+# No rung's model id may collide with its tier name or its count.
+for tier_name, model in (("EXECUTIVE", "opus-5"), ("WORKERS", "haiku-4-5")):
+    name_span = next(s for s in spans() if s[0] == tier_name)
+    assert name_span[2] <= model_left[0], (name_span, model_left)
+assert max(b for t, _a, b in spans() if t in ("opus-5", "haiku-4-5")) <= min(
+    a for t, a, _b in spans() if t in ("x1", "x3", "x10")), spans()
+# The handover chip shares the header row with the close / minimize buttons.
+assert "FORK ACTIVE" in texts, texts
+chip = ov.canvas.bbox("fork_chip")
+title_btns = [ov.canvas.bbox(i) for t in ("close_btn", "min_btn")
+              for i in ov.canvas.find_withtag(t)]
+assert chip and title_btns, (chip, title_btns)
+assert chip[2] <= min(b[0] for b in title_btns), (chip, title_btns)
 lowest = max(ov.canvas.bbox(i)[3] for i in ov.canvas.find_all())
 assert lowest <= int(ov.canvas["height"]) + 2, (lowest, ov.canvas["height"])
 
@@ -1355,6 +1800,746 @@ def test_overlay_close_button_and_collapsed_bar_render():
     out = f"rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}"
     assert proc.returncode == 0, out
     assert "OK" in proc.stdout or "SKIP" in proc.stdout, out
+
+
+# --------------------------------------------------------------- the graph
+
+def test_graph_derives_legacy_keys_from_config():
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    cfg.throttle_model = "claude-opus-5"
+    cfg.worker_model = "claude-sonnet-5"
+    cfg.max_concurrency = 7
+    cfg.surge_concurrency = 12
+    # With no graph section the legacy keys imply one, and applying it back is
+    # a no-op: an old config.json keeps behaving exactly as it did.
+    g = G.default_graph(cfg)
+    assert g[G.EXECUTIVE] == {"model": "claude-opus-5", "count": 1}, g
+    assert g[G.ADVISORY] == {"model": "claude-opus-5", "count": 3}, g
+    assert g[G.WORKERS] == {"model": "claude-sonnet-5", "count": 7,
+                            "surge_count": 12}, g
+    assert G.apply_graph(cfg) == g
+    assert (cfg.max_concurrency, cfg.surge_concurrency) == (7, 12)
+    assert cfg.worker_model == "claude-sonnet-5"
+
+    # A graph in config.json is authoritative over all four legacy keys.
+    cfg.graph = {"executive": {"model": "claude-opus-4-8", "count": 1},
+                 "advisory": {"model": "claude-sonnet-5", "count": 5},
+                 "workers": {"model": "claude-haiku-4-5-20251001",
+                             "count": 20, "surge_count": 30}}
+    G.apply_graph(cfg)
+    assert cfg.throttle_model == "claude-opus-4-8", cfg.throttle_model
+    assert cfg.worker_model == "claude-haiku-4-5-20251001", cfg.worker_model
+    assert (cfg.max_concurrency, cfg.surge_concurrency) == (20, 30)
+    # An empty worker model stays empty: plain workers keep launching with no
+    # --model at all rather than being silently pinned to the executive's.
+    cfg.graph = {}
+    cfg.worker_model = ""
+    assert G.default_graph(cfg)[G.WORKERS]["model"] == ""
+
+
+def test_graph_override_file_wins_and_clamps():
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    cfg.throttle_model = "claude-opus-5"
+    cfg.worker_model = "claude-opus-5"
+    cfg.max_concurrency = 4
+    base, source = G.read_graph_source(cfg)
+    assert source == G.SOURCE_CONFIG and base[G.WORKERS]["count"] == 4
+
+    # A partial override (what the overlay's -/+ writes) merges over config.
+    G.write_graph(cfg, {G.WORKERS: {"count": 20}})
+    g, source = G.read_graph_source(cfg)
+    assert source == G.SOURCE_OVERRIDE, source
+    assert g[G.WORKERS]["count"] == 20 and g[G.EXECUTIVE]["model"] == "claude-opus-5"
+    assert set(json.loads(cfg.graph_file.read_text(encoding="utf-8"))) == {
+        "graph", "set_at"}
+    G.apply_graph(cfg)
+    assert cfg.max_concurrency == 20 and cfg.surge_concurrency >= 20
+
+    # Counts are clamped, not trusted; junk falls back to the config value.
+    for raw, want in ((0, G.COUNT_MIN), (-5, G.COUNT_MIN), (999, G.COUNT_MAX),
+                      ("x", 20), (None, 20), (True, 20)):
+        G.write_graph(cfg, {G.WORKERS: {"count": raw}})
+        assert G.read_graph(cfg)[G.WORKERS]["count"] == want, raw
+        G.write_graph(cfg, {G.WORKERS: {"count": 20}})
+    # A malformed override is ignored rather than taking the loop down.
+    # (apply_graph folded the 20 onto the Config above; put the config value
+    # back so the fallback is visibly the config one, not the override's.)
+    cfg.max_concurrency = 4
+    cfg.surge_concurrency = 4
+    for junk in ("{not json", "[]", "", "{}", '{"graph": 5}', '"hello"', "5",
+                 "null", "true", '{"workers": null}', '{"workers": []}'):
+        cfg.graph_file.write_text(junk, encoding="utf-8")
+        g, source = G.read_graph_source(cfg)
+        assert source == G.SOURCE_CONFIG and g[G.WORKERS]["count"] == 4, junk
+        # Silently ignored by the read path, but not silent everywhere: the
+        # CLI has a way to say the file on disk is doing nothing.
+        assert G.override_warning(cfg), junk
+    # A readable override switches the warning back off.
+    G.write_graph(cfg, {G.WORKERS: {"count": 6}})
+    assert G.override_warning(cfg) is None
+
+
+def test_graph_reads_never_raise_on_hostile_input():
+    """Every read path degrades to the config value; none of them raises.
+
+    read_graph_source runs once per poll inside the run loop, on every overlay
+    refresh and from load_config, so an infinity in state/graph.json used to be
+    a crash in all three: json.loads turns both `1e999` and the bare
+    `Infinity` literal into float("inf"), and int(inf) raises OverflowError,
+    which the old _int did not catch (it caught only TypeError/ValueError).
+    """
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    cfg.throttle_model = "claude-opus-5"
+    cfg.worker_model = "claude-opus-5"
+    cfg.max_concurrency = 4
+    cfg.surge_concurrency = 4
+    # Junk *inside* a well-formed tier: the file is still an override (the
+    # other tiers in it must keep applying), only the bad field falls back.
+    for body in ('{"workers": {"count": 1e999}}',
+                 '{"workers": {"count": Infinity}}',
+                 '{"workers": {"count": -Infinity}}',
+                 '{"workers": {"count": NaN}}',
+                 '{"workers": {"surge_count": 1e999}}',
+                 '{"workers": {"count": null}}',
+                 '{"workers": {"count": "x"}}',
+                 '{"workers": {"count": [1, 2]}}',
+                 '{"workers": {"count": {"n": 1}}}',
+                 '{"workers": {"model": null}}',
+                 '{"workers": {"model": 5}}',
+                 '{"workers": {}}',
+                 '{"executive": {"count": Infinity}}',
+                 '{"graph": {"workers": {"count": 1e999}}}'):
+        cfg.graph_file.write_text(body, encoding="utf-8")
+        g = G.read_graph(cfg)
+        assert g[G.WORKERS]["count"] == 4, body
+        assert g[G.WORKERS]["surge_count"] >= 4, body
+        assert g[G.EXECUTIVE]["count"] == 1, body
+        assert g[G.WORKERS]["model"] == "claude-opus-5", body
+        # And the derivation onto the live Config, which is what the run loop
+        # actually calls every tick.
+        G.apply_graph(cfg)
+        assert cfg.max_concurrency == 4, body
+    cfg.graph_file.unlink()
+
+    # A hostile config.json is the same story one level up: default_graph reads
+    # the legacy scalars, and they are hand-edited far more often than the
+    # override is.
+    for attr, value in (("max_concurrency", float("inf")),
+                        ("max_concurrency", float("nan")),
+                        ("max_concurrency", None),
+                        ("max_concurrency", "lots"),
+                        ("surge_concurrency", float("inf")),
+                        ("throttle_model", None),
+                        ("worker_model", 5)):
+        hostile = make_cfg()
+        setattr(hostile, attr, value)
+        block = G.default_graph(hostile)[G.WORKERS]
+        assert G.COUNT_MIN <= block["count"] <= G.COUNT_MAX, (attr, value)
+        assert block["surge_count"] >= block["count"], (attr, value)
+        assert G.read_graph_source(hostile)[1] == G.SOURCE_CONFIG, (attr, value)
+
+    # A hand-edited "graph" section in config.json, likewise.
+    for section in ({"workers": {"count": float("inf")}}, {"workers": 5},
+                    {"workers": {"count": float("nan")}}, [1, 2], "junk", None):
+        hostile = make_cfg()
+        hostile.graph = section
+        graph, source = G.read_graph_source(hostile)
+        assert source == G.SOURCE_CONFIG, section
+        assert set(graph) == set(G.TIERS), section
+
+    # And the display helpers, which the overlay's refresh timer and the fork's
+    # prompt expansion call on whatever graph they were handed: a missing tier
+    # is a filled-in default, not a KeyError.
+    partial = {G.WORKERS: {"count": 1}}
+    assert set(G.normalize({}, partial)) == set(G.TIERS)
+    assert "executive" in G.graph_line(partial)
+    assert G.overlay_label(partial).startswith("E ")
+    assert len(G.format_tiers(partial)) == 3
+    assert len(G.tiers_of(None)) == 3
+    # validate_graph turns a broken graph into words rather than an exception.
+    assert len(G.validate_graph({G.WORKERS: 5}, ["claude-opus-5"])) == 3
+    _g, errors = G.set_assignments(partial, ["workers.count=9"])
+    assert errors == [] and _g[G.EXECUTIVE]["count"] == 1
+
+
+def test_graph_migration_writes_the_section_once():
+    from tokentracker import graph as G
+    from tokentracker.config import load_config
+    tmp = Path(tempfile.mkdtemp(prefix="tokdist_graphmig_"))
+    (tmp / "config.json").write_text(json.dumps({
+        "worker_model": "claude-opus-5", "throttle_model": "claude-opus-4-8",
+        "max_concurrency": 6, "surge_concurrency": 9,
+    }), encoding="utf-8")
+    cfg = load_config(tmp)
+    raw = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+    assert "graph" in raw, raw
+    assert raw["graph"]["workers"] == {"model": "claude-opus-5", "count": 6,
+                                       "surge_count": 9}, raw["graph"]
+    # The legacy keys are kept for compatibility, not replaced.
+    assert raw["worker_model"] == "claude-opus-5" and raw["max_concurrency"] == 6
+    assert cfg.max_concurrency == 6 and cfg.throttle_model == "claude-opus-4-8"
+    # Second load: the section already exists, so a hand edit survives.
+    raw["graph"]["workers"]["count"] = 15
+    (tmp / "config.json").write_text(json.dumps(raw), encoding="utf-8")
+    cfg2 = load_config(tmp)
+    assert cfg2.max_concurrency == 15, cfg2.max_concurrency
+    assert G.read_graph(cfg2)[G.WORKERS]["count"] == 15
+
+
+def test_graph_validation_warns_instead_of_crashing():
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    cfg.local_model = "Qwen3.8-27B-NVFP4"
+    models = G.known_models(cfg)
+    assert "claude-opus-5" in models and "Qwen3.8-27B-NVFP4" in models
+    good = G.normalize({G.WORKERS: {"model": "claude-opus-5"}},
+                       G.default_graph(cfg))
+    assert G.validate_graph(good, models) == []
+    bad = G.normalize({G.WORKERS: {"model": "claude-mythos-9"}},
+                      G.default_graph(cfg))
+    warnings = G.validate_graph(bad, models)
+    assert len(warnings) == 1 and "claude-mythos-9" in warnings[0], warnings
+    # A warning, not a refusal: the id is still what the graph holds.
+    assert bad[G.WORKERS]["model"] == "claude-mythos-9"
+
+
+def test_graph_set_assignment_parsing():
+    from tokentracker import graph as G
+    cfg = make_cfg()
+    cfg.throttle_model = "claude-opus-5"
+    base = G.default_graph(cfg)
+    g, errors = G.set_assignments(
+        base, ["workers.count=20", "advisory.model=claude-opus-4-8",
+               "workers.surge_count=25"])
+    assert errors == [], errors
+    assert g[G.WORKERS]["count"] == 20 and g[G.WORKERS]["surge_count"] == 25
+    assert g[G.ADVISORY]["model"] == "claude-opus-4-8"
+    assert g[G.EXECUTIVE] == base[G.EXECUTIVE]
+    for bad in ("workers", "workers.count", "nope.count=1", "workers.nope=1",
+                "workers.count=lots"):
+        _g, errors = G.set_assignments(base, [bad])
+        assert len(errors) == 1, (bad, errors)
+
+
+def test_cli_graph_shows_and_sets():
+    from tokentracker import graph as G
+    from tokentracker.cli import main as cli_main
+    from tokentracker.config import load_config
+    tmp = Path(tempfile.mkdtemp(prefix="tokdist_graphcli_"))
+    (tmp / "config.json").write_text(json.dumps({
+        "worker_model": "claude-opus-5", "throttle_model": "claude-opus-5",
+        "max_concurrency": 10, "surge_concurrency": 20,
+    }), encoding="utf-8")
+    out = _capture(lambda: cli_main(["--root", str(tmp), "graph"]))
+    assert f"agentic graph (source: {G.SOURCE_CONFIG})" in out, out
+    for tier in G.TIERS:
+        assert tier in out, (tier, out)
+    assert "x10 (surge x20)" in out, out
+    assert "Agentic graph (from TokenDistributor config)" in out, out
+
+    out = _capture(lambda: cli_main(
+        ["--root", str(tmp), "graph", "set", "workers.count=20",
+         "advisory.model=claude-opus-4-8"]))
+    assert f"agentic graph (source: {G.SOURCE_OVERRIDE})" in out, out
+    cfg = load_config(tmp)
+    assert cfg.max_concurrency == 20, cfg.max_concurrency
+    assert G.read_graph(cfg)[G.ADVISORY]["model"] == "claude-opus-4-8"
+    # config.json is never rewritten by a set; the override file carries it.
+    raw = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+    assert raw["graph"]["workers"]["count"] == 10, raw["graph"]
+    # An unparseable assignment is refused without touching the override.
+    assert cli_main(["--root", str(tmp), "graph", "set", "workers.count=lots"]) == 1
+    assert G.read_graph(load_config(tmp))[G.WORKERS]["count"] == 20
+
+
+def test_scheduler_reads_the_graph_worker_counts():
+    from tokentracker import graph as G
+    cfg = _gate_cfg()
+    G.write_graph(cfg, {G.EXECUTIVE: {"model": "claude-opus-5"},
+                        G.WORKERS: {"model": "claude-opus-5", "count": 8,
+                                    "surge_count": 16}})
+    G.apply_graph(cfg)
+    # Endgame surge takes the graph's surge count, pacing the worker count.
+    d = scheduler.decide(snap(0.7, left_h=6), rates(), idle(), QS, cfg,
+                         CLASS_RATES, NOW)
+    assert d.mode == "surge" and d.target_concurrency == 16, d
+    d = scheduler.decide(snap(0.05, left_h=48), rates(), idle(), QS, cfg,
+                         (0.05, 0.05), NOW)
+    assert d.mode == "pace" and d.target_concurrency == 8, d
+    # And the loop re-derives it every tick, so an overlay tap lands within one
+    # poll rather than needing a restart.
+    G.write_graph(cfg, {G.WORKERS: {"count": 2, "surge_count": 3}})
+    from tokentracker import cli
+    d2, _a, _e, _s, _r = cli._tick(cfg, _gate_dispatcher(cfg)[0],
+                                   usage.UsageHistory(cfg), do_fetch=False)
+    assert cfg.max_concurrency == 2 and cfg.surge_concurrency == 3, cfg
+
+
+def test_repo_config_ships_the_graph():
+    from tokentracker import graph as G
+    from tokentracker.config import load_config
+    cfg = load_config(ROOT)
+    g = G.read_graph(cfg)
+    assert g[G.EXECUTIVE]["model"] == "claude-opus-5", g
+    assert g[G.ADVISORY]["count"] == 3 and g[G.WORKERS]["count"] == 10, g
+    assert g[G.WORKERS]["surge_count"] == 20, g
+    assert G.validate_graph(g, G.known_models(cfg)) == []
+    # The legacy keys the scheduler and dispatcher read are the graph's.
+    assert cfg.max_concurrency == 10 and cfg.surge_concurrency == 20
+    assert cfg.worker_model == "claude-opus-5"
+
+
+# -------------------------------------------------------------- the ledger
+
+def _entry(mid, model, ts, tools, usage, uuid="u1"):
+    """One assistant JSONL entry, in Claude Code's shape."""
+    return json.dumps({
+        "type": "assistant", "uuid": uuid, "timestamp": ts,
+        "message": {
+            "id": mid, "model": model, "usage": usage,
+            "content": [{"type": "tool_use", "id": f"{mid}-{n}", "name": n}
+                        for n in tools],
+        },
+    })
+
+
+def _usage(out=0, inp=0, creation=0, read=0):
+    return {"output_tokens": out, "input_tokens": inp,
+            "cache_creation_input_tokens": creation,
+            "cache_read_input_tokens": read}
+
+
+def test_ledger_parser_dedupes_and_categorises():
+    from tokentracker import ledger
+    cfg = make_cfg()
+    start = NOW - timedelta(hours=1)
+    inside = (NOW - timedelta(minutes=10)).isoformat()
+    outside = (NOW - timedelta(hours=5)).isoformat()
+    u = _usage(out=100, inp=10, creation=20, read=1000)
+    path = cfg.projects_dir / "t.jsonl"
+    path.write_text("\n".join([
+        # One logical turn split over two entries, each repeating the same
+        # usage: the dedup by message.id is the whole point.
+        _entry("m1", "claude-opus-5", inside, ["Edit"], u),
+        _entry("m1", "claude-opus-5", inside, ["Bash"], u, uuid="u2"),
+        _entry("m2", "claude-opus-5", inside, ["Read", "Grep"], _usage(out=5)),
+        _entry("m3", "claude-opus-5", inside, [], _usage(out=7)),
+        _entry("m4", "claude-opus-5", inside, ["Workflow"], _usage(out=9)),
+        "not json at all",
+        _entry("m5", "claude-opus-5", outside, ["Edit"], _usage(out=999)),
+    ]), encoding="utf-8")
+
+    tally = ledger.parse_transcript(path, start, NOW)
+    row = tally.by_model["claude-opus-5"]
+    assert row["messages"] == 4, row            # m5 is outside the window
+    assert row["usage"]["output_tokens"] == 100 + 5 + 7 + 9, row
+    # AUTHOR beats OPS inside one turn; usage counted once, not twice.
+    assert row["cats"]["AUTHOR"]["messages"] == 1, row["cats"]
+    assert row["cats"]["AUTHOR"]["output_tokens"] == 100, row["cats"]
+    assert row["cats"]["READ"]["messages"] == 1, row["cats"]
+    assert row["cats"]["DECIDE"]["messages"] == 1, row["cats"]
+    assert row["cats"]["DELEGATE"]["messages"] == 1, row["cats"]
+    assert "OPS" not in row["cats"], row["cats"]
+    # weighted = output + 0.1*(input + cache_creation) + 0.01*cache_read
+    assert abs(row["cats"]["AUTHOR"]["weighted"] - 113.0) < 1e-9, row["cats"]
+    assert abs(row["weighted"] - (113.0 + 5 + 7 + 9)) < 1e-9, row
+    assert ledger.categorise([]) == "DECIDE"
+    assert ledger.categorise(["AskUserQuestion"]) == "DECIDE"
+    assert ledger.categorise(["Bash", "Read"]) == "OPS"
+    assert ledger.categorise(["SomeMcpTool"]) == "READ"
+    hours = tally.hourly["claude-opus-5"]
+    assert sum(h["messages"] for h in hours.values()) == 4, hours
+
+
+def test_ledger_tiers_split_by_the_graph():
+    from tokentracker import graph as G
+    from tokentracker import ledger
+    cfg = make_cfg()
+    graph = G.normalize({G.EXECUTIVE: {"model": "claude-opus-5"},
+                         G.ADVISORY: {"model": "claude-opus-4-8"},
+                         G.WORKERS: {"model": "claude-sonnet-5"}},
+                        G.default_graph(cfg))
+    assert ledger.tier_of("claude-opus-5", graph) == ledger.EXEC_TIER
+    assert ledger.tier_of("claude-opus-4-8", graph) == ledger.EXEC_TIER
+    assert ledger.tier_of("claude-sonnet-5", graph) == ledger.WORK_TIER
+    # A model the graph never names still has to land somewhere, or the tier
+    # totals would not add up to the per-model totals.
+    assert ledger.tier_of("claude-fable-5-1", graph) == ledger.WORK_TIER
+    # One model at every tier is counted once, at the executive tier.
+    flat = G.normalize({G.WORKERS: {"model": "claude-opus-5"}},
+                       G.default_graph(cfg))
+    flat[G.EXECUTIVE]["model"] = "claude-opus-5"
+    assert ledger.tier_of("claude-opus-5", flat) == ledger.EXEC_TIER
+
+
+def _ledger_cfg(exec_tools=("Edit",)) -> Config:
+    """A cfg with one main-session transcript the generator can actually read."""
+    cfg = make_cfg()
+    cfg.main_session_ids = [MAIN_ID]
+    cfg.throttle_model = "claude-opus-5"
+    cfg.worker_model = "claude-sonnet-5"
+    cfg.throttle_prompt = "You are the forked acting technical director."
+    ts = (utcnow() - timedelta(minutes=5)).isoformat()
+    lines = [_entry(f"m{i}", "claude-opus-5", ts, list(exec_tools),
+                    _usage(out=100, read=1000), uuid=f"u{i}")
+             for i in range(3)]
+    lines.append(_entry("w1", "claude-sonnet-5", ts, ["Bash"],
+                        _usage(out=50), uuid="uw"))
+    proj = cfg.projects_dir / "proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / f"{MAIN_ID}.jsonl").write_text("\n".join(lines), encoding="utf-8")
+    return cfg
+
+
+def test_ledger_verdict_uses_the_sixty_percent_rule():
+    from tokentracker import graph as G
+    from tokentracker import ledger
+    hands = _ledger_cfg(exec_tools=("Edit",))
+    G.apply_graph(hands)
+    summary = ledger.build_summary(hands, utcnow() - timedelta(hours=1), utcnow())
+    assert summary["verdict"]["executive_only"] is False, summary["verdict"]
+    assert summary["fable_vs_opus"]["fable_models"] == ["claude-opus-5"]
+    assert summary["fable_vs_opus"]["opus_models"] == ["claude-sonnet-5"]
+    assert summary["fable_work_breakdown"]["fable"]["AUTHOR"]["output"] == 300
+    assert summary["root_causes"], summary["root_causes"]
+
+    # The same tier that only decides and delegates passes the same rule.
+    exec_only = _ledger_cfg(exec_tools=())
+    G.apply_graph(exec_only)
+    summary = ledger.build_summary(exec_only, utcnow() - timedelta(hours=1),
+                                   utcnow())
+    assert summary["verdict"]["executive_only"] is True, summary["verdict"]
+    assert summary["root_causes"] == [], summary["root_causes"]
+    breakdown = summary["fable_work_breakdown"]["fable"]
+    assert breakdown["DECIDE"]["share"] == 1.0, breakdown
+    for cat in ledger.CATS:
+        assert set(breakdown[cat]) >= {"output", "weighted", "share"}, breakdown
+
+
+def test_ledger_writes_timestamped_page_and_latest_copy():
+    from tokentracker import ledger
+    cfg = _ledger_cfg()
+    page = ledger.generate(cfg, "manual", hours=1.0)
+    assert page.exists() and page.parent == cfg.reports_dir, page
+    assert page.name.endswith("-ledger.html"), page.name
+    stamp = page.name[:-len("-ledger.html")]
+    assert len(stamp) == 16 and stamp[8] == "T" and stamp.endswith("Z"), stamp
+    summary_path = cfg.reports_dir / f"{stamp}-summary.json"
+    assert summary_path.exists(), list(cfg.reports_dir.iterdir())
+    latest = cfg.reports_dir / ledger.LATEST_NAME
+    assert latest.read_bytes() == page.read_bytes(), "latest.html is a copy"
+    assert ledger.latest_report(cfg) == latest
+
+    html = page.read_text(encoding="utf-8")
+    assert ledger.TITLE_PLACEHOLDER not in html and "__DATA__" not in html
+    day = json.loads(summary_path.read_text(encoding="utf-8"))["window"]["end"][:10]
+    assert f"<title>Work Distribution {day}</title>" in html, html[:200]
+
+    state = json.loads(cfg.report_file.read_text(encoding="utf-8"))
+    assert set(state) == set(ledger.REPORT_KEYS), state
+    assert state["last_report"] == str(page) and state["last_reason"] == "manual"
+    assert state["window"]["hours"] == 1.0, state
+    assert ledger.report_age(cfg).startswith("report "), ledger.report_age(cfg)
+
+    # A second run lands on its own file and the window starts where the last
+    # report ended, so consecutive reports do not double-count the same turns.
+    later = utcnow() + timedelta(seconds=61)
+    page2 = ledger.generate(cfg, "manual", now=later)
+    assert page2 != page and page2.exists()
+    window = json.loads(cfg.report_file.read_text(encoding="utf-8"))["window"]
+    assert window["start"] == state["generated_at"], (window, state)
+
+
+def test_ledger_cli_report_command():
+    from tokentracker import ledger
+    from tokentracker.cli import main as cli_main
+    cfg = _ledger_cfg()
+    out = _capture(lambda: cli_main(["--root", str(cfg.root), "report",
+                                     "--hours", "2"]))
+    # The CLI builds its own Config from --root, so only the files matter.
+    assert "wrote " in out and "latest:" in out, out
+    reports = cfg.root / "reports"
+    assert (reports / "latest.html").exists(), list(reports.iterdir())
+    assert cli_main(["--root", str(cfg.root), "report",
+                     "--since", "not-a-time"]) == 1
+
+
+def test_ledger_trigger_decisions_are_pure():
+    from tokentracker import ledger
+    # A fork that finished with something to show for it earns a report.
+    assert ledger.milestone_wanted("done", True)
+    # Done with nothing committed does not.
+    assert not ledger.milestone_wanted("done", False)
+    assert not ledger.milestone_wanted("failed", True)
+    assert not ledger.milestone_wanted("killed", True)
+    assert not ledger.milestone_wanted("running", True)
+    assert not ledger.milestone_wanted("done", True, enabled=False)
+    # A stop reports once: the same stop key never fires twice.
+    assert ledger.stop_wanted("stop:12:00", None)
+    assert not ledger.stop_wanted("stop:12:00", "stop:12:00")
+    assert ledger.stop_wanted("stop:13:00", "stop:12:00")
+    assert not ledger.stop_wanted(None, None)
+    assert not ledger.stop_wanted("stop:13:00", None, enabled=False)
+
+
+def test_ledger_repo_change_detection():
+    from tokentracker import ledger
+    cfg = make_cfg()
+    repo = Path(tempfile.mkdtemp(prefix="tokdist_repo_"))
+    cfg.report_repo = str(repo)
+    since = utcnow()
+    assert ledger.repo_changed_since(cfg, None) == (False, "no start time")
+    assert not ledger.repo_changed_since(cfg, since)[0]
+    progress = repo / "dev_JSON" / "PROGRESS_REPORT.json"
+    progress.parent.mkdir(parents=True, exist_ok=True)
+    progress.write_text("{}", encoding="utf-8")
+    import os as _os
+    stale = (since - timedelta(hours=1)).timestamp()
+    _os.utime(progress, (stale, stale))
+    assert not ledger.repo_changed_since(cfg, since)[0]
+    fresh = (since + timedelta(minutes=1)).timestamp()
+    _os.utime(progress, (fresh, fresh))
+    changed, why = ledger.repo_changed_since(cfg, since)
+    assert changed and "PROGRESS_REPORT" in why, why
+    cfg.report_repo = ""
+    assert ledger.repo_changed_since(cfg, since) == (False, "no repo configured")
+
+
+def test_ledger_fires_on_fork_milestone_and_once_per_stop():
+    from tokentracker import cli, control, ledger
+    cfg = _ledger_cfg()
+    repo = Path(tempfile.mkdtemp(prefix="tokdist_milestone_"))
+    cfg.report_repo = str(repo)
+    progress = repo / "dev_JSON" / "PROGRESS_REPORT.json"
+    progress.parent.mkdir(parents=True, exist_ok=True)
+    progress.write_text("{}", encoding="utf-8")
+    d = dispatch.Dispatcher(cfg)
+    d.add(TaskSpec(id=cli.THROTTLE_TASK_ID, prompt="p", cwd=str(cfg.root),
+                   status="done",
+                   started_at=(utcnow() - timedelta(hours=1)).isoformat()))
+    calls: list[tuple] = []
+    real = ledger.generate_async
+    ledger.generate_async = lambda c, reason, **kw: (calls.append((reason, kw))
+                                                     or True)
+    try:
+        # running -> done with a fresh PROGRESS_REPORT.json: report.
+        line = ledger.maybe_report(cfg, d, before=("running", None),
+                                   control=control.RUNNING, stop=None)
+        assert line is not None and "milestone" in line, line
+        assert len(calls) == 1 and "milestone" in calls[0][0], calls
+        # Already done at the start of the tick: nothing new happened.
+        calls.clear()
+        assert ledger.maybe_report(cfg, d, before=("done", None),
+                                   control=control.RUNNING, stop=None) is None
+        assert calls == [], calls
+        # Done, but the repo did not move: not a milestone.
+        cfg.report_repo = str(repo / "nowhere")
+        assert ledger.maybe_report(cfg, d, before=("running", None),
+                                   control=control.RUNNING, stop=None) is None
+        assert calls == [], calls
+        # A stop reports once, keyed on the record that caused it.
+        control.write_control(cfg, control.STOPPED)
+        line = ledger.maybe_report(cfg, d, before=("done", None),
+                                   control=control.STOPPED, stop=None)
+        assert line is not None and "stopped" in line, line
+        key = calls[0][1]["stop_key"]
+        assert key and key.startswith("stop:"), calls
+        ledger.write_report_state(cfg, path=Path("x"), reason="stopped",
+                                  window={}, stop_key=key)
+        calls.clear()
+        assert ledger.maybe_report(cfg, d, before=("done", None),
+                                   control=control.STOPPED, stop=None) is None
+        assert calls == [], calls
+        # The weekly-goal stop is its own episode and reports on its own.
+        stop = {"reason": "weekly goal reached", "goal": 0.9, "weekly": 0.95,
+                "at": utcnow().isoformat()}
+        line = ledger.maybe_report(cfg, d, before=("done", None),
+                                   control=control.STOPPED, stop=stop)
+        assert line is not None, line
+        assert calls[0][1]["stop_key"].startswith("goal:"), calls
+    finally:
+        ledger.generate_async = real
+
+
+def test_ledger_survives_a_broken_dispatcher():
+    # maybe_report runs inside the poll; nothing it touches may raise.
+    from tokentracker import control, ledger
+
+    class Boom:
+        def get(self, _task_id):
+            raise RuntimeError("nope")
+
+    cfg = make_cfg()
+    assert ledger.maybe_report(cfg, Boom(), before=("running", None),
+                               control=control.RUNNING, stop=None) is None
+    assert ledger.read_report_state(cfg) == {}
+    cfg.report_file.write_text("{not json", encoding="utf-8")
+    assert ledger.read_report_state(cfg) == {}
+    assert ledger.report_age(cfg) is None
+    assert ledger.latest_report(cfg) is None
+
+
+def test_ledger_finds_forks_by_recorded_id_and_by_prompt():
+    from tokentracker import ledger
+    cfg = _ledger_cfg()
+    proj = cfg.projects_dir / "proj"
+    ts = (utcnow() - timedelta(minutes=3)).isoformat()
+    # A fork whose session id the dispatcher captured at exit.
+    known = "11111111-2222-3333-4444-555555555555"
+    (proj / f"{known}.jsonl").write_text(
+        _entry("f1", "claude-sonnet-5", ts, ["Bash"], _usage(out=11)),
+        encoding="utf-8")
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "throttle-main-continue", "prompt": "p", "cwd": str(cfg.root),
+         "status": "done", "fork_session_id": known},
+    ]}), encoding="utf-8")
+    # A fork whose id was never recorded, found by the brief it was given.
+    unknown = "99999999-8888-7777-6666-555555555555"
+    (proj / f"{unknown}.jsonl").write_text("\n".join([
+        json.dumps({"type": "user", "timestamp": ts, "message": {
+            "role": "user", "content": cfg.throttle_prompt + " Continue."}}),
+        _entry("f2", "claude-sonnet-5", ts, ["Edit"], _usage(out=13)),
+    ]), encoding="utf-8")
+
+    found = ledger.discover_sessions(cfg, utcnow() - timedelta(hours=1), utcnow())
+    roles = {s["sid"]: s["role"] for s in found}
+    assert roles.get(MAIN_ID) == "main", roles
+    assert roles.get(known) == "fork", roles
+    assert roles.get(unknown) == "fork", roles
+    summary = ledger.build_summary(cfg, utcnow() - timedelta(hours=1), utcnow())
+    assert summary["totals_by_model"]["claude-sonnet-5"]["output_tokens"] == 74
+    assert "fork" in summary["sources"]["fork_sessions"] or True
+    labels = [s["id_or_label"] for s in summary["where_fable_went"]]
+    assert any(known[:8] in label for label in labels), labels
+
+
+def test_dispatch_records_the_fork_session_id():
+    # Without it the ledger cannot tell which transcript on disk was the fork.
+    cfg = _fork_cfg()
+    _seed_tasks(cfg)
+    d = dispatch.Dispatcher(cfg)
+    task = d.get("a")
+    task.status = "running"
+    task.started_at = (utcnow() - timedelta(minutes=2)).isoformat()
+    (cfg.logs_dir / "a.out.json").write_text(json.dumps({
+        "is_error": False, "session_id": "sid-from-claude",
+        "usage": {"output_tokens": 5}}), encoding="utf-8")
+    d._finalize_record(task, 0, utcnow())
+    assert task.fork_session_id == "sid-from-claude", task
+    d.save()
+    on_disk = json.loads(cfg.tasks_file.read_text(encoding="utf-8"))
+    row = next(t for t in on_disk["tasks"] if t["id"] == "a")
+    assert row["fork_session_id"] == "sid-from-claude", row
+
+
+def test_ledger_utilization_series_from_history():
+    from tokentracker import ledger
+    cfg = make_cfg()
+    _write_history(cfg, [(50, 0.40), (20, 0.50), (0, 0.60)])
+    points = ledger.utilization_series(cfg, NOW - timedelta(hours=1), NOW)
+    assert len(points) == 3, points
+    assert abs(points[-1]["seven_day"] - 0.60) < 1e-9, points[-1]
+    assert set(points[0]) == {"t", "five_hour", "seven_day", "fable"}, points[0]
+    assert ledger.utilization_series(cfg, NOW + timedelta(hours=1),
+                                     NOW + timedelta(hours=2)) == []
+
+
+# ------------------------------------------------------------- the overlay
+
+def test_overlay_exposes_report_and_graph_controls():
+    import inspect
+    try:
+        import tkinter  # noqa: F401  - absent on headless builds
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    src = inspect.getsource(overlay.Overlay)
+    for tag in ("view_report", "report_now", "graph_minus", "graph_plus"):
+        assert f'tag_bind("{tag}"' in src, tag
+        assert f'tags="{tag}"' in src or f'tags=tag' in src, tag
+    for name in ("_click_view_report", "_click_report_now", "_draw_report_row",
+                 "_click_graph_minus", "_click_graph_plus", "_step_workers",
+                 "_draw_graph_ladder", "_ladder_height"):
+        assert callable(getattr(overlay.Overlay, name)), name
+    # Every handler swallows the click, or the drag binding would see it.
+    for name in ("_click_view_report", "_click_report_now", "_step_workers"):
+        assert 'return "break"' in inspect.getsource(
+            getattr(overlay.Overlay, name)), name
+    # Scaled geometry only: raw design pixels break on a 2x display.
+    for name in ("_draw_report_row", "_draw_graph_ladder", "_ladder_height"):
+        body = inspect.getsource(getattr(overlay.Overlay, name))
+        assert "P = self._px" in body, name
+        assert "self._pxf(" in body or name == "_ladder_height", name
+    refresh = inspect.getsource(overlay.Overlay._refresh)
+    assert "_draw_report_row" in refresh and "_draw_graph_ladder" in refresh
+    # The card has to grow by the chart, or the goal row lands on top of it.
+    assert "_ladder_height()" in refresh, refresh
+    assert "report_age" in refresh and "latest_report" in refresh
+    # The chart replaced the textual GRAPH row rather than joining it.
+    assert "_draw_graph_row" not in src and "overlay_label" not in src
+    # ... and the collapsed bar omits it entirely rather than squeezing it in.
+    collapsed = inspect.getsource(overlay.Overlay._refresh_collapsed)
+    assert "_draw_graph_ladder" not in collapsed, collapsed
+
+
+def test_overlay_worker_step_clamps_and_writes_the_override():
+    try:
+        from tokentracker import graph as G
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    cfg = make_cfg()
+    cfg.throttle_model = "claude-opus-5"
+    cfg.max_concurrency = 10
+    fake = overlay.Overlay.__new__(overlay.Overlay)
+    fake.cfg = cfg
+    fake._refresh = lambda: None
+    fake._graph = G.read_graph(cfg)
+    assert fake._step_workers(1) == "break"
+    assert G.read_graph(cfg)[G.WORKERS]["count"] == 11
+    for _ in range(50):
+        fake._step_workers(1)
+    assert G.read_graph(cfg)[G.WORKERS]["count"] == G.COUNT_MAX
+    for _ in range(60):
+        fake._step_workers(-1)
+    assert G.read_graph(cfg)[G.WORKERS]["count"] == G.COUNT_MIN
+    # The override is what changed; config.json is never touched by a tap.
+    assert cfg.graph_file.exists() and not (cfg.root / "config.json").exists()
+    assert G.overlay_label(G.read_graph(cfg)).startswith("E opus-5 x1 | A ")
+
+
+def test_overlay_view_report_needs_a_report():
+    try:
+        from tokentracker import ledger, overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    cfg = make_cfg()
+    fake = overlay.Overlay.__new__(overlay.Overlay)
+    fake.cfg = cfg
+    fake._refresh = lambda: None
+    fake._report = None
+    opened: list = []
+    real = ledger.open_report
+    overlay.open_report = lambda c: opened.append(c) or Path("x")
+    try:
+        # No page yet: the button is inert rather than handing the shell a
+        # path that does not exist.
+        assert fake._click_view_report(None) == "break"
+        assert opened == [], opened
+        fake._report = Path("some.html")
+        fake._click_view_report(None)
+        assert opened == [cfg], opened
+    finally:
+        overlay.open_report = real
 
 
 def main() -> int:

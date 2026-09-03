@@ -1,0 +1,1270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: #EEF1F4;
+    --surface: #F7F8FA;
+    --ink: #1B2129;
+    --muted: #5B6672;
+    --rule: #C9CFD8;
+    --fable: #6B4FD8;
+    --opus: #1E9E8A;
+    --warn: #D98A1E;
+    --crit: #C7423F;
+    --ok: #2E8B57;
+
+    /* per-model series steps (validated: CVD + normal-vision separation) */
+    --m-fable-5: #A78BFA;
+    --m-fable-51: #6B4FD8;
+    --m-opus-48: #43C9A9;
+    --m-opus-5: #08947F;
+
+    /* ordered category ramp, executive -> hands-on (single hue, monotone L) */
+    --cat-1: #9FB3D4;
+    --cat-2: #8399BF;
+    --cat-3: #6A82AA;
+    --cat-4: #526A94;
+    --cat-5: #3C527A;
+    --cat-6: #26375A;
+
+    --font-head: "IBM Plex Sans Condensed", "IBM Plex Sans", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-body: "IBM Plex Sans", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0F141A;
+      --surface: #161C24;
+      --ink: #E6EAF0;
+      --muted: #98A3B0;
+      --rule: #2A323C;
+      --fable: #9D86F2;
+      --opus: #3FC2AC;
+      --warn: #E8A33F;
+      --crit: #E06561;
+      --ok: #4FBF7A;
+      --cat-1: #44567A;
+      --cat-2: #576D95;
+      --cat-3: #6D85AE;
+      --cat-4: #8A9FC4;
+      --cat-5: #A9BAD9;
+      --cat-6: #C8D6EC;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #0F141A;
+    --surface: #161C24;
+    --ink: #E6EAF0;
+    --muted: #98A3B0;
+    --rule: #2A323C;
+    --fable: #9D86F2;
+    --opus: #3FC2AC;
+    --warn: #E8A33F;
+    --crit: #E06561;
+    --ok: #4FBF7A;
+    --cat-1: #44567A;
+    --cat-2: #576D95;
+    --cat-3: #6D85AE;
+    --cat-4: #8A9FC4;
+    --cat-5: #A9BAD9;
+    --cat-6: #C8D6EC;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 40px 24px 72px;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .band {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    padding: 32px 0;
+  }
+  .band + .band { border-top: 1px solid var(--rule); }
+  .band:first-child { padding-top: 0; }
+
+  h1, h2, h3 { font-family: var(--font-head); margin: 0; font-weight: 700; letter-spacing: -0.01em; }
+  h1 { font-size: 40px; line-height: 1.1; }
+  h2 { font-size: 21px; line-height: 1.2; font-weight: 600; }
+  h3 { font-size: 15px; line-height: 1.3; font-weight: 600; }
+  p { margin: 0; }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .sub { color: var(--muted); max-width: 72ch; }
+  .caption { font-size: 12.5px; color: var(--muted); max-width: 72ch; }
+  .prose { max-width: 65ch; }
+
+  .head-stack { display: flex; flex-direction: column; gap: 10px; }
+
+  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+  /* ---- verdict band ---- */
+  .verdict-top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 40px 56px;
+  }
+  .stat { display: flex; flex-direction: column; gap: 4px; }
+  .stat .label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .stat .fig {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
+    font-size: 56px;
+    line-height: 1;
+    color: var(--ink);
+  }
+  .stat .fig.is-fable { color: var(--fable); }
+  .stat .sub-note { font-size: 12.5px; color: var(--muted); }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 6px 10px;
+    border: 1px solid currentColor;
+    color: var(--muted);
+    background: transparent;
+    white-space: nowrap;
+  }
+  .pill .dot { width: 8px; height: 8px; background: currentColor; flex: none; }
+  .pill--ok { color: var(--ok); }
+  .pill--warn { color: var(--warn); }
+  .pill--crit { color: var(--crit); }
+  .pill--sm { font-size: 11px; padding: 3px 7px; letter-spacing: 0.06em; }
+
+  .banner {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    border: 1px solid var(--warn);
+    border-left-width: 4px;
+    padding: 12px 14px;
+    color: var(--ink);
+    background: var(--surface);
+    font-size: 13.5px;
+  }
+  .banner strong { font-family: var(--font-mono); color: var(--warn); letter-spacing: 0.06em; }
+
+  ul, ol { margin: 0; padding: 0; list-style: none; }
+  .list { display: flex; flex-direction: column; gap: 8px; max-width: 78ch; }
+  .list li { display: flex; gap: 12px; }
+  .list li .marker {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    flex: none;
+    min-width: 1.6em;
+  }
+  .checklist li .marker { color: var(--fable); }
+  .checklist li .marker::before { content: "\25A0"; }
+
+  /* ---- layout bands ---- */
+  .cols2 {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 40px;
+    align-items: start;
+  }
+  .panel { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+  /* ---- charts ---- */
+  .chart { width: 100%; display: block; overflow: visible; }
+  .chart-wrap { width: 100%; }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .legend .key { display: inline-flex; align-items: center; gap: 7px; }
+  .legend .swatch { width: 12px; height: 12px; flex: none; }
+  .legend .line-key { width: 16px; height: 0; border-top: 2px solid; flex: none; }
+  .legend .line-key.dashed { border-top-style: dashed; }
+
+  /* ---- tables ---- */
+  .scroll-x { overflow-x: auto; }
+  /* color/font are set explicitly: tables do not inherit them in quirks mode */
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13px;
+    color: var(--ink);
+    font-family: var(--font-body);
+  }
+  caption { text-align: left; color: var(--muted); font-size: 12.5px; padding-bottom: 8px; }
+  th, td { text-align: left; padding: 7px 12px 7px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  thead th {
+    font-family: var(--font-mono);
+    font-weight: 500;
+    font-size: 11px;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  td.n, th.n { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.id { font-family: var(--font-mono); font-size: 12px; white-space: nowrap; }
+  td.what { min-width: 30ch; max-width: 52ch; }
+  tbody tr:last-child td { border-bottom: 0; }
+  #totals-table table { font-size: 12.5px; }
+  #totals-table th, #totals-table td { padding-right: 8px; }
+  .row-key { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .row-key .swatch { width: 10px; height: 10px; flex: none; }
+
+  details { border-top: 1px solid var(--rule); padding-top: 10px; }
+  summary { cursor: pointer; font-size: 12.5px; color: var(--muted); font-family: var(--font-mono); letter-spacing: 0.05em; }
+  details[open] summary { padding-bottom: 12px; }
+
+  a { color: var(--fable); }
+  a:focus-visible, summary:focus-visible, details:focus-visible {
+    outline: 2px solid var(--fable);
+    outline-offset: 2px;
+  }
+
+  .foot { display: flex; flex-direction: column; gap: 18px; font-size: 13px; color: var(--muted); }
+  .foot h3 { color: var(--ink); }
+  .formula {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 10px 12px;
+    display: inline-block;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+  .kicker { color: var(--ink); }
+
+  @media (max-width: 820px) {
+    .cols2 { grid-template-columns: minmax(0, 1fr); gap: 36px; }
+    h1 { font-size: 30px; }
+    .stat .fig { font-size: 44px; }
+    .verdict-top { gap: 24px 32px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  }
+</style>
+
+<main class="page">
+
+  <section class="band" aria-labelledby="title">
+    <div class="head-stack">
+      <div class="eyebrow" id="eyebrow">TOKEN LEDGER</div>
+      <h1 id="title">__TITLE__</h1>
+      <p class="sub" id="subhead">Did the technical-director tier only direct, or did it also do the building?</p>
+    </div>
+    <div id="sample-banner" hidden></div>
+  </section>
+
+  <section class="band" aria-labelledby="verdict-h">
+    <h2 id="verdict-h">Verdict</h2>
+    <div class="verdict-top">
+      <div class="stat">
+        <div class="label">Executive tier share of output tokens</div>
+        <div class="fig is-fable" id="v-share-output">n/a</div>
+        <div class="sub-note" id="v-share-output-note"></div>
+      </div>
+      <div class="stat">
+        <div class="label">Executive tier share of weighted cost</div>
+        <div class="fig" id="v-share-weighted">n/a</div>
+        <div class="sub-note" id="v-share-weighted-note"></div>
+      </div>
+      <div class="stat">
+        <div class="label">Executive-only test</div>
+        <div id="v-pill-wrap"><span class="pill" id="v-pill">n/a</span></div>
+      </div>
+    </div>
+    <p class="prose" id="v-para">n/a</p>
+    <div>
+      <h3>Evidence</h3>
+      <ul class="list" id="v-evidence" style="padding-top:10px"></ul>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="charts-h">
+    <h2 id="charts-h">Utilization and the shape of the work</h2>
+    <div class="cols2">
+
+      <div class="panel">
+        <h3>Limit utilization over the window</h3>
+        <p class="caption">Scoped weekly utilization against the rolling five-hour and seven-day windows. Endpoint values are labelled.</p>
+        <div class="legend" id="util-legend"></div>
+        <div class="chart-wrap"><svg class="chart" id="util-chart" role="img" aria-label="Line chart of scoped, five-hour and seven-day limit utilization over the audit window"></svg></div>
+        <details id="util-table-wrap">
+          <summary>Table view: utilization samples</summary>
+          <div class="scroll-x" id="util-table"></div>
+        </details>
+      </div>
+
+      <div class="panel">
+        <h3>What each tier spent its tokens on</h3>
+        <p class="caption">Categories run executive to hands-on, left to right: DECIDE, DELEGATE, READ, AUTHOR, OPS, ARTIFACT. Each tier gets two bars, weighted cost and raw output. Both bars use one shared scale, so bar length compares across tiers.</p>
+        <div class="legend" id="tier-legend"></div>
+        <div class="chart-wrap"><svg class="chart" id="tier-chart" role="img" aria-label="Stacked bars of work category by model tier"></svg></div>
+        <div class="scroll-x" id="totals-table"></div>
+        <details id="tier-table-wrap">
+          <summary>Table view: category breakdown</summary>
+          <div class="scroll-x" id="tier-table"></div>
+        </details>
+      </div>
+
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="ledger-h">
+    <h2 id="ledger-h">Where the tokens went</h2>
+    <p class="caption">Every attributed block of spend in the window, ranked by weighted cost. The verdict column is the audit's own call on whether that block was executive work.</p>
+    <div class="scroll-x" id="ledger-table"></div>
+  </section>
+
+  <section class="band" aria-labelledby="hourly-h">
+    <h2 id="hourly-h">Hourly output by model</h2>
+    <p class="caption">Output tokens per UTC hour, stacked by model. Each model carries its own colour, so a handoff between models is visible where the colour steps.</p>
+    <div class="legend" id="hourly-legend"></div>
+    <div class="chart-wrap"><svg class="chart" id="hourly-chart" role="img" aria-label="Stacked bar chart of hourly output tokens by model"></svg></div>
+    <details id="hourly-table-wrap">
+      <summary>Table view: hourly output tokens</summary>
+      <div class="scroll-x" id="hourly-table"></div>
+    </details>
+  </section>
+
+  <section class="band" aria-labelledby="why-h">
+    <h2 id="why-h">Why it happened, and what to change</h2>
+    <div class="cols2">
+      <div class="panel">
+        <h3>Why</h3>
+        <p class="caption">Numbered because the source file orders these by impact, not because they happened in this sequence.</p>
+        <ol class="list" id="root-causes"></ol>
+      </div>
+      <div class="panel">
+        <h3>What to change</h3>
+        <p class="caption">Each item is a concrete configuration or routing change, not a policy statement.</p>
+        <ul class="list checklist" id="recs"></ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="foot-h">
+    <h2 id="foot-h">Notes and sources</h2>
+    <div class="foot">
+      <div>
+        <h3>Caveats</h3>
+        <ul class="list" id="caveats" style="padding-top:10px"></ul>
+      </div>
+      <div>
+        <h3>Weighted cost</h3>
+        <p style="padding-top:8px">Every "weighted" figure on this page is computed with one formula, so the tiers compare on a single scale:</p>
+        <p style="padding-top:8px"><span class="formula">weighted_cost = output + 0.1 &times; (input + cache_creation) + 0.01 &times; cache_read</span></p>
+        <p style="padding-top:8px">It is a comparison proxy built from transcript usage records. It is not a bill, and it does not model per-model pricing.</p>
+      </div>
+      <div>
+        <h3>Sources</h3>
+        <ul class="list" id="sources" style="padding-top:10px">
+          <li><span class="marker">1</span><span>Main session transcript, parsed message by message and deduped by message id.</span></li>
+          <li><span class="marker">2</span><span>Forked session transcripts launched by the dispatcher in this window.</span></li>
+          <li><span class="marker">3</span><span>Workflow agent transcripts, including runs that inherited the caller's model.</span></li>
+          <li><span class="marker">4</span><span>TokenDistributor history and logs, for utilization samples and dispatch decisions.</span></li>
+        </ul>
+      </div>
+      <p class="kicker">Built from files on disk; no figure is estimated unless listed under caveats.</p>
+    </div>
+  </section>
+
+</main>
+
+<script>
+const DATA = __DATA__;
+
+(function () {
+  "use strict";
+
+  /* ---------------------------------------------------------------- utils */
+
+  var D = (DATA && typeof DATA === "object") ? DATA : {};
+  var NS = "http://www.w3.org/2000/svg";
+  var CATS = ["DECIDE", "DELEGATE", "READ", "AUTHOR", "OPS", "ARTIFACT"];
+  var CAT_VARS = ["--cat-1", "--cat-2", "--cat-3", "--cat-4", "--cat-5", "--cat-6"];
+  var EXEC_CATS = { DECIDE: 1, DELEGATE: 1 };
+
+  function isNum(v) { return typeof v === "number" && isFinite(v); }
+  function num(v) {
+    if (isNum(v)) return v;
+    if (typeof v === "string") {
+      var s = v.replace(/[,\s%]/g, "");
+      if (s !== "" && isFinite(+s)) return +s;
+    }
+    return null;
+  }
+  function pick(obj, keys) {
+    if (!obj || typeof obj !== "object") return null;
+    for (var i = 0; i < keys.length; i++) {
+      if (obj[keys[i]] !== undefined && obj[keys[i]] !== null) return obj[keys[i]];
+    }
+    return null;
+  }
+  function pickNum(obj, keys) { return num(pick(obj, keys)); }
+
+  function fmtTok(v) {
+    var n = num(v);
+    if (n === null) return "n/a";
+    var a = Math.abs(n);
+    if (a >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (a >= 1e3) return (n / 1e3).toFixed(1) + "k";
+    return String(Math.round(n));
+  }
+  function fmtInt(v) {
+    var n = num(v);
+    if (n === null) return "n/a";
+    return Math.round(n).toLocaleString("en-US");
+  }
+  function fmtPct(v) {
+    var n = num(v);
+    if (n === null) return "n/a";
+    if (n > 1.0001) n = n / 100;
+    return (n * 100).toFixed(1) + "%";
+  }
+  function frac(v) {
+    var n = num(v);
+    if (n === null) return null;
+    return n > 1.0001 ? n / 100 : n;
+  }
+  function txt(v) { return (v === null || v === undefined) ? "n/a" : String(v); }
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+  function svg(tag, attrs) {
+    var e = document.createElementNS(NS, tag);
+    if (attrs) for (var k in attrs) if (attrs[k] !== null && attrs[k] !== undefined) e.setAttribute(k, String(attrs[k]));
+    return e;
+  }
+  function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); }
+  function byId(id) { return document.getElementById(id); }
+
+  function hourLabel(iso) {
+    if (!iso) return "n/a";
+    var m = String(iso).match(/T(\d{2}):(\d{2})/);
+    if (m) return m[1] + ":" + m[2];
+    return String(iso);
+  }
+  function dayLabel(iso) {
+    var m = String(iso || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+    return m ? m[2] + "-" + m[3] : "";
+  }
+  function stamp(iso) {
+    if (!iso) return "n/a";
+    var d = dayLabel(iso), h = hourLabel(iso);
+    return d ? d + " " + h : h;
+  }
+
+  /* --------------------------------------------------- model identity map */
+
+  function modelKind(model) {
+    var m = String(model || "").toLowerCase();
+    if (/fable/.test(m)) return "fable";
+    if (/opus/.test(m)) return "opus";
+    return "other";
+  }
+  function modelVar(model) {
+    var m = String(model || "").toLowerCase().replace(/[._]/g, "-");
+    if (/fable/.test(m)) return /5-1|5\.1|51\b/.test(m) ? "--m-fable-51" : "--m-fable-5";
+    if (/opus/.test(m)) return /4-8|4\.8|48\b/.test(m) ? "--m-opus-48" : "--m-opus-5";
+    return "--muted";
+  }
+  function modelColor(model) { return "var(" + modelVar(model) + ")"; }
+  function modelOrder(model) {
+    var v = modelVar(model);
+    var order = ["--m-fable-5", "--m-fable-51", "--m-opus-48", "--m-opus-5", "--muted"];
+    var i = order.indexOf(v);
+    return i < 0 ? order.length : i;
+  }
+
+  /* ------------------------------------------------------- normalisation */
+
+  // totals_by_model -> [{model, messages, output, cache_read, cache_creation, weighted}]
+  function normTotals(raw) {
+    var out = [];
+    if (!raw || typeof raw !== "object") return out;
+    var entries = Array.isArray(raw)
+      ? raw.map(function (r) { return [pick(r, ["model", "name", "id"]), r]; })
+      : Object.keys(raw).map(function (k) { return [k, raw[k]]; });
+    entries.forEach(function (pair) {
+      var model = pair[0], row = pair[1];
+      if (!row || typeof row !== "object") return;
+      var u = (row.usage && typeof row.usage === "object") ? row.usage : row;
+      out.push({
+        model: model || "unknown",
+        messages: pickNum(row, ["messages", "msgs", "message_count", "count"]),
+        output: pickNum(u, ["output_tokens", "output"]),
+        cache_read: pickNum(u, ["cache_read_tokens", "cache_read", "cache_read_input_tokens"]),
+        cache_creation: pickNum(u, ["cache_creation_tokens", "cache_creation", "cache_creation_input_tokens"]),
+        weighted: pickNum(row, ["weighted_cost", "weighted"]) === null
+          ? pickNum(u, ["weighted_cost", "weighted"])
+          : pickNum(row, ["weighted_cost", "weighted"])
+      });
+    });
+    out.sort(function (a, b) {
+      var d = modelOrder(a.model) - modelOrder(b.model);
+      return d !== 0 ? d : String(a.model).localeCompare(String(b.model));
+    });
+    return out;
+  }
+
+  // fable_work_breakdown -> {fable: {CAT: {output, weighted, share}}, opus: {...}}
+  function normBreakdown(raw) {
+    var res = { fable: {}, opus: {} };
+    if (!raw || typeof raw !== "object") return null;
+    var keys = Object.keys(raw);
+    if (!keys.length) return null;
+
+    var tierKeys = keys.filter(function (k) { return /^(fable|opus)$/i.test(k); });
+    if (tierKeys.length) {
+      // shape A: keyed by tier
+      tierKeys.forEach(function (k) {
+        var tier = k.toLowerCase();
+        var block = raw[k] || {};
+        Object.keys(block).forEach(function (cat) {
+          var row = block[cat] || {};
+          var c = String(cat).toUpperCase();
+          res[tier][c] = {
+            output: isNum(row) ? row : pickNum(row, ["output", "output_tokens"]),
+            weighted: isNum(row) ? null : pickNum(row, ["weighted", "weighted_cost"]),
+            share: isNum(row) ? null : frac(pick(row, ["share", "pct", "percent"]))
+          };
+        });
+      });
+      return res;
+    }
+
+    // shape B: keyed by category, tier-prefixed fields
+    keys.forEach(function (cat) {
+      var row = raw[cat] || {};
+      var c = String(cat).toUpperCase();
+      res.fable[c] = {
+        output: pickNum(row, ["fable_output", "fable_output_tokens"]),
+        weighted: pickNum(row, ["fable_weighted", "fable_weighted_cost"]),
+        share: frac(pick(row, ["fable_share", "fable_pct"]))
+      };
+      res.opus[c] = {
+        output: pickNum(row, ["opus_output", "opus_output_tokens"]),
+        weighted: pickNum(row, ["opus_weighted", "opus_weighted_cost"]),
+        share: frac(pick(row, ["opus_share", "opus_pct"]))
+      };
+    });
+    return res;
+  }
+
+  function catList(block) {
+    var seen = {}, list = [];
+    CATS.forEach(function (c) { if (block && block[c]) { seen[c] = 1; list.push(c); } });
+    Object.keys(block || {}).forEach(function (c) { if (!seen[c]) list.push(c); });
+    return list;
+  }
+  function allCats(bd) {
+    var s = {}, out = [];
+    ["fable", "opus"].forEach(function (t) {
+      catList((bd && bd[t]) || {}).forEach(function (c) { if (!s[c]) { s[c] = 1; out.push(c); } });
+    });
+    // keep canonical order first, then anything extra
+    var ordered = CATS.filter(function (c) { return out.indexOf(c) >= 0; });
+    out.forEach(function (c) { if (ordered.indexOf(c) < 0) ordered.push(c); });
+    return ordered;
+  }
+  function catColor(cat, cats) {
+    var i = cats.indexOf(cat);
+    if (i < 0) i = 0;
+    return "var(" + CAT_VARS[Math.min(i, CAT_VARS.length - 1)] + ")";
+  }
+
+  // utilization_series -> [{t, five_hour, seven_day, fable}] with fractions
+  function normUtil(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw.map(function (p) {
+      if (!p || typeof p !== "object") return null;
+      return {
+        t: pick(p, ["t", "time", "timestamp", "hour", "ts"]),
+        five_hour: frac(pick(p, ["five_hour", "fiveHour", "five_hour_pct", "5h", "five"])),
+        seven_day: frac(pick(p, ["seven_day", "sevenDay", "seven_day_pct", "7d", "seven"])),
+        fable: frac(pick(p, ["fable", "fable_pct", "fable_weekly", "weekly_fable"]))
+      };
+    }).filter(Boolean);
+  }
+
+  // hourly_output_by_model -> {hours: [iso], byModel: {model: {hour: tokens}}}
+  function normHourly(raw) {
+    var byModel = {}, hourSet = {};
+    function add(model, hour, v) {
+      var n = num(v);
+      if (!model || !hour || n === null) return;
+      var m = String(model);
+      if (!byModel[m]) byModel[m] = {};
+      byModel[m][hour] = (byModel[m][hour] || 0) + n;
+      hourSet[hour] = 1;
+    }
+    function valueOf(v) {
+      if (isNum(v) || typeof v === "string") return num(v);
+      if (v && typeof v === "object") return pickNum(v, ["output", "output_tokens", "tokens", "out"]);
+      return null;
+    }
+    if (Array.isArray(raw)) {
+      raw.forEach(function (r) {
+        if (!r || typeof r !== "object") return;
+        add(pick(r, ["model", "name"]), pick(r, ["hour", "t", "time", "timestamp", "ts"]),
+          valueOf(pick(r, ["output", "output_tokens", "tokens", "value"])));
+      });
+    } else if (raw && typeof raw === "object") {
+      var keys = Object.keys(raw);
+      var looksLikeHours = keys.length > 0 && keys.every(function (k) { return /^\d{4}-\d{2}-\d{2}/.test(k); });
+      keys.forEach(function (k) {
+        var inner = raw[k];
+        if (!inner || typeof inner !== "object") return;
+        Object.keys(inner).forEach(function (k2) {
+          if (looksLikeHours) add(k2, k, valueOf(inner[k2]));   // {hour: {model: n}}
+          else add(k, k2, valueOf(inner[k2]));                  // {model: {hour: n}}
+        });
+      });
+    }
+    var hours = Object.keys(hourSet).sort();
+    return { hours: hours, byModel: byModel };
+  }
+
+  function normLedger(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw.map(function (r) {
+      if (!r || typeof r !== "object") return null;
+      return {
+        source: pick(r, ["source", "src", "origin"]),
+        id: pick(r, ["id_or_label", "id", "label", "name"]),
+        what: pick(r, ["what", "description", "detail", "note"]),
+        output: pickNum(r, ["fable_output", "output", "output_tokens"]),
+        cache_read: pickNum(r, ["fable_cache_read", "cache_read", "cache_read_tokens"]),
+        weighted: pickNum(r, ["weighted_cost", "weighted", "fable_weighted"]),
+        verdict: pick(r, ["verdict", "call", "judgement", "judgment"])
+      };
+    }).filter(Boolean).sort(function (a, b) {
+      return (b.weighted === null ? -Infinity : b.weighted) - (a.weighted === null ? -Infinity : a.weighted);
+    });
+  }
+
+  /* ------------------------------------------------------------- header */
+
+  var W = D.window || {};
+  var wStart = pick(W, ["start", "from", "begin"]);
+  var wEnd = pick(W, ["end", "to", "finish"]);
+  var wHours = pickNum(W, ["hours", "duration_hours", "h"]);
+  byId("eyebrow").textContent =
+    "TOKEN LEDGER \u00B7 " + (wStart ? stamp(wStart) : "n/a") + " \u2192 " + (wEnd ? stamp(wEnd) : "n/a") +
+    " UTC \u00B7 " + (wHours === null ? "n/a" : (Math.round(wHours * 100) / 100)) + " h";
+
+  /* ------------------------------------------------------ sample banner */
+
+  var caveats = Array.isArray(D.caveats) ? D.caveats : [];
+  var sampleCav = caveats.filter(function (c) { return /^\s*(sample|preview|placeholder)\b/i.test(String(c)); })[0];
+  if (sampleCav) {
+    var b = byId("sample-banner");
+    b.hidden = false;
+    b.className = "banner";
+    var lab = el("strong", null, "SAMPLE");
+    var p = el("p", null, String(sampleCav));
+    b.appendChild(lab);
+    b.appendChild(p);
+  }
+
+  /* ------------------------------------------------------------ verdict */
+
+  var fvo = D.fable_vs_opus || {};
+  var shareOut = frac(pick(fvo, ["fable_share_output", "share_output"]));
+  var shareW = frac(pick(fvo, ["fable_share_weighted", "share_weighted"]));
+  var fOut = pickNum(fvo, ["fable_output", "fable_output_tokens"]);
+  var oOut = pickNum(fvo, ["opus_output", "opus_output_tokens"]);
+
+  byId("v-share-output").textContent = shareOut === null ? "n/a" : fmtPct(shareOut);
+  byId("v-share-weighted").textContent = shareW === null ? "n/a" : fmtPct(shareW);
+  byId("v-share-output-note").textContent =
+    (fOut === null && oOut === null) ? "" : (fmtTok(fOut) + " executive vs " + fmtTok(oOut) + " worker");
+  byId("v-share-weighted-note").textContent = "output + 0.1\u00D7(input + cache creation) + 0.01\u00D7cache read";
+
+  var V = D.verdict || {};
+  var execOnly = pick(V, ["executive_only", "executive"]);
+  var pill = byId("v-pill");
+  clear(pill);
+  if (execOnly === true || execOnly === false) {
+    pill.className = "pill " + (execOnly ? "pill--ok" : "pill--crit");
+    pill.appendChild(el("span", "dot"));
+    pill.appendChild(document.createTextNode(execOnly ? "EXECUTIVE ONLY" : "NOT EXECUTIVE ONLY"));
+  } else {
+    pill.textContent = "VERDICT N/A";
+  }
+  byId("v-para").textContent = txt(pick(V, ["one_paragraph", "paragraph", "summary"]));
+
+  var evList = byId("v-evidence");
+  var evidence = Array.isArray(V.evidence) ? V.evidence : [];
+  if (!evidence.length) evList.appendChild(el("li", null, "n/a"));
+  evidence.forEach(function (e, i) {
+    var li = el("li");
+    li.appendChild(el("span", "marker", String(i + 1)));
+    li.appendChild(el("span", null, String(e)));
+    evList.appendChild(li);
+  });
+
+  /* ------------------------------------------------- chart 1: utilization */
+
+  function drawUtil() {
+    var pts = normUtil(D.utilization_series);
+    var host = byId("util-chart");
+    var legend = byId("util-legend");
+    var series = [
+      { key: "fable", name: "Scoped weekly", color: "var(--fable)", dash: null },
+      { key: "five_hour", name: "Five-hour window", color: "var(--muted)", dash: "5 4" },
+      { key: "seven_day", name: "Seven-day window", color: "var(--opus)", dash: null }
+    ];
+
+    series.forEach(function (s) {
+      var k = el("span", "key");
+      var line = el("span", "line-key" + (s.dash ? " dashed" : ""));
+      line.style.borderTopColor = s.color;
+      k.appendChild(line);
+      k.appendChild(el("span", null, s.name));
+      legend.appendChild(k);
+    });
+
+    if (!pts.length) {
+      host.parentNode.appendChild(el("p", "caption", "n/a \u2014 no utilization_series in the source file."));
+      byId("util-table-wrap").hidden = true;
+      return;
+    }
+
+    var w = 660, h = 300, m = { t: 14, r: 92, b: 40, l: 44 };
+    var pw = w - m.l - m.r, ph = h - m.t - m.b;
+    host.setAttribute("viewBox", "0 0 " + w + " " + h);
+    host.setAttribute("preserveAspectRatio", "xMidYMid meet");
+
+    var n = pts.length;
+    function X(i) { return m.l + (n === 1 ? pw / 2 : (i * pw) / (n - 1)); }
+    function Y(v) { return m.t + (1 - v) * ph; }
+
+    [0, 0.25, 0.5, 0.75, 1].forEach(function (g) {
+      host.appendChild(svg("line", {
+        x1: m.l, x2: m.l + pw, y1: Y(g), y2: Y(g),
+        stroke: "var(--rule)", "stroke-width": 1, "shape-rendering": "crispEdges"
+      }));
+      var t = svg("text", { x: m.l - 8, y: Y(g) + 4, "text-anchor": "end",
+        fill: "var(--muted)", "font-size": 11, "font-family": "var(--font-mono)" });
+      t.textContent = (g * 100).toFixed(0) + "%";
+      host.appendChild(t);
+    });
+
+    var step = Math.max(1, Math.ceil(n / 8));
+    pts.forEach(function (p, i) {
+      if (i % step !== 0 && i !== n - 1) return;
+      var t = svg("text", { x: X(i), y: m.t + ph + 18, "text-anchor": "middle",
+        fill: "var(--muted)", "font-size": 11, "font-family": "var(--font-mono)" });
+      t.textContent = hourLabel(p.t);
+      host.appendChild(t);
+    });
+    var xl = svg("text", { x: m.l, y: m.t + ph + 34, fill: "var(--muted)", "font-size": 10.5,
+      "font-family": "var(--font-mono)", "letter-spacing": "0.08em" });
+    xl.textContent = "HH:MM UTC";
+    host.appendChild(xl);
+
+    var ends = [];
+    series.forEach(function (s) {
+      var d = "", last = null, lastI = -1, started = false;
+      pts.forEach(function (p, i) {
+        var v = p[s.key];
+        if (v === null) { started = false; return; }
+        d += (started ? " L" : " M") + X(i).toFixed(1) + " " + Y(v).toFixed(1);
+        started = true; last = v; lastI = i;
+      });
+      if (!d) return;
+      host.appendChild(svg("path", {
+        d: d.trim(), fill: "none", stroke: s.color, "stroke-width": 2,
+        "stroke-linejoin": "round", "stroke-linecap": "round",
+        "stroke-dasharray": s.dash
+      }));
+      if (lastI >= 0) ends.push({ s: s, x: X(lastI), y: Y(last), v: last });
+    });
+
+    // end labels: nudge apart when the lines converge, keep a leader to the dot
+    ends.sort(function (a, b) { return a.y - b.y; });
+    ends.forEach(function (e, i) {
+      e.ly = e.y;
+      if (i > 0 && e.ly < ends[i - 1].ly + 16) e.ly = ends[i - 1].ly + 16;
+    });
+    ends.forEach(function (e) {
+      host.appendChild(svg("circle", { cx: e.x, cy: e.y, r: 4.5,
+        fill: e.s.color, stroke: "var(--surface)", "stroke-width": 2 }));
+      if (Math.abs(e.ly - e.y) > 2) {
+        host.appendChild(svg("path", {
+          d: "M" + (e.x + 6) + " " + e.y.toFixed(1) + " L" + (e.x + 12) + " " + e.ly.toFixed(1),
+          fill: "none", stroke: "var(--rule)", "stroke-width": 1
+        }));
+      }
+      var lab = svg("text", { x: e.x + 14, y: e.ly + 4, "font-size": 12,
+        "font-family": "var(--font-mono)", "font-weight": 500, fill: "var(--ink)" });
+      lab.textContent = (e.v * 100).toFixed(1) + "%";
+      var key = svg("tspan", { fill: "var(--muted)", "font-weight": 400, "font-size": 10.5 });
+      key.textContent = "  " + (e.s.key === "fable" ? "scoped" : (e.s.key === "five_hour" ? "5h" : "7d"));
+      lab.appendChild(key);
+      host.appendChild(lab);
+    });
+
+    // table twin
+    var tbl = el("table");
+    var cap = el("caption", null, "Utilization samples, percent of limit.");
+    tbl.appendChild(cap);
+    var thead = el("thead"), hr = el("tr");
+    ["Time (UTC)", "Scoped", "Five-hour", "Seven-day"].forEach(function (hd, i) {
+      var th = el("th", i ? "n" : null, hd); hr.appendChild(th);
+    });
+    thead.appendChild(hr); tbl.appendChild(thead);
+    var tb = el("tbody");
+    pts.forEach(function (p) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "id", stamp(p.t)));
+      [p.fable, p.five_hour, p.seven_day].forEach(function (v) {
+        tr.appendChild(el("td", "n", v === null ? "n/a" : fmtPct(v)));
+      });
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    byId("util-table").appendChild(tbl);
+  }
+
+  /* -------------------------------------------- chart 2: tier breakdown */
+
+  function drawTiers() {
+    var bd = normBreakdown(D.fable_work_breakdown);
+    var host = byId("tier-chart");
+    var legend = byId("tier-legend");
+    if (!bd) {
+      host.parentNode.appendChild(el("p", "caption", "n/a \u2014 no fable_work_breakdown in the source file."));
+      byId("tier-table-wrap").hidden = true;
+      drawTotals();
+      return;
+    }
+    var cats = allCats(bd);
+
+    cats.forEach(function (c) {
+      var k = el("span", "key");
+      var sw = el("span", "swatch");
+      sw.style.background = catColor(c, cats);
+      k.appendChild(sw);
+      k.appendChild(el("span", null, c + (EXEC_CATS[c] ? "" : "")));
+      legend.appendChild(k);
+    });
+    var note = el("span", "key");
+    note.appendChild(el("span", null, "DECIDE and DELEGATE are the executive categories."));
+    legend.appendChild(note);
+
+    var rows = [];
+    ["fable", "opus"].forEach(function (tier) {
+      ["weighted", "output"].forEach(function (metric) {
+        var vals = cats.map(function (c) {
+          var cell = (bd[tier] && bd[tier][c]) || {};
+          var v = cell[metric];
+          return v === null || v === undefined ? 0 : v;
+        });
+        var total = vals.reduce(function (a, b) { return a + b; }, 0);
+        rows.push({ tier: tier, metric: metric, vals: vals, total: total });
+      });
+    });
+    var max = Math.max.apply(null, rows.map(function (r) { return r.total; }).concat([1]));
+
+    var w = 660, m = { t: 24, r: 64, b: 28, l: 76 };
+    var barH = 20, pairGap = 6, groupGap = 48;
+    var h = m.t + m.b + rows.length * barH + 2 * pairGap + groupGap;
+    var pw = w - m.l - m.r;
+    host.setAttribute("viewBox", "0 0 " + w + " " + h);
+    host.setAttribute("preserveAspectRatio", "xMidYMid meet");
+
+    var y = m.t;
+    rows.forEach(function (r, ri) {
+      if (ri === 2) y += groupGap;
+      else if (ri > 0) y += pairGap;
+
+      if (ri === 0 || ri === 2) {
+        var tl = svg("text", { x: 0, y: y - 9, fill: "var(--ink)", "font-size": 13,
+          "font-family": "var(--font-head)", "font-weight": 600 });
+        tl.textContent = r.tier === "fable" ? "Executive tier" : "Worker tier";
+        host.appendChild(tl);
+      }
+      var ml = svg("text", { x: m.l - 10, y: y + 14, "text-anchor": "end", fill: "var(--muted)",
+        "font-size": 11, "font-family": "var(--font-mono)" });
+      ml.textContent = r.metric;
+      host.appendChild(ml);
+
+      var x = m.l;
+      r.vals.forEach(function (v, i) {
+        var segW = (v / max) * pw;
+        if (segW > 0) {
+          var drawW = Math.max(0.6, segW - 2);
+          var rect = svg("rect", { x: x, y: y, width: drawW, height: barH,
+            fill: catColor(cats[i], cats) });
+          var ttl = svg("title");
+          ttl.textContent = cats[i] + " \u00B7 " + r.tier + " \u00B7 " + r.metric + " " + fmtTok(v) +
+            " (" + fmtInt(v) + ")";
+          rect.appendChild(ttl);
+          host.appendChild(rect);
+          if (drawW > 46) {
+            var lab = svg("text", { x: x + 6, y: y + 14, "font-size": 11,
+              "font-family": "var(--font-mono)", "font-weight": 500,
+              fill: i >= 2 ? "var(--surface)" : "var(--ink)" });
+            lab.textContent = fmtTok(v);
+            host.appendChild(lab);
+          }
+        }
+        x += segW;
+      });
+      var tot = svg("text", { x: Math.min(x + 8, w - 4), y: y + 14, "font-size": 11.5,
+        "font-family": "var(--font-mono)", fill: "var(--muted)" });
+      tot.textContent = fmtTok(r.total);
+      host.appendChild(tot);
+      y += barH;
+    });
+
+    var scaleNote = svg("text", { x: m.l, y: h - 8, "font-size": 10.5,
+      "font-family": "var(--font-mono)", fill: "var(--muted)", "letter-spacing": "0.06em" });
+    scaleNote.textContent = "SHARED SCALE \u00B7 0 \u2192 " + fmtTok(max) + " TOKENS";
+    host.appendChild(scaleNote);
+
+    // table twin
+    var tbl = el("table");
+    tbl.appendChild(el("caption", null, "Category breakdown by tier. Share is the tier's own weighted cost share."));
+    var thead = el("thead"), hr = el("tr");
+    ["Tier", "Category", "Output", "Weighted", "Share"].forEach(function (hd, i) {
+      hr.appendChild(el("th", i >= 2 ? "n" : null, hd));
+    });
+    thead.appendChild(hr); tbl.appendChild(thead);
+    var tb = el("tbody");
+    ["fable", "opus"].forEach(function (tier) {
+      cats.forEach(function (c) {
+        var cell = (bd[tier] && bd[tier][c]) || {};
+        var tr = el("tr");
+        tr.appendChild(el("td", null, tier === "fable" ? "Executive" : "Worker"));
+        var tdc = el("td");
+        var key = el("span", "row-key");
+        var sw = el("span", "swatch"); sw.style.background = catColor(c, cats);
+        key.appendChild(sw); key.appendChild(el("span", null, c));
+        tdc.appendChild(key);
+        tr.appendChild(tdc);
+        tr.appendChild(el("td", "n", cell.output === null || cell.output === undefined ? "n/a" : fmtInt(cell.output)));
+        tr.appendChild(el("td", "n", cell.weighted === null || cell.weighted === undefined ? "n/a" : fmtInt(cell.weighted)));
+        tr.appendChild(el("td", "n", cell.share === null || cell.share === undefined ? "n/a" : fmtPct(cell.share)));
+        tb.appendChild(tr);
+      });
+    });
+    tbl.appendChild(tb);
+    byId("tier-table").appendChild(tbl);
+
+    drawTotals();
+  }
+
+  /* ------------------------------------------------------- totals table */
+
+  function drawTotals() {
+    var rows = normTotals(D.totals_by_model);
+    var host = byId("totals-table");
+    if (!rows.length) {
+      host.appendChild(el("p", "caption", "n/a \u2014 no totals_by_model in the source file."));
+      return;
+    }
+    var tbl = el("table");
+    tbl.appendChild(el("caption", null, "Per-model totals for the window. Token columns in millions."));
+    var thead = el("thead"), hr = el("tr");
+    ["Model", "Msgs", "Output M", "Cache rd M", "Cache cr M", "Weighted M"].forEach(function (hd, i) {
+      hr.appendChild(el("th", i ? "n" : null, hd));
+    });
+    thead.appendChild(hr); tbl.appendChild(thead);
+    var tb = el("tbody");
+    rows.forEach(function (r) {
+      var tr = el("tr");
+      var td = el("td");
+      var key = el("span", "row-key");
+      var sw = el("span", "swatch"); sw.style.background = modelColor(r.model);
+      key.appendChild(sw);
+      var nm = el("span", "mono", r.model); nm.style.fontSize = "12px";
+      key.appendChild(nm);
+      td.appendChild(key);
+      tr.appendChild(td);
+      tr.appendChild(el("td", "n", r.messages === null ? "n/a" : fmtInt(r.messages)));
+      [r.output, r.cache_read, r.cache_creation, r.weighted].forEach(function (v) {
+        tr.appendChild(el("td", "n", v === null ? "n/a" : fmtTok(v)));
+      });
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    host.appendChild(tbl);
+  }
+
+  /* --------------------------------------------------------- ledger table */
+
+  function drawLedger() {
+    var rows = normLedger(D.where_fable_went);
+    var host = byId("ledger-table");
+    if (!rows.length) {
+      host.appendChild(el("p", "caption", "n/a \u2014 no where_fable_went in the source file."));
+      return;
+    }
+    var tbl = el("table");
+    var thead = el("thead"), hr = el("tr");
+    [["#", "n"], ["Source", null], ["ID / label", null], ["What", null],
+     ["Output M", "n"], ["Cache read M", "n"], ["Weighted M", "n"], ["Verdict", null]]
+      .forEach(function (c) { hr.appendChild(el("th", c[1], c[0])); });
+    thead.appendChild(hr); tbl.appendChild(thead);
+    var tb = el("tbody");
+    rows.forEach(function (r, i) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "n", String(i + 1)));
+      tr.appendChild(el("td", null, txt(r.source)));
+      tr.appendChild(el("td", "id", txt(r.id)));
+      tr.appendChild(el("td", "what", txt(r.what)));
+      tr.appendChild(el("td", "n", r.output === null ? "n/a" : fmtTok(r.output)));
+      tr.appendChild(el("td", "n", r.cache_read === null ? "n/a" : fmtTok(r.cache_read)));
+      tr.appendChild(el("td", "n", r.weighted === null ? "n/a" : fmtTok(r.weighted)));
+
+      var v = String(r.verdict || "").toLowerCase();
+      var cls = v === "executive" ? "pill--ok" : (v === "hands-on" ? "pill--warn" : (v === "worker-tier" ? "pill--crit" : ""));
+      var tdv = el("td");
+      var p = el("span", "pill pill--sm " + cls);
+      p.appendChild(el("span", "dot"));
+      p.appendChild(document.createTextNode(r.verdict ? String(r.verdict) : "n/a"));
+      tdv.appendChild(p);
+      tr.appendChild(tdv);
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    host.appendChild(tbl);
+  }
+
+  /* ---------------------------------------------------- chart 3: hourly */
+
+  function niceMax(v) {
+    if (!(v > 0)) return 1;
+    var mag = Math.pow(10, Math.floor(Math.log10(v)));
+    var steps = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10];
+    for (var i = 0; i < steps.length; i++) {
+      if (steps[i] * mag >= v) return steps[i] * mag;
+    }
+    return 10 * mag;
+  }
+  function topRoundRect(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h);
+    if (h <= 0 || w <= 0) return "";
+    return "M" + x + " " + (y + h) +
+      " L" + x + " " + (y + r) +
+      " Q" + x + " " + y + " " + (x + r) + " " + y +
+      " L" + (x + w - r) + " " + y +
+      " Q" + (x + w) + " " + y + " " + (x + w) + " " + (y + r) +
+      " L" + (x + w) + " " + (y + h) + " Z";
+  }
+
+  function drawHourly() {
+    var H = normHourly(D.hourly_output_by_model);
+    var host = byId("hourly-chart");
+    var legend = byId("hourly-legend");
+    var models = Object.keys(H.byModel).sort(function (a, b) {
+      var d = modelOrder(a) - modelOrder(b);
+      return d !== 0 ? d : a.localeCompare(b);
+    });
+
+    models.forEach(function (mo) {
+      var k = el("span", "key");
+      var sw = el("span", "swatch");
+      sw.style.background = modelColor(mo);
+      k.appendChild(sw);
+      k.appendChild(el("span", null, mo));
+      legend.appendChild(k);
+    });
+
+    if (!H.hours.length || !models.length) {
+      host.parentNode.appendChild(el("p", "caption", "n/a \u2014 no hourly_output_by_model in the source file."));
+      byId("hourly-table-wrap").hidden = true;
+      return;
+    }
+
+    var w = 1060, h = 320, m = { t: 22, r: 12, b: 46, l: 56 };
+    var pw = w - m.l - m.r, ph = h - m.t - m.b;
+    host.setAttribute("viewBox", "0 0 " + w + " " + h);
+    host.setAttribute("preserveAspectRatio", "xMidYMid meet");
+
+    var totals = H.hours.map(function (hr) {
+      return models.reduce(function (a, mo) { return a + (H.byModel[mo][hr] || 0); }, 0);
+    });
+    var maxTotal = Math.max.apply(null, totals.concat([0]));
+    var top = niceMax(maxTotal);
+    var peakIdx = totals.indexOf(maxTotal);
+
+    function Y(v) { return m.t + (1 - v / top) * ph; }
+
+    var ticks = 4;
+    for (var i = 0; i <= ticks; i++) {
+      var v = (top * i) / ticks;
+      host.appendChild(svg("line", { x1: m.l, x2: m.l + pw, y1: Y(v), y2: Y(v),
+        stroke: "var(--rule)", "stroke-width": 1, "shape-rendering": "crispEdges" }));
+      var t = svg("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end", fill: "var(--muted)",
+        "font-size": 11, "font-family": "var(--font-mono)" });
+      t.textContent = fmtTok(v);
+      host.appendChild(t);
+    }
+    var yl = svg("text", { x: 0, y: m.t - 8, fill: "var(--muted)", "font-size": 10.5,
+      "font-family": "var(--font-mono)", "letter-spacing": "0.08em" });
+    yl.textContent = "OUTPUT TOKENS";
+    host.appendChild(yl);
+
+    var band = pw / H.hours.length;
+    var barW = Math.min(26, band * 0.62);
+
+    H.hours.forEach(function (hr, hi) {
+      var cx = m.l + band * (hi + 0.5);
+      var x = cx - barW / 2;
+      var acc = 0;
+      var stackTop = null;
+      // draw from the top of the stack downward so the topmost gets the rounded cap
+      var segs = models.map(function (mo) { return { model: mo, v: H.byModel[mo][hr] || 0 }; })
+        .filter(function (s) { return s.v > 0; });
+      var running = 0;
+      segs.forEach(function (s, si) {
+        var y0 = Y(running + s.v), y1 = Y(running);
+        var segH = Math.max(0, y1 - y0 - (si === segs.length - 1 ? 0 : 0));
+        var gap = si === segs.length - 1 ? 0 : 2;
+        var drawH = Math.max(0.8, segH - gap);
+        var isTop = si === segs.length - 1;
+        var node;
+        if (isTop) {
+          node = svg("path", { d: topRoundRect(x, y0, barW, drawH, 4), fill: modelColor(s.model) });
+        } else {
+          node = svg("rect", { x: x, y: y0 + gap, width: barW, height: drawH, fill: modelColor(s.model) });
+        }
+        var ttl = svg("title");
+        ttl.textContent = hourLabel(hr) + " UTC \u00B7 " + s.model + " \u00B7 " + fmtInt(s.v) + " output tokens";
+        node.appendChild(ttl);
+        host.appendChild(node);
+        running += s.v;
+        stackTop = y0;
+      });
+      if (hi === peakIdx && stackTop !== null) {
+        var pl = svg("text", { x: cx, y: stackTop - 8, "text-anchor": "middle", fill: "var(--ink)",
+          "font-size": 11.5, "font-family": "var(--font-mono)", "font-weight": 500 });
+        pl.textContent = fmtTok(totals[hi]);
+        host.appendChild(pl);
+      }
+      var xt = svg("text", { x: cx, y: m.t + ph + 18, "text-anchor": "middle", fill: "var(--muted)",
+        "font-size": 11, "font-family": "var(--font-mono)" });
+      xt.textContent = hourLabel(hr);
+      host.appendChild(xt);
+      if (hi === 0 || dayLabel(hr) !== dayLabel(H.hours[hi - 1])) {
+        var dt = svg("text", { x: cx, y: m.t + ph + 33, "text-anchor": "middle", fill: "var(--muted)",
+          "font-size": 10, "font-family": "var(--font-mono)" });
+        dt.textContent = dayLabel(hr);
+        host.appendChild(dt);
+      }
+    });
+
+    // table twin
+    var tbl = el("table");
+    tbl.appendChild(el("caption", null, "Output tokens per UTC hour."));
+    var thead = el("thead"), hr2 = el("tr");
+    hr2.appendChild(el("th", null, "Hour (UTC)"));
+    models.forEach(function (mo) { hr2.appendChild(el("th", "n", mo)); });
+    hr2.appendChild(el("th", "n", "Total"));
+    thead.appendChild(hr2); tbl.appendChild(thead);
+    var tb = el("tbody");
+    H.hours.forEach(function (hrk, hi) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "id", stamp(hrk)));
+      models.forEach(function (mo) {
+        var v = H.byModel[mo][hrk];
+        tr.appendChild(el("td", "n", v === undefined ? "\u2014" : fmtInt(v)));
+      });
+      tr.appendChild(el("td", "n", fmtInt(totals[hi])));
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    byId("hourly-table").appendChild(tbl);
+  }
+
+  /* ------------------------------------------------------ lists & footer */
+
+  function fillList(hostId, arr, numbered) {
+    var host = byId(hostId);
+    var items = Array.isArray(arr) ? arr : [];
+    if (!items.length) {
+      var li0 = el("li");
+      li0.appendChild(el("span", "marker", numbered ? "\u2014" : ""));
+      li0.appendChild(el("span", null, "n/a"));
+      host.appendChild(li0);
+      return;
+    }
+    items.forEach(function (s, i) {
+      var li = el("li");
+      li.appendChild(el("span", "marker", numbered ? String(i + 1) : ""));
+      li.appendChild(el("span", null, String(s)));
+      host.appendChild(li);
+    });
+  }
+
+  try { drawUtil(); } catch (e) { console.error("util chart", e); }
+  try { drawTiers(); } catch (e) { console.error("tier chart", e); try { drawTotals(); } catch (e2) {} }
+  try { drawLedger(); } catch (e) { console.error("ledger", e); }
+  try { drawHourly(); } catch (e) { console.error("hourly chart", e); }
+  try {
+    fillList("root-causes", D.root_causes, true);
+    fillList("recs", D.recommendations, false);
+    fillList("caveats", caveats, true);
+  } catch (e) { console.error("lists", e); }
+})();
+</script>
+</body>
+</html>

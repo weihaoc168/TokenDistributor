@@ -10,6 +10,13 @@ from datetime import datetime
 from typing import IO
 
 from .config import Config
+from .handover import (
+    FORK_FALLBACK_MODEL,
+    FORK_MODES,
+    FORK_TASK_ID,
+    finish_handover,
+    write_handover,
+)
 from .models import Decision, QueueStats, TaskSpec, parse_iso, utcnow
 
 LOCAL_HEALTH_TIMEOUT = 4.0
@@ -89,10 +96,15 @@ class Dispatcher:
         self._local_start_ts: float | None = None
         self.local_engine_healthy: bool | None = None
         self._adopted: dict[str, int] = {}
+        # Mode of the decision currently being applied; the handover record has
+        # to say whether the director fork was launched in pace or under full
+        # throttle, and apply() is the only place that knows.
+        self.current_mode: str | None = None
         self.load()
         if not supervise:
             return
         changed = False
+        now = utcnow()
         for task in self._tasks:
             if task.status == "running" and task.id not in self._procs:
                 # A restart must not kill the bookkeeping of a session another
@@ -103,6 +115,13 @@ class Dispatcher:
                     continue
                 task.status = "failed"
                 task.error = "orphaned by tracker restart"
+                # An orphan is an exit like any other: stamp finished_at (the
+                # re-arm cooldown is measured from it) and close the handover.
+                # Loop and fork usually die together - a reboot - and without
+                # this the record stays at "started" for a director that no
+                # longer exists, forever if the fork is never re-armed.
+                task.finished_at = now.isoformat()
+                self._note_fork_finish(task, now)
                 changed = True
         if changed:
             self.save()
@@ -211,6 +230,12 @@ class Dispatcher:
             for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens")
         )
         task.session_tokens = tokens or None
+        # The session id claude minted for this run. `--fork-session` means the
+        # id is only knowable from this result, and without it the ledger has
+        # to guess which transcript on disk belonged to the fork.
+        session_id = result.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            task.fork_session_id = session_id
         cost = result.get("total_cost_usd")
         task.cost_usd = float(cost) if isinstance(cost, (int, float)) else None
         task.finished_at = now.isoformat()
@@ -221,6 +246,9 @@ class Dispatcher:
         else:
             task.status = "failed"
             task.error = str(result.get("result", ""))[:200] or f"exit code {exit_code}"
+
+        self._note_fork_finish(task, now, tokens=tokens, cost_usd=task.cost_usd,
+                               fork_session_id=result.get("session_id"))
 
         started = parse_iso(task.started_at) or now
         minutes = max((now - started).total_seconds() / 60, 0.1)
@@ -235,6 +263,25 @@ class Dispatcher:
                 pass
         lane = " local" if task.lane == "local" else ""
         return f"task {task.id}: {task.status}{lane} ({tokens} tokens, {minutes:.1f} min)"
+
+    def _note_fork_finish(self, task: TaskSpec, now: datetime,
+                          tokens: int | None = None,
+                          cost_usd: float | None = None,
+                          fork_session_id: str | None = None) -> None:
+        """Close out the handover record when the director fork ends.
+
+        Every exit goes through here - finalize, adoption, both kill paths and
+        the restart orphan-marking - so the monitor session never sees a fork
+        stuck at "started" forever.
+        """
+        if task.id != FORK_TASK_ID:
+            return
+        sid = fork_session_id if isinstance(fork_session_id, str) else None
+        finish_handover(
+            self.cfg, status=task.status,
+            finished_at=task.finished_at or now.isoformat(),
+            tokens=tokens, cost_usd=cost_usd, fork_session_id=sid,
+        )
 
     def _kill_tree(self, pid: int) -> None:
         subprocess.run(
@@ -265,6 +312,7 @@ class Dispatcher:
                 task.error = f"exceeded max_minutes={limit_minutes:g}"
                 task.finished_at = now.isoformat()
                 del self._procs[task_id]
+                self._note_fork_finish(task, now)
                 actions.append(f"task {task.id}: killed after {limit_minutes:g} min limit")
         for task_id, pid in list(self._adopted.items()):
             task = self.get(task_id)
@@ -286,20 +334,21 @@ class Dispatcher:
                 task.status = "killed"
                 task.error = f"exceeded max_minutes={limit_minutes:g}"
                 task.finished_at = now.isoformat()
+                self._note_fork_finish(task, now)
                 actions.append(
                     f"task {task.id}: adopted session killed after {limit_minutes:g} min limit")
         if actions:
             self.save()
         return actions
 
-    def launch(self, task: TaskSpec, now: datetime, lane: str = "cloud") -> str:
-        exe = shutil.which(self.cfg.claude_cmd)
-        if exe is None:
-            raise DispatchError(f"claude executable not found: {self.cfg.claude_cmd}")
+    def _argv(self, task: TaskSpec, lane: str, exe: str) -> list[str]:
+        """The command line for one task, in one place so it can be asserted on.
+
+        The director fork's line must carry `--model <throttle_model>` and
+        `--resume <parent session> --fork-session`; an earlier audit found a
+        launch that went out with no --model at all.
+        """
         cmd = [exe, "-p", "--output-format", "json"]
-        env = None
-        if lane == "local":
-            env = local_env(self.cfg)
         model = self._task_model(task, lane)
         if model:
             cmd += ["--model", model]
@@ -310,6 +359,14 @@ class Dispatcher:
         else:
             cmd += ["--permission-mode", self.cfg.permission_mode]
         cmd += self.cfg.extra_claude_args
+        return cmd
+
+    def launch(self, task: TaskSpec, now: datetime, lane: str = "cloud") -> str:
+        exe = shutil.which(self.cfg.claude_cmd)
+        if exe is None:
+            raise DispatchError(f"claude executable not found: {self.cfg.claude_cmd}")
+        env = local_env(self.cfg) if lane == "local" else None
+        cmd = self._argv(task, lane, exe)
 
         prompt = self._task_prompt(task, lane)
 
@@ -335,18 +392,42 @@ class Dispatcher:
         task.error = None
         self._procs[task.id] = _Proc(popen, out, err)
         self.save()
+        if task.id == FORK_TASK_ID:
+            # The handover signal: the parent session stops working here and
+            # watches this file. Written after the process actually started, so
+            # a failed launch never claims a handover happened.
+            mode = self.current_mode if self.current_mode in FORK_MODES else FORK_MODES[0]
+            write_handover(
+                self.cfg, task_id=task.id, mode=mode,
+                model=self._task_model(task, lane),
+                parent_session=task.resume_session,
+                started_at=task.started_at,
+            )
         suffix = f" -> {self.cfg.local_model}" if lane == "local" else ""
         return f"task {task.id}: launched {lane}{suffix} ({task.weight}, pid {popen.pid})"
 
     def _task_model(self, task: TaskSpec, lane: str) -> str | None:
         if lane == "local":
             return self.cfg.local_model
+        if task.id == FORK_TASK_ID:
+            # Never None for the director fork: a model-less launch silently
+            # drops it onto the account default (a Fable model), which is
+            # exactly what this fork exists not to be.
+            return (task.model or self.cfg.throttle_model
+                    or self.cfg.worker_model or FORK_FALLBACK_MODEL)
         return task.model or self.cfg.worker_model or None
 
     def _task_prompt(self, task: TaskSpec, lane: str) -> str:
+        prompt = task.prompt
+        if "{graph}" in prompt:
+            # Expanded at launch, not when the row was queued: the agentic
+            # graph the fork is told about is the one in force right now,
+            # including a worker count the operator just changed.
+            from .graph import graph_line, read_graph
+            prompt = prompt.replace("{graph}", graph_line(read_graph(self.cfg)))
         if lane == "local" and self.cfg.local_prompt_preamble:
-            return f"{self.cfg.local_prompt_preamble}\n\n{task.prompt}"
-        return task.prompt
+            return f"{self.cfg.local_prompt_preamble}\n\n{prompt}"
+        return prompt
 
     def gpu_guard_proc(self) -> str | None:
         """Name of a running GPU-exclusive process, or None.
@@ -430,6 +511,7 @@ class Dispatcher:
                 actions.append(f"task {task.id}: launch failed ({exc})")
 
     def apply(self, decision: Decision, now: datetime) -> list[str]:
+        self.current_mode = decision.mode
         if self.supervise:
             self.sync_from_disk()
         actions = self.reap(now)

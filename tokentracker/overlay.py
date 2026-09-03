@@ -13,6 +13,18 @@ from .control import RUNNING as CONTROL_RUNNING
 from .control import STOPPED as CONTROL_STOPPED
 from .control import read_control, write_control
 from .goal import GOAL_FALLBACK, GOAL_STEP, read_goal, read_stop, write_goal
+from .graph import (
+    COUNT_MAX,
+    COUNT_MIN,
+    TIERS,
+    WORKERS,
+    read_graph,
+    short_model,
+    tiers_of,
+    write_graph,
+)
+from .handover import fork_active
+from .ledger import generate_async, latest_report, open_report, report_age
 from .models import parse_iso, utcnow
 
 TRANSPARENT = "#010203"
@@ -64,12 +76,48 @@ CTL_BTN_GAP = 8
 # WEEKLY GOAL row: a shorter strip above START/STOP holding "-", the goal, "+".
 GOAL_ROW_H = 24
 GOAL_STEP_BTN_W = 26
+# AGENTIC GRAPH ladder: one rung per tier, top to bottom (executive, advisory,
+# workers), each a bar whose width is that tier's headcount, hung off a thin
+# spine on the left - so the shape itself says "narrow at the top, widest at
+# the workers". It replaces the old one-line GRAPH row, which said the same
+# three model ids and counts in text and clipped them to fit.
+LADDER_LABEL_H = 15
+LADDER_RUNG_H = 20
+LADDER_RUNG_GAP = 3
+LADDER_SPINE_X = 1
+LADDER_SPINE_W = 2
+LADDER_BAR_X = 4
+# The bar is a thin band *under* each rung's text rather than a block behind
+# it: a block wide enough to mean something has its right edge somewhere in
+# the middle of the row, and that edge cuts the tier name in half.
+LADDER_TEXT_H = 12
+LADDER_BAND_Y = 13
+LADDER_BAND_H = 4
+# A tier of one must still be a bar, not a hairline.
+LADDER_BAR_MIN = 10
+LADDER_BAR_RADIUS = 2
+LADDER_TEXT_PAD = 6
+# The -/+ taps on the worker count, in a gutter every rung reserves so the
+# "xN" column lands on the same x down all three.
+LADDER_STEP_W = 17
+LADDER_STEP_GAP = 3
+# REPORT row: a wide VIEW REPORT button beside a narrow REPORT NOW tap target,
+# with the report's age on its own line underneath.
+REPORT_BTN_H = 26
+REPORT_NOW_W = 84
+REPORT_AGE_H = 16
 # Red band naming the stop point, drawn under the mode label when stop.json is
 # on disk (expanded), or across the usage readouts (collapsed).
 STOP_BAND_H = 20
 # Centre-to-centre spacing of the close and minimize buttons (each is 16 design
 # px wide), so close sits immediately left of minimize with a small gap.
 TITLE_BTN_STEP = 20
+# "FORK ACTIVE" chip in the header row, drawn while the forked director session
+# is running. 16 design px tall on the title-button baseline (centre y 22), so
+# it ends at 30 - one pixel clear of the gauge arcs, which start at 31.
+FORK_CHIP_H = 16
+FORK_CHIP_PAD = 7
+FORK_CHIP_MIN_W = 30
 BTN_ACTIVE_BG = "#8a3d33"
 OTHERS_VISIBLE = 2
 SCROLLBAR_W = 3
@@ -383,6 +431,10 @@ class Overlay:
         self._control = read_control(cfg)
         self._goal = read_goal(cfg)
         self._stop = read_stop(cfg)
+        self._fork = fork_active(cfg)
+        self._graph = read_graph(cfg)
+        self._report = latest_report(cfg)
+        self._report_age = report_age(cfg)
         self._after_id: str | None = None
         self._collapsed = self._load_collapsed()
 
@@ -437,6 +489,10 @@ class Overlay:
         self.canvas.tag_bind("stop_btn", "<Button-1>", self._click_stop)
         self.canvas.tag_bind("goal_minus", "<Button-1>", self._click_goal_minus)
         self.canvas.tag_bind("goal_plus", "<Button-1>", self._click_goal_plus)
+        self.canvas.tag_bind("graph_minus", "<Button-1>", self._click_graph_minus)
+        self.canvas.tag_bind("graph_plus", "<Button-1>", self._click_graph_plus)
+        self.canvas.tag_bind("view_report", "<Button-1>", self._click_view_report)
+        self.canvas.tag_bind("report_now", "<Button-1>", self._click_report_now)
         self.canvas.tag_bind("min_btn", "<Button-1>", self._toggle_collapsed)
         self.canvas.tag_bind("close_btn", "<Button-1>", self._click_close)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
@@ -489,6 +545,27 @@ class Overlay:
         # Close sits immediately left of minimize; minimize keeps its corner.
         self._draw_close_button(min_cx - self._pxf(TITLE_BTN_STEP), cy)
         self._draw_min_button(min_cx, cy, collapsed=collapsed)
+
+    def _draw_fork_chip(self, x0: float, cy: float, right_limit: float) -> None:
+        """Green "FORK ACTIVE" chip: the forked director session is running.
+
+        Sized to its own text and clipped at `right_limit`, which is the left
+        edge of the close button, so the chip can never slide under the title
+        buttons painted over the same row.
+        """
+        P = self._px
+        label = "FORK ACTIVE"
+        x1 = min(x0 + self._font_small.measure(label) + 2 * self._pxf(FORK_CHIP_PAD),
+                 right_limit)
+        if x1 - x0 < P(FORK_CHIP_MIN_W):
+            return
+        half = self._pxf(FORK_CHIP_H) / 2
+        self._round_rect(x0, cy - half, x1, cy + half, self._pxf(7),
+                         fill=SUB_BG, outline=GREEN, width=1, tags="fork_chip")
+        self.canvas.create_text(
+            (x0 + x1) / 2, cy,
+            text=self._fit(label, self._font_small, (x1 - x0) - P(6)),
+            font=FONT_SMALL, fill=GREEN, tags="fork_chip")
 
     def _click_close(self, _event: tk.Event) -> str:
         # Deferred: destroying the window from inside a canvas item binding frees
@@ -742,6 +819,177 @@ class Overlay:
         self.canvas.create_text((x0 + x1) / 2, mid_y, text=text,
                                 font=FONT_BOLD, fill=AMBER)
 
+    def _step_workers(self, delta: int) -> str:
+        """Nudge the worker lane count; the loop re-derives concurrency from it.
+
+        Clamped to the graph's own bounds, and written to state/graph.json so
+        the checked-in config.json is never rewritten by a click.
+        """
+        graph = read_graph(self.cfg)
+        count = int(graph[WORKERS]["count"]) + delta
+        graph[WORKERS]["count"] = min(max(count, COUNT_MIN), COUNT_MAX)
+        self._graph = write_graph(self.cfg, graph)
+        self._refresh()
+        return "break"
+
+    def _click_graph_minus(self, _event: tk.Event) -> str:
+        return self._step_workers(-1)
+
+    def _click_graph_plus(self, _event: tk.Event) -> str:
+        return self._step_workers(1)
+
+    def _ladder_height(self) -> int:
+        """What `_draw_graph_ladder` will occupy, so the card can grow for it."""
+        P = self._px
+        return (P(LADDER_LABEL_H) + 3 * P(LADDER_RUNG_H)
+                + 2 * P(LADDER_RUNG_GAP))
+
+    def _draw_graph_ladder(self, x0: float, y0: float, x1: float) -> None:
+        """The AGENTIC GRAPH ladder chart: a rung per tier, widest at workers.
+
+        Each rung is a label line - tier name left, short model id centred,
+        "xN" right-aligned - with a thin bar under it whose width is that
+        tier's headcount, and all three bars hang off one spine on the left,
+        so the configured graph reads as a shape before it reads as numbers.
+        The worker rung is the emphasis (it is the only count the panel can
+        change) and carries its surge budget as a ghost extension behind the
+        solid bar, out to `surge_count`.
+
+        The bar is under the text rather than behind it on purpose: a bar wide
+        enough to mean anything ends somewhere in the middle of the row, and
+        that edge lands in the middle of a word.
+
+        The three "xN" share one right edge, which is what lets the counts be
+        compared down the rungs instead of read one at a time.
+
+        Replaces the old textual GRAPH row - it carried the same three ids and
+        counts in one clipped line - and keeps its -/+ taps, now sitting on
+        the worker rung itself.
+        """
+        P = self._px
+        rung_h = P(LADDER_RUNG_H)
+        gap = P(LADDER_RUNG_GAP)
+        top = y0 + P(LADDER_LABEL_H)
+        bar_x = x0 + P(LADDER_BAR_X)
+        step_w = P(LADDER_STEP_W)
+        gutter = 2 * step_w + P(LADDER_STEP_GAP)
+        num_x = x1 - gutter - P(LADDER_TEXT_PAD)
+        span = max(num_x - bar_x, P(LADDER_BAR_MIN))
+        band_h = max(2, P(LADDER_BAND_H))
+        blocks = dict(zip(TIERS, tiers_of(self._graph)))
+        workers = blocks[WORKERS]
+        surge = int(workers.get("surge_count", workers["count"]))
+        # One scale for all three rungs, taking the surge in: the ghost is the
+        # widest thing drawn, so it is what has to fit inside `span`.
+        scale = max(surge, *(int(b["count"]) for b in blocks.values()), 1)
+
+        self.canvas.create_text(x0, y0 + P(LADDER_LABEL_H) / 2,
+                                text="AGENTIC GRAPH", font=FONT_SMALL,
+                                fill=DIM, anchor="w", tags="ladder")
+        if surge > int(workers["count"]):
+            # The surge budget has no column of its own (a second number would
+            # break the xN alignment); the ghost bar shows it, this names it.
+            self.canvas.create_text(x1, y0 + P(LADDER_LABEL_H) / 2,
+                                    text=f"surge x{surge}", font=FONT_SMALL,
+                                    fill=DIM, anchor="e", tags="ladder")
+
+        for i, tier in enumerate(TIERS):
+            block = blocks[tier]
+            count = int(block["count"])
+            is_workers = tier == WORKERS
+            ry0 = top + i * (rung_h + gap)
+            ry1 = ry0 + rung_h
+            mid = ry0 + P(LADDER_TEXT_H) / 2
+            band_y = ry0 + P(LADDER_BAND_Y)
+            # The spine, drawn a segment at a time so the worker tier's own
+            # stretch of it can carry the emphasis colour.
+            spine_x = x0 + P(LADDER_SPINE_X)
+            self.canvas.create_rectangle(
+                spine_x, ry0, spine_x + max(1, P(LADDER_SPINE_W)),
+                ry1 + (gap if i < len(TIERS) - 1 else 0),
+                fill=BLUE if is_workers else BORDER, outline="",
+                tags="ladder_spine")
+
+            solid_w = max(P(LADDER_BAR_MIN), span * count / scale)
+            if is_workers and surge > count:
+                ghost_w = max(solid_w, span * surge / scale)
+                self._round_rect(bar_x, band_y, bar_x + ghost_w,
+                                 band_y + band_h,
+                                 self._pxf(LADDER_BAR_RADIUS), fill=BORDER,
+                                 outline="", tags=("ladder", "ladder_ghost"))
+            self._round_rect(bar_x, band_y, bar_x + solid_w, band_y + band_h,
+                             self._pxf(LADDER_BAR_RADIUS),
+                             fill=BLUE if is_workers else DIM, outline="",
+                             tags=("ladder", f"rung_{tier}"))
+
+            name = tier.upper()
+            name_x = bar_x + P(LADDER_TEXT_PAD)
+            self.canvas.create_text(name_x, mid, text=name, font=FONT_SMALL,
+                                    fill=FG if is_workers else DIM, anchor="w",
+                                    tags="ladder")
+            counts = f"x{count}"
+            self.canvas.create_text(num_x, mid, text=counts, font=FONT_BOLD,
+                                    fill=BLUE if is_workers else SILVER,
+                                    anchor="e", tags="ladder")
+            # Its own column, halfway along the bar span, so the model ids line
+            # up down the rungs the way the counts do - but never left of the
+            # tier name, which is wider at some DPIs than at others.
+            left = name_x + self._font_small.measure(name)
+            right = num_x - self._font_bold.measure(counts)
+            model_x = max(bar_x + (num_x - bar_x) / 2, left + P(LADDER_TEXT_PAD))
+            model = self._fit(short_model(block["model"]), self._font_small,
+                              (right - model_x) - P(LADDER_TEXT_PAD))
+            self.canvas.create_text(model_x, mid, text=model, anchor="w",
+                                    font=FONT_SMALL,
+                                    fill=SILVER if is_workers else DIM,
+                                    tags="ladder")
+
+            if is_workers:
+                for tag, label, bx0 in (("graph_minus", "-", x1 - gutter),
+                                        ("graph_plus", "+", x1 - step_w)):
+                    self._round_rect(bx0, ry0, bx0 + step_w,
+                                     ry0 + P(LADDER_TEXT_H) + P(2),
+                                     self._pxf(6), fill=CARD_BG, outline=BLUE,
+                                     width=1, tags=tag)
+                    self.canvas.create_text(bx0 + step_w / 2, mid, text=label,
+                                            font=FONT_BOLD, fill=BLUE, tags=tag)
+
+    def _click_view_report(self, _event: tk.Event) -> str:
+        # Dead until there is a page: a click with no report must not launch
+        # the shell on a path that does not exist.
+        if self._report is not None:
+            open_report(self.cfg)
+        return "break"
+
+    def _click_report_now(self, _event: tk.Event) -> str:
+        # Off-thread: parsing the transcripts takes seconds and the overlay
+        # redraws on a timer, so it must not block the Tk event loop.
+        generate_async(self.cfg, "manual")
+        self._refresh()
+        return "break"
+
+    def _draw_report_row(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        """VIEW REPORT (dimmed until one exists) beside a REPORT NOW tap target."""
+        P = self._px
+        gap = P(CTL_BTN_GAP)
+        now_w = P(REPORT_NOW_W)
+        view_x1 = max(x0 + P(60), x1 - now_w - gap)
+        have = self._report is not None
+        color = BLUE if have else DIM
+        self._round_rect(x0, y0, view_x1, y1, self._pxf(12), fill=SUB_BG,
+                         outline=color, width=1, tags="view_report")
+        label = "VIEW REPORT" if have else "no report yet"
+        self.canvas.create_text((x0 + view_x1) / 2, (y0 + y1) / 2,
+                                text=self._fit(label, self._font_bold,
+                                               (view_x1 - x0) - P(10)),
+                                font=FONT_BOLD, fill=color, tags="view_report")
+        self._round_rect(view_x1 + gap, y0, x1, y1, self._pxf(12), fill=SUB_BG,
+                         outline=GREEN, width=1, tags="report_now")
+        self.canvas.create_text((view_x1 + gap + x1) / 2, (y0 + y1) / 2,
+                                text=self._fit("REPORT NOW", self._font_small,
+                                               (x1 - view_x1 - gap) - P(8)),
+                                font=FONT_SMALL, fill=GREEN, tags="report_now")
+
     def _draw_goal_tick(self, cx: float, cy: float, frac: float) -> None:
         """Amber tick on the weekly ring at the goal, inside the ring's stroke.
 
@@ -865,6 +1113,14 @@ class Overlay:
         # writes stop.json on its own tick and the goal may change from the CLI.
         self._goal = read_goal(self.cfg)
         self._stop = read_stop(self.cfg)
+        # The handover file is written by the loop when it launches the forked
+        # director and updated when it ends, so it is re-read here too.
+        self._fork = fork_active(self.cfg)
+        # The graph and the last report are both files another process writes
+        # (the CLI, the loop's report thread), so they are re-read every pass.
+        self._graph = read_graph(self.cfg)
+        self._report = latest_report(self.cfg)
+        self._report_age = report_age(self.cfg)
         self.canvas.delete("all")
         if self._collapsed:
             self._refresh_collapsed(state)
@@ -980,17 +1236,26 @@ class Overlay:
         band_h = P(STOP_BAND_H) if stop_text else 0
         rows_y = dist_header_y + P(26) + (band_h + P(6) if stop_text else 0)
         footer_y = rows_y + len(rows) * row_h + P(12)
-        # WEEKLY GOAL row, then START/STOP, then FULL THROTTLE: the card grows
-        # by each row plus its gap so nothing overlaps the bottom status line.
-        goal_y = footer_y + P(22)
+        # AGENTIC GRAPH ladder, WEEKLY GOAL row, START/STOP, FULL THROTTLE,
+        # then the report row and its age line: the card grows by each block
+        # plus its gap, so nothing overlaps the bottom status line at any DPI.
+        graph_y = footer_y + P(20)
+        goal_y = graph_y + self._ladder_height() + P(8)
         ctl_y = goal_y + P(GOAL_ROW_H) + P(BTN_ROW_GAP)
         btn_y = ctl_y + P(BTN_H) + P(BTN_ROW_GAP)
-        height = btn_y + P(BTN_H) + P(30)
+        rep_y = btn_y + P(BTN_H) + P(BTN_ROW_GAP)
+        age_y = rep_y + P(REPORT_BTN_H) + P(REPORT_AGE_H) / 2
+        height = rep_y + P(REPORT_BTN_H) + P(REPORT_AGE_H) + P(30)
 
         self.canvas.config(height=height)
         self._round_card(width, height)
         # Top-right, above the Fable gauge and inside the corner radius.
         self._draw_title_buttons(width - P(34), P(22), collapsed=False)
+        if self._fork:
+            # Left end of the same row; the limit is the close button's left
+            # edge (its centre is one TITLE_BTN_STEP left of minimize).
+            close_left = width - P(34) - self._pxf(TITLE_BTN_STEP) - self._pxf(8)
+            self._draw_fork_chip(pad - P(6), P(22), close_left - self._pxf(6))
 
         center_cx = width // 2
         self._gauge(pad + P(48), five_frac, AMBER, "5 hours")
@@ -1097,6 +1362,7 @@ class Overlay:
                                     font=FONT_SMALL, fill=DIM, anchor="w")
             self.canvas.create_text(width - pad, footer_y + P(6), text=footer_right,
                                     font=FONT_SMALL, fill=DIM, anchor="e")
+        self._draw_graph_ladder(pad, graph_y, width - pad)
         self._draw_goal_row(pad, goal_y, width - pad, goal_y + P(GOAL_ROW_H))
         ctl_gap = P(CTL_BTN_GAP)
         ctl_w = (width - 2 * pad - ctl_gap) / 2
@@ -1104,6 +1370,13 @@ class Overlay:
         self._draw_ctl_button(width - pad - ctl_w, ctl_y, width - pad,
                               ctl_y + P(BTN_H), "stop")
         self._draw_button(pad, btn_y, width - pad, btn_y + P(BTN_H), self._throttle)
+        self._draw_report_row(pad, rep_y, width - pad, rep_y + P(REPORT_BTN_H))
+        if self._report_age:
+            # Only when there is one to age: with no report the button itself
+            # already says so, and a second "no report yet" line would just
+            # repeat it.
+            self.canvas.create_text(width / 2, age_y, text=self._report_age,
+                                    font=FONT_SMALL, fill=DIM)
 
         bottom = warn or updated_line
         if bottom:

@@ -17,11 +17,15 @@ from .goal import (
     read_stop,
     write_goal,
 )
-from .models import Decision, TaskSpec, utcnow
+from .handover import FORK_MODES, FORK_TASK_ID, fork_status_line
+from .models import Decision, TaskSpec, parse_iso, utcnow
 
 ROOT = Path(__file__).resolve().parent.parent
 BAR_WIDTH = 30
-THROTTLE_TASK_ID = "throttle-main-continue"
+THROTTLE_TASK_ID = FORK_TASK_ID
+FORK_COOLDOWN_SECONDS = 120
+# Fallback only: the live brief is config.json's throttle_prompt, which is what
+# turns the fork into the acting technical director.
 THROTTLE_PROMPT = (
     "FULL THROTTLE: the operator pressed the TokenDistributor full-throttle "
     "button. The goal is to exhaust the remaining weekly Claude token budget on "
@@ -68,17 +72,73 @@ def _wake_sig(cfg: Config) -> tuple[float | None, float | None, float | None]:
     return _throttle_sig(cfg), _control_sig(cfg), _goal_sig(cfg)
 
 
-def _ensure_throttle_task(cfg: Config, dispatcher: Dispatcher) -> None:
+def _fork_prompt(cfg: Config) -> str:
+    """The director brief handed to the fork; config.json is authoritative.
+
+    The `{graph}` placeholder is expanded here, at launch, so the fork is told
+    the agentic graph that is in force this poll - including a worker count the
+    operator changed from the overlay a minute ago.
+    """
+    from .graph import graph_line, read_graph
+
+    text = str(getattr(cfg, "throttle_prompt", "") or "").strip() or THROTTLE_PROMPT
+    if "{graph}" in text:
+        text = text.replace("{graph}", graph_line(read_graph(cfg)))
+    return text
+
+
+def _fork_cooldown(cfg: Config) -> float:
+    try:
+        return max(0.0, float(getattr(cfg, "fork_cooldown_seconds",
+                                      FORK_COOLDOWN_SECONDS)))
+    except (TypeError, ValueError):
+        return float(FORK_COOLDOWN_SECONDS)
+
+
+def _rearm_ready(cfg: Config, task: TaskSpec, now) -> bool:
+    """True once the cooldown since the previous fork finished has elapsed.
+
+    Without it a fork that dies on launch would be relaunched on every poll,
+    burning the weekly budget on nothing but process starts.
+    """
+    cooldown = _fork_cooldown(cfg)
+    if cooldown <= 0:
+        return True
+    finished = parse_iso(task.finished_at)
+    if finished is None:
+        return True
+    return (now - finished).total_seconds() >= cooldown
+
+
+def _fork_wanted(cfg: Config, mode: str, control: str, throttle: bool) -> bool:
+    """Whether the continue fork should be ensured on this tick.
+
+    The handover is only armed while dispatch is actually running, the weekly
+    goal has not been reached, and the loop is in a working mode: pace (normal
+    dispatch, when fork_in_pace is on) or surge (full throttle). blocked,
+    yield, coast and stopped never hand the director job over.
+    """
+    if not cfg.main_session_ids or not cfg.throttle_fork_enabled:
+        return False
+    if control == STOPPED or mode not in FORK_MODES:
+        return False
+    if read_stop(cfg) is not None:
+        return False
+    return True if throttle else bool(getattr(cfg, "fork_in_pace", True))
+
+
+def _ensure_throttle_task(cfg: Config, dispatcher: Dispatcher, now=None) -> None:
     # With forking disabled, full throttle still surges queued workers but the
     # executive continuation runs inside the main session itself (its agent
     # graph), not as a forked headless copy.
     if not cfg.main_session_ids or not cfg.throttle_fork_enabled:
         return
+    now = now or utcnow()
     task = dispatcher.get(THROTTLE_TASK_ID)
     if task is None:
         dispatcher.add(TaskSpec(
             id=THROTTLE_TASK_ID,
-            prompt=THROTTLE_PROMPT,
+            prompt=_fork_prompt(cfg),
             cwd=str(Path.home()),
             weight="heavy",
             model=cfg.throttle_model or None,
@@ -87,11 +147,16 @@ def _ensure_throttle_task(cfg: Config, dispatcher: Dispatcher) -> None:
             resume_session=cfg.main_session_ids[0],
         ))
     elif task.status in ("done", "failed", "killed"):
+        if not _rearm_ready(cfg, task, now):
+            return
         # The stored spec may predate a config change (main session handover,
-        # executive model directive); refresh it before every relaunch.
+        # executive model directive, a rewritten brief); refresh it before
+        # every relaunch.
         task.model = cfg.throttle_model or None
+        task.prompt = _fork_prompt(cfg)
         task.resume_session = cfg.main_session_ids[0]
         dispatcher.set_status(THROTTLE_TASK_ID, "pending")
+    # pending or running: the handover already stands, nothing to re-arm.
 
 
 def _bar(frac: float) -> str:
@@ -151,6 +216,8 @@ def _tick(
     cfg: Config, dispatcher: Dispatcher, history, do_fetch: bool = True,
 ) -> tuple[Decision, list[str], Exception | None, "object | None", bool]:
     from .activity import detect_activity
+    from .graph import apply_graph
+    from .ledger import maybe_report
     from .scheduler import decide, decide_local, normalize, pacing
     from .usage import (
         UsageFetchError,
@@ -161,7 +228,16 @@ def _tick(
     )
 
     now = utcnow()
+    # The graph is re-derived every poll, not once at startup: the overlay's
+    # worker -/+ writes state/graph.json, and this is what turns that click
+    # into the concurrency the scheduler reads a few lines below.
+    apply_graph(cfg)
     own_dirs = dispatcher.own_project_dirs()
+    # The fork's status before this tick's reap; a running -> done transition
+    # is what the milestone trigger watches for.
+    fork_before = dispatcher.get(THROTTLE_TASK_ID)
+    fork_state = ((fork_before.status, fork_before.started_at)
+                  if fork_before is not None else (None, None))
     snap = None
     fetch_exc: Exception | None = None
     if do_fetch:
@@ -184,6 +260,10 @@ def _tick(
         decision.local_concurrency = decide_local(decision, activity, cfg, now)
         decision = gate_decision(decision, control)
         actions = dispatcher.apply(decision, now)
+        report_line = maybe_report(cfg, dispatcher, before=fork_state,
+                                   control=control, stop=read_stop(cfg), now=now)
+        if report_line is not None:
+            actions.append(report_line)
         _write_state(cfg, {"at": now.isoformat(), "decision": decision.to_dict(),
                            "dispatch": control,
                            "error": str(fetch_exc) if fetch_exc else reason})
@@ -215,9 +295,12 @@ def _tick(
             "surge", cfg.surge_concurrency, True,
             "Full throttle (manual override): exhausting weekly budget.",
         )
-        if control != STOPPED:
-            _ensure_throttle_task(cfg, dispatcher)
-    elif not throttle:
+    # The handover is armed in normal pace mode too, not only under full
+    # throttle: the fork is the acting director for as long as the loop is
+    # dispatching at all. read_stop is current here - apply_goal_stop ran above.
+    if _fork_wanted(cfg, decision.mode, control, throttle):
+        _ensure_throttle_task(cfg, dispatcher, now)
+    else:
         stale_task = dispatcher.get(THROTTLE_TASK_ID)
         if stale_task is not None and stale_task.status == "pending":
             dispatcher.set_status(THROTTLE_TASK_ID, "killed")
@@ -229,6 +312,12 @@ def _tick(
     actions = dispatcher.apply(decision, now)
     if goal_line is not None:
         actions.insert(0, goal_line)
+    # Report triggers run after the reap, so a fork that finished on this very
+    # tick is already marked done; generation itself is off-thread.
+    report_line = maybe_report(cfg, dispatcher, before=fork_state,
+                               control=control, stop=stop, now=now)
+    if report_line is not None:
+        actions.append(report_line)
 
     decision_payload = decision.to_dict()
     if stop is not None:
@@ -269,11 +358,37 @@ def _tick(
 
 
 def cmd_run(cfg: Config, once: bool) -> int:
+    """The control loop, with the loop-exit report bolted onto both exits.
+
+    ctrl-c and a SystemExit both mean dispatch has stopped, which is one of the
+    report triggers; the report is written synchronously here because the
+    process is about to end.
+    """
+    from .ledger import report_on_exit
+
+    try:
+        return _run_loop(cfg, once)
+    except (KeyboardInterrupt, SystemExit):
+        print("stopped; running background tasks continue detached")
+        line = report_on_exit(cfg)
+        if line is not None:
+            print(line)
+        return 0
+
+
+def _run_loop(cfg: Config, once: bool) -> int:
     from .usage import RateLimitedError, UsageHistory
+
+    from .graph import known_models, overlay_label, read_graph, validate_graph
 
     dispatcher = Dispatcher(cfg, supervise=True)
     history = UsageHistory(cfg)
     print(f"TokenDistributor loop started (poll every {cfg.poll_seconds}s, ctrl-c to stop)")
+    graph = read_graph(cfg)
+    print(f"graph: {overlay_label(graph)}")
+    # A warning, not a refusal: an unknown id is usually a new model.
+    for warning in validate_graph(graph, known_models(cfg)):
+        print(warning)
     next_fetch_ts = 0.0
     backoff = 0.0
     while True:
@@ -319,17 +434,15 @@ def cmd_run(cfg: Config, once: bool) -> int:
                 if until > 0:
                     sleep_s = min(sleep_s, max(10.0, until))
         deadline = time.monotonic() + sleep_s
-        try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                time.sleep(min(10.0, remaining))
-                if _wake_sig(cfg) != sig:
-                    break
-        except KeyboardInterrupt:
-            print("stopped; running background tasks continue detached")
-            return 0
+        # KeyboardInterrupt is deliberately not caught here: cmd_run owns the
+        # exit so the loop-exit report is written on every way out.
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(10.0, remaining))
+            if _wake_sig(cfg) != sig:
+                break
 
 
 def cmd_status(cfg: Config) -> int:
@@ -341,6 +454,9 @@ def cmd_status(cfg: Config) -> int:
     except UsageFetchError as exc:
         print(f"live usage unavailable: {exc}")
         print(f"dispatch: {read_control(cfg)}")
+        fork_line = fork_status_line(cfg)
+        if fork_line is not None:
+            print(fork_line)
         if cfg.state_file.exists():
             state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
             print(f"last known state from {state.get('at')}:")
@@ -365,6 +481,11 @@ def cmd_status(cfg: Config) -> int:
               f"weekly {float(stop.get('weekly', 0)):.0%} at {stop.get('at')}")
 
     print(f"dispatch: {read_control(cfg)}")
+    # The monitor session reports from this line: who is acting as director,
+    # since when, in which mode and on which model.
+    fork_line = fork_status_line(cfg)
+    if fork_line is not None:
+        print(fork_line)
 
     if cfg.state_file.exists():
         state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
@@ -405,6 +526,68 @@ def cmd_goal(cfg: Config, value: str | None) -> int:
         return 1
     write_goal(cfg, goal)
     print(f"weekly goal: {goal:.0%} (source: {read_goal_source(cfg)[1]})")
+    return 0
+
+
+def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
+    """Generate the work-distribution report now, and optionally open it."""
+    from .ledger import generate, latest_report, open_report
+
+    since = None
+    if getattr(args, "since", None):
+        since = parse_iso(args.since)
+        if since is None:
+            print(f"error: cannot read '{args.since}' as an ISO timestamp")
+            return 1
+    try:
+        page = generate(cfg, "manual", since=since,
+                        hours=getattr(args, "hours", None))
+        print(f"wrote {page}")
+        print(f"latest: {cfg.reports_dir / 'latest.html'}")
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"error: report generation failed ({exc})")
+        if latest_report(cfg) is None:
+            return 1
+    if getattr(args, "open", False):
+        opened = open_report(cfg)
+        print(f"opened {opened}" if opened else "no report to open yet")
+    return 0
+
+
+def cmd_graph(cfg: Config, assignments: list[str] | None) -> int:
+    """Print the agentic graph, or set tiers from `tier.field=value` pairs."""
+    from .graph import (
+        SOURCE_OVERRIDE,
+        format_tiers,
+        graph_line,
+        known_models,
+        override_warning,
+        read_graph_source,
+        set_assignments,
+        validate_graph,
+        write_graph,
+    )
+
+    ignored = override_warning(cfg)
+    graph, source = read_graph_source(cfg)
+    if assignments:
+        graph, errors = set_assignments(graph, assignments)
+        for error in errors:
+            print(f"error: {error}")
+        if errors:
+            return 1
+        graph = write_graph(cfg, graph)
+        source = SOURCE_OVERRIDE
+    print(f"agentic graph (source: {source})")
+    if ignored and not assignments:
+        # The read path swallows a broken override on purpose; without this the
+        # only symptom would be the numbers quietly staying at config.json's.
+        print(ignored)
+    for line in format_tiers(graph):
+        print(line)
+    for warning in validate_graph(graph, known_models(cfg)):
+        print(warning)
+    print(f"fork prompt line: {graph_line(graph)}")
     return 0
 
 
@@ -470,6 +653,22 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list", help="list tasks")
     sub.add_parser("overlay", help="always-on-top panel docked to the Sundial layer")
 
+    rep_p = sub.add_parser(
+        "report", help="generate the work-distribution report (reports/latest.html)")
+    rep_p.add_argument("--since", default=None,
+                       help="window start as an ISO timestamp")
+    rep_p.add_argument("--hours", type=float, default=None,
+                       help="window length in hours, ending now")
+    rep_p.add_argument("--open", action="store_true",
+                       help="open reports/latest.html when it is written")
+
+    graph_p = sub.add_parser(
+        "graph", help="show or set the agentic graph (executive/advisory/workers)")
+    graph_p.add_argument("action", nargs="?", choices=("set",), default=None,
+                         help="'set' to assign tiers; omit to print the graph")
+    graph_p.add_argument("assignments", nargs="*", metavar="tier.field=value",
+                         help="e.g. workers.count=20 advisory.model=claude-opus-5")
+
     add_p = sub.add_parser("add", help="queue a task")
     add_p.add_argument("--id", required=True)
     add_p.add_argument("--prompt", required=True)
@@ -497,6 +696,13 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(cfg)
         if args.cmd == "goal":
             return cmd_goal(cfg, args.value)
+        if args.cmd == "report":
+            return cmd_report(cfg, args)
+        if args.cmd == "graph":
+            if args.action != "set" and args.assignments:
+                print("error: use 'graph set tier.field=value'")
+                return 1
+            return cmd_graph(cfg, args.assignments if args.action == "set" else None)
         if args.cmd == "add":
             return cmd_add(cfg, args)
         if args.cmd == "list":

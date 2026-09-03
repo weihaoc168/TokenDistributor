@@ -44,8 +44,24 @@ class Config:
     worker_model: str = ""
     throttle_model: str = ""
     throttle_fork_enabled: bool = True
+    # The continue fork is also ensured in normal pace mode, not only under
+    # full throttle, and re-armed only after this cooldown so a fork that dies
+    # on launch cannot be relaunched every poll.
+    fork_in_pace: bool = True
+    fork_cooldown_seconds: int = 120
+    throttle_prompt: str = ""
     extra_claude_args: list[str] = field(default_factory=list)
     main_session_ids: list[str] = field(default_factory=list)
+    # The agentic graph (executive / advisory / workers). When present it is
+    # authoritative and the four legacy keys above are derived from it by
+    # graph.apply_graph; see tokentracker/graph.py.
+    graph: dict[str, Any] = field(default_factory=dict)
+    known_models: list[str] = field(default_factory=list)
+    # Work-distribution report (tokentracker/ledger.py).
+    report_repo: str = "C:/Users/chenw/StarGTA"
+    report_on_milestone: bool = True
+    report_on_stop: bool = True
+    report_window_hours: float = 24.0
     local_enabled: bool = False
     local_base_url: str = "http://127.0.0.1:1919"
     local_daemon_url: str = "http://127.0.0.1:1900"
@@ -99,6 +115,26 @@ class Config:
         """Written once the weekly goal is reached; the main session's stop point."""
         return self.state_dir / "stop.json"
 
+    @property
+    def handover_file(self) -> Path:
+        """Fork handover record; the parent session watches this file."""
+        return self.state_dir / "handover.json"
+
+    @property
+    def graph_file(self) -> Path:
+        """Per-user agentic-graph override; wins over config.json like goal.json."""
+        return self.state_dir / "graph.json"
+
+    @property
+    def report_file(self) -> Path:
+        """Record of the last work-distribution report the tracker generated."""
+        return self.state_dir / "report.json"
+
+    @property
+    def reports_dir(self) -> Path:
+        """Where the generated ledger pages live (reports/latest.html and friends)."""
+        return self.root / "reports"
+
 
 _PATH_KEYS = (
     "credentials_path", "projects_dir", "sessions_dir", "state_dir", "logs_dir",
@@ -138,4 +174,19 @@ def load_config(root: str | Path) -> Config:
     cfg = Config(root=root, **kwargs)
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
+    # The agentic graph is authoritative over the legacy scalar keys, so it is
+    # resolved (config.json + state/graph.json override) and folded onto the
+    # Config here, before any caller reads max_concurrency or worker_model.
+    # Imported late: graph.py imports Config from this module.
+    from .graph import apply_graph, default_graph, migrate_config_file
+    if cfg_file.exists() and not isinstance(raw.get("graph"), dict):
+        # One-time migration: a config.json that predates the graph gets the
+        # section written from the keys it already has, then keeps both.
+        migrate_config_file(cfg)
+    if not cfg.graph:
+        # Freeze the legacy-derived graph as this Config's baseline, so the
+        # per-user override stays an override: deleting state/graph.json goes
+        # back to the file's own numbers rather than to the last ones applied.
+        cfg.graph = default_graph(cfg)
+    apply_graph(cfg)
     return cfg

@@ -106,6 +106,9 @@ class TaskSpec:
     started_at: str | None = None
     finished_at: str | None = None
     pid: int | None = None
+    # Minted by `claude -p --output-format json` and printed in its result at
+    # exit; the ledger needs it to find the fork's own transcript.
+    fork_session_id: str | None = None
     session_tokens: int | None = None
     cost_usd: float | None = None
     error: str | None = None

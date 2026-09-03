@@ -3,4 +3,5 @@ __pycache__/
 state/
 logs/
 sandbox/
+reports/
 .gstack/
