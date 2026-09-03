@@ -969,7 +969,7 @@ def test_repo_config_arms_the_fork_on_the_executive_model():
                     model=cfg.throttle_model,
                     resume_session=cfg.main_session_ids[0])
     argv = dispatch.Dispatcher(cfg)._argv(task, "cloud", "claude.exe")
-    assert argv[argv.index("--model") + 1] == "claude-opus-5", argv
+    assert argv[argv.index("--model") + 1] == "claude-fable-5-1", argv  # the fork runs on the executive model
     assert argv[argv.index("--resume") + 1].startswith("329cb798"), argv
     assert "--fork-session" in argv, argv
 
