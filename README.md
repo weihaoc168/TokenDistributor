@@ -16,6 +16,8 @@ The overlay: three rings (5-hour, weekly with the gear mascot and an amber goal 
 - **Falls back to a local lane.** While `blocked`, queued tasks are re-dispatched to a local FreeToken engine (Qwen on the 5090) that burns zero cloud budget. A GPU guard refuses to auto-start the engine while a listed process (the Unreal editor, a game) owns the card, since the engine pins about 31.5 GB of it.
 - **Runs a configured agentic graph.** `config.json`'s `graph` names the model and headcount at each tier (executive, advisory, workers); the legacy `worker_model` / `max_concurrency` keys are derived from it, the fork brief is handed the same line through its `{graph}` placeholder, and `state/graph.json` (the overlay's `-` / `+`) overrides it without touching the config.
 - **Reports where the work went.** It parses the session, fork and Workflow-agent transcripts for a window, splits every turn by tier (by model id, or by transcript role when the graph names one model at every tier) and by what it did (DECIDE / DELEGATE / READ / AUTHOR / OPS), and writes `reports/latest.html`: a page whose verdict says whether the executive tier stayed executive-only (the 60% hands-on rule). It runs itself when a fork finishes a milestone and when dispatch stops, and on demand from the CLI or the overlay's **VIEW REPORT**.
+- **Prices that work in dollars.** `config.json`'s `pricing` block carries each model's published list price (input / output / cache write 5m / cache write 1h / cache read, USD per 1M tokens) with the source URL and the date it was read, and the report's **What it cost** section bills the window's own usage records at it: total USD, a stacked bar per model of the five components, by tier, by lane role, per hour, and the cost between consecutive commits. A model with no published price is shown as `unpriced` and named in a caveat, never billed at a guessed rate; the local FreeToken lane is priced at 0. `state/pricing.json` (`tracker.py pricing set`) overrides one field at a time without touching the config.
+- **Bills both cache-write durations.** `usage.cache_creation` splits every creation figure into 5-minute and 1-hour writes, and the published table charges the 1-hour ones at 2&times; base input against the 5-minute ones' 1.25&times;. So the price table carries both numbers and `cost_usd` has five terms, not four. On this machine's traffic the 1-hour share runs 10-40% of creation per model, which a single-rate formula would quietly understate by about 3.5% of the total and by the same bias in every cut below it.
 - **Draws that graph as a ladder chart.** The panel's **AGENTIC GRAPH** block is one rung per tier, executive over advisory over workers, each a bar as wide as its headcount and hung off a spine on the left, with the tier, the short model id and `xN` in aligned columns; the worker rung is the emphasis and carries its surge budget as a ghost extension, and its `-` / `+` still write `state/graph.json`.
 - **Shows an always-on-top overlay.** A Tk card docked near the Sundial widget, refreshed every few seconds, with minimize (collapse to a bar) and close buttons and its own live session, distribution, graph, goal, control, and report rows.
 
@@ -37,6 +39,8 @@ The keys in `config.json` that matter most, with this machine's current values:
 |---|---|---|
 | `graph` | opus-5: E x1, A x3, W x10/20 | the agentic graph; `worker_model`, `throttle_model`, `max_concurrency` and `surge_concurrency` are derived from it (`state/graph.json` overrides) |
 | `known_models` | five `claude-*` ids | allow-list for graph model ids; an unknown id warns, it never refuses |
+| `pricing` | list prices for the five `claude-*` ids + the local model | USD per 1M tokens per model: `input`, `output`, `cache_write` (5m), `cache_write_1h`, `cache_read`, each row with its `source` and `checked` date (`state/pricing.json` overrides). A model missing here, or missing any one of the five, reports as `unpriced` |
+| `pricing_default` | `null` | price for a model the table does not name; null on purpose, so nothing is billed at a stand-in rate |
 | `report_repo` | `C:/Users/chenw/StarGTA` | repo watched for the fork-milestone report trigger |
 | `weekly_goal` | `0.9` | weekly utilization the week stops at (`state/goal.json` overrides) |
 | `local_enabled` | `true` | turn on the local FreeToken / Qwen lane |
@@ -55,6 +59,9 @@ py  -3.13 tracker.py goal 85             # set the weekly goal (0.85, 85 or 85% 
 py  -3.13 tracker.py status              # live rings, pacing, queue
 py  -3.13 tracker.py graph               # print the executive / advisory / worker tiers
 py  -3.13 tracker.py graph set workers.count=20 advisory.model=claude-opus-5
+py  -3.13 tracker.py pricing             # print the per-model list prices the report bills at
+py  -3.13 tracker.py pricing set claude-opus-5.output=25 claude-opus-5.checked=2026-09-03
+py  -3.13 tracker.py pricing set claude-opus-5.cache_write_1h=10   # 1-hour writes bill at 2x base input
 py  -3.13 tracker.py report --open       # build the work-distribution page and open it
 
 # queue real work
@@ -73,6 +80,7 @@ State files under `state/`:
 | `stop.json` | written once the weekly goal is reached, the main session's stop point |
 | `throttle.json` | the FULL THROTTLE flag (`{"active": ...}`) |
 | `graph.json` | per-user agentic-graph override the ladder chart's `-` / `+` writes; a patch, so only the fields set here stop following `config.json` |
+| `pricing.json` | per-user price override `tracker.py pricing set` writes; a patch, so only the fields set here stop following `config.json` |
 | `report.json` | the last work-distribution report: path, reason, window |
 | `overlay.json` | the overlay's collapsed / expanded state |
 | `history.jsonl` | the log of usage snapshots the pacer reads back |
@@ -82,7 +90,7 @@ Reports land in `reports/`: `<UTC timestamp>-ledger.html`, the `<timestamp>-summ
 ## Tests
 
 ```powershell
-py -3.13 tests/test_all.py               # 112/112
+py -3.13 tests/test_all.py               # 121/121
 ```
 
 ## Acknowledgements

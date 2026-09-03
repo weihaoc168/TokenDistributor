@@ -2178,9 +2178,12 @@ def _entry(mid, model, ts, tools, usage, uuid="u1"):
     })
 
 
-def _usage(out=0, inp=0, creation=0, read=0):
+def _usage(out=0, inp=0, creation=0, read=0, creation_1h=0):
+    # `creation` is the whole cache-creation figure and `creation_1h` the slice
+    # of it written at the 1-hour duration, exactly as the API records them.
     return {"output_tokens": out, "input_tokens": inp,
             "cache_creation_input_tokens": creation,
+            "cache_creation_1h_input_tokens": creation_1h,
             "cache_read_input_tokens": read}
 
 
@@ -2385,6 +2388,10 @@ def _ledger_cfg(exec_tools=("Edit",)) -> Config:
     """A cfg with one main-session transcript the generator can actually read."""
     cfg = make_cfg()
     cfg.main_session_ids = [MAIN_ID]
+    # No tracked repo: the milestone buckets shell out to git, and a report
+    # test must not depend on what this machine's StarGTA checkout happens to
+    # hold. bucket_milestones is exercised directly instead.
+    cfg.report_repo = ""
     cfg.throttle_model = "claude-opus-5"
     cfg.worker_model = "claude-sonnet-5"
     cfg.throttle_prompt = "You are the forked acting technical director."
@@ -2787,6 +2794,488 @@ def test_overlay_view_report_needs_a_report():
         assert opened == [cfg], opened
     finally:
         overlay.open_report = real
+
+
+# ------------------------------------------------------------- the pricing
+
+PRICES = {
+    "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_write": 6.25,
+                      "cache_write_1h": 10.0, "cache_read": 0.5,
+                      "source": "https://example/pricing",
+                      "checked": "2026-09-03"},
+    "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_write": 12.5,
+                         "cache_write_1h": 20.0, "cache_read": 0.25,
+                         "source": "https://example/pricing",
+                         "checked": "2026-09-03"},
+}
+
+
+def test_pricing_cost_usd_arithmetic():
+    from tokentracker import ledger
+    from tokentracker import pricing as P
+    table = P.normalize(PRICES)
+    price = P.price_for(table, "claude-opus-5")
+    # One million of each, so every rate lands in the total exactly once. The
+    # whole million of cache creation is a 5-minute write here.
+    million = _usage(out=1_000_000, inp=1_000_000, creation=1_000_000,
+                     read=1_000_000)
+    assert abs(ledger.cost_usd(million, price) - (5 + 25 + 6.25 + 0.5)) < 1e-9
+    parts = ledger.cost_components(million, price)
+    assert parts == {"input": 5.0, "output": 25.0, "cache_write": 6.25,
+                     "cache_write_1h": 0.0, "cache_read": 0.5}, parts
+    # The realistic shape: cache reads dominate the token count and not the bill.
+    real = _usage(out=2_000, inp=500, creation=10_000, read=400_000)
+    want = (500 * 5 + 2_000 * 25 + 10_000 * 6.25 + 400_000 * 0.5) / 1e6
+    assert abs(ledger.cost_usd(real, price) - want) < 1e-12, want
+
+    # Cache creation is ONE counter over TWO prices: the 1-hour share bills at
+    # 2x base input, the rest at 1.25x. Billing the whole figure at the
+    # 5-minute rate is the understatement this split exists to prevent.
+    mixed = _usage(out=2_000, inp=500, creation=10_000, read=400_000,
+                   creation_1h=4_000)
+    mixed_want = (500 * 5 + 2_000 * 25 + 6_000 * 6.25 + 4_000 * 10.0
+                  + 400_000 * 0.5) / 1e6
+    assert abs(ledger.cost_usd(mixed, price) - mixed_want) < 1e-12, mixed_want
+    assert ledger.cost_usd(mixed, price) > ledger.cost_usd(real, price)
+    assert ledger.billed_tokens(mixed) == {
+        "input": 500, "output": 2_000, "cache_write": 6_000,
+        "cache_write_1h": 4_000, "cache_read": 400_000}, mixed
+    parts = ledger.cost_components(mixed, price)
+    assert abs(parts["cache_write"] - 6_000 * 6.25 / 1e6) < 1e-12, parts
+    assert abs(parts["cache_write_1h"] - 4_000 * 10.0 / 1e6) < 1e-12, parts
+    assert abs(sum(parts.values()) - mixed_want) < 1e-12, parts
+    # All of it at the 1-hour duration, and none of it double-billed: the two
+    # write lines always partition cache_creation, never exceed it.
+    allhour = _usage(creation=10_000, creation_1h=10_000)
+    assert ledger.billed_tokens(allhour)["cache_write"] == 0
+    assert abs(ledger.cost_usd(allhour, price) - 10_000 * 10.0 / 1e6) < 1e-12
+    # A record whose sub-count contradicts its total is clamped, never negative.
+    broken = _usage(creation=1_000, creation_1h=9_999)
+    assert ledger.billed_tokens(broken) == {
+        "input": 0, "output": 0, "cache_write": 0, "cache_write_1h": 1_000,
+        "cache_read": 0}, broken
+    # A usage dict from before the split still prices, as all-5-minute.
+    legacy = {"output_tokens": 1_000, "input_tokens": 0,
+              "cache_creation_input_tokens": 8_000, "cache_read_input_tokens": 0}
+    assert abs(ledger.cost_usd(legacy, price)
+               - (1_000 * 25 + 8_000 * 6.25) / 1e6) < 1e-12
+
+    # The 1-hour share is lifted out of the nested block the API writes it in.
+    folded = ledger.new_usage()
+    ledger.add_usage(folded, {"input_tokens": 2, "output_tokens": 7,
+                              "cache_creation_input_tokens": 10_828,
+                              "cache_read_input_tokens": 35_935,
+                              "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                                                 "ephemeral_1h_input_tokens": 10_828}})
+    assert folded[ledger.CREATION_1H_KEY] == 10_828, folded
+    assert folded[ledger.CREATION_KEY] == 10_828, folded
+    # The nested block is not read twice when the flat key is already there.
+    twice = ledger.new_usage()
+    ledger.add_usage(twice, {"cache_creation_input_tokens": 100,
+                             "cache_creation_1h_input_tokens": 40,
+                             "cache_creation": {"ephemeral_1h_input_tokens": 40}})
+    assert twice[ledger.CREATION_1H_KEY] == 40, twice
+    # Junk in the nested block is ignored rather than raising inside a report.
+    junk = ledger.new_usage()
+    ledger.add_usage(junk, {"cache_creation": {"ephemeral_1h_input_tokens": "lots"}})
+    ledger.add_usage(junk, {"cache_creation": "not a block"})
+    assert junk[ledger.CREATION_1H_KEY] == 0, junk
+    # Unpriced is None, never zero: zero would be a claim nobody made.
+    assert ledger.cost_usd(million, P.price_for(table, "claude-sonnet-5")) is None
+    assert ledger.cost_components(million, None) is None
+    # A half-filled row prices nothing at all.
+    half = P.normalize({"m": {"input": 5.0, "output": 25.0}})
+    assert not P.is_priced(half["m"])
+    assert ledger.cost_usd(million, half["m"]) is None
+    # ... and a table that prices the model bills the tally through to the row.
+    tally = ledger.Tally(table)
+    tally.add_turn("claude-opus-5", "AUTHOR", real, NOW)
+    tally.add_turn("claude-sonnet-5", "OPS", real, NOW)
+    rows = tally.by_model
+    assert abs(rows["claude-opus-5"]["cost_usd"] - want) < 1e-12, rows
+    assert rows["claude-opus-5"]["unpriced"] is False
+    assert rows["claude-sonnet-5"]["cost_usd"] is None, rows
+    assert rows["claude-sonnet-5"]["unpriced"] is True
+    assert abs(tally.usd() - want) < 1e-12, tally.usd()
+    # The priced share is measured in weighted cost, so it says how much of the
+    # window the dollar figure actually covers.
+    priced, total = tally.priced_weighted()
+    assert priced == total / 2, (priced, total)
+
+
+def test_pricing_summary_cost_block():
+    from tokentracker import graph as G
+    from tokentracker import ledger
+    cfg = _ledger_cfg(exec_tools=("Edit",))
+    cfg.pricing = {"claude-opus-5": PRICES["claude-opus-5"]}  # sonnet unpriced
+    G.apply_graph(cfg)
+    summary = ledger.build_summary(cfg, utcnow() - timedelta(hours=1), utcnow())
+    cost = summary["cost"]
+    assert set(cost) >= {"total_usd", "priced_share", "by_model", "by_tier",
+                         "by_source", "by_role", "by_category", "top_sinks",
+                         "per_hour", "per_milestone", "pricing_used",
+                         "unpriced_models", "by_model_components",
+                         "cache_write_1h_tokens",
+                         "cache_write_1h_share"}, sorted(cost)
+    # 3 opus turns: 300 output + 3000 cache read.
+    want = (300 * 25 + 3000 * 0.5) / 1e6
+    assert abs(cost["total_usd"] - round(want, 4)) < 1e-9, cost["total_usd"]
+    assert abs(cost["by_model"]["claude-opus-5"] - round(want, 4)) < 1e-9
+    assert cost["by_model"]["claude-sonnet-5"] is None, cost["by_model"]
+    assert cost["unpriced_models"] == ["claude-sonnet-5"], cost["unpriced_models"]
+    assert cost["by_model_components"]["claude-sonnet-5"] is None
+    assert abs(cost["by_model_components"]["claude-opus-5"]["output"]
+               - 300 * 25 / 1e6) < 1e-9
+    # Five components, so the two cache-write durations are separable.
+    assert set(cost["by_model_components"]["claude-opus-5"]) == {
+        "input", "output", "cache_write", "cache_write_1h",
+        "cache_read"}, cost["by_model_components"]
+    # This fixture writes no cache at all, so the 1-hour share is a real zero.
+    assert cost["cache_write_1h_tokens"] == 0, cost
+    assert cost["cache_write_1h_share"] == 0.0, cost
+    assert summary["totals_by_model"]["claude-opus-5"]["cache_creation_1h_tokens"] == 0
+    # weighted: 3 x (100 + 0.01*1000) priced, 50 unpriced.
+    assert abs(cost["priced_share"] - round(330 / 380, 4)) < 1e-9, cost
+    # Every dollar lands in exactly one tier, one source, one role, one category.
+    assert abs(cost["by_tier"]["executive"] - cost["total_usd"]) < 1e-9, cost
+    assert abs(cost["by_source"]["main_session"] - cost["total_usd"]) < 1e-9
+    assert set(cost["by_role"]) == set(ledger.ROLES), cost["by_role"]
+    assert abs(cost["by_role"]["director"] - cost["total_usd"]) < 1e-9, cost
+    assert abs(cost["by_category"]["AUTHOR"] - cost["total_usd"]) < 1e-9, cost
+    assert cost["per_hour"] and "usd_by_model" in cost["per_hour"][0], cost
+    # The table the footer prints, with the source behind each number.
+    used = cost["pricing_used"]
+    assert used["claude-opus-5"]["source"] == "https://example/pricing"
+    assert used["claude-opus-5"]["checked"] == "2026-09-03"
+    assert used["claude-opus-5"]["unpriced"] is False
+    assert used["claude-sonnet-5"]["unpriced"] is True, used
+    assert used["claude-sonnet-5"]["input"] is None, used
+    sink = cost["top_sinks"][0]
+    assert set(sink) == {"source", "id_or_label", "what", "model", "usd",
+                         "tokens_out", "cache_read"}, sink
+    # The per-model totals carry the same bill, and say when there is none.
+    totals = summary["totals_by_model"]
+    assert abs(totals["claude-opus-5"]["cost_usd"] - round(want, 4)) < 1e-9
+    assert totals["claude-sonnet-5"]["cost_usd"] is None
+    assert totals["claude-sonnet-5"]["unpriced"] is True
+    # An unpriced model is named in a caveat rather than billed at a guess.
+    assert any("claude-sonnet-5" in c and "unpriced" in c
+               for c in summary["caveats"]), summary["caveats"]
+    # The existing keys still carry what the page already renders.
+    assert summary["totals_by_model"]["claude-opus-5"]["weighted_cost"] == 330.0
+    assert summary["where_fable_went"], summary["where_fable_went"]
+
+
+def test_pricing_bills_one_hour_cache_writes_end_to_end():
+    """A transcript that writes 1-hour cache is billed at 2x, not 1.25x.
+
+    The regression this pins is silent by construction: the four-term formula
+    produces a plausible number that is simply too small, and every figure
+    derived from it (by model, tier, role, hour, commit) carries the same bias.
+    So the test computes both formulas and demands the larger, correct one.
+    """
+    from tokentracker import graph as G
+    from tokentracker import ledger
+    cfg = _ledger_cfg(exec_tools=("Edit",))
+    cfg.pricing = {"claude-opus-5": PRICES["claude-opus-5"]}
+    G.apply_graph(cfg)
+    ts = (utcnow() - timedelta(minutes=5)).isoformat()
+    # The API's own shape: the flat total, plus the nested split beside it.
+    usage = {"input_tokens": 0, "output_tokens": 0,
+             "cache_read_input_tokens": 0,
+             "cache_creation_input_tokens": 100_000,
+             "cache_creation": {"ephemeral_5m_input_tokens": 60_000,
+                                "ephemeral_1h_input_tokens": 40_000}}
+    proj = cfg.projects_dir / "proj"
+    path = proj / f"{MAIN_ID}.jsonl"
+    path.write_text(path.read_text(encoding="utf-8") + "\n"
+                    + _entry("cache1", "claude-opus-5", ts, ["Read"], usage,
+                             uuid="ucache"), encoding="utf-8")
+
+    summary = ledger.build_summary(cfg, utcnow() - timedelta(hours=1), utcnow())
+    cost = summary["cost"]
+    row = summary["totals_by_model"]["claude-opus-5"]
+    assert row["cache_creation_tokens"] == 100_000, row
+    assert row["cache_creation_1h_tokens"] == 40_000, row
+    assert cost["cache_write_1h_tokens"] == 40_000, cost
+    assert cost["cache_write_1h_share"] == 0.4, cost
+
+    base = (300 * 25 + 3_000 * 0.5) / 1e6           # the three existing turns
+    five_term = base + (60_000 * 6.25 + 40_000 * 10.0) / 1e6
+    four_term = base + (100_000 * 6.25) / 1e6       # what folding them gives
+    assert abs(cost["total_usd"] - round(five_term, 4)) < 1e-9, cost["total_usd"]
+    assert cost["total_usd"] > four_term, (cost["total_usd"], four_term)
+    parts = cost["by_model_components"]["claude-opus-5"]
+    assert abs(parts["cache_write"] - 60_000 * 6.25 / 1e6) < 1e-9, parts
+    assert abs(parts["cache_write_1h"] - 40_000 * 10.0 / 1e6) < 1e-9, parts
+    # Every derived cut carries the corrected figure, not just the headline.
+    assert abs(cost["by_tier"]["executive"] - cost["total_usd"]) < 1e-9, cost
+    assert abs(cost["by_role"]["director"] - cost["total_usd"]) < 1e-9, cost
+    assert abs(sum(cost["by_category"].values()) - cost["total_usd"]) < 1e-9, cost
+    hourly = sum(sum(h["usd_by_model"].values()) for h in cost["per_hour"])
+    assert abs(hourly - cost["total_usd"]) < 1e-3, hourly
+    # And the page says so rather than presenting the total as the whole story.
+    assert any("1-hour" in c and "1.25" in c for c in summary["caveats"]), \
+        summary["caveats"]
+
+
+def test_pricing_milestone_bucketing():
+    from tokentracker import ledger
+    sep = ledger.GIT_SEP
+    log = "\n".join([
+        f"aaaaaaaa1111{sep}2026-09-03T10:00:00+00:00{sep}beta: pod pass",
+        "",
+        f"bbbbbbbb2222{sep}2026-09-03T12:00:00+00:00{sep}beta: crowd pass",
+        "not a log line at all",
+    ])
+    commits = ledger.parse_git_log(log)
+    assert [c["commit"] for c in commits] == ["aaaaaaaa1111", "bbbbbbbb2222"]
+    assert commits[0]["subject"] == "beta: pod pass"
+
+    start = datetime(2026, 9, 3, 9, 0, tzinfo=timezone.utc)
+
+    def at(hour, minute):
+        return datetime(2026, 9, 3, hour, minute, tzinfo=timezone.utc)
+
+    events = [
+        (at(8, 30), "claude-opus-5", 99.0),    # before the window start
+        (at(9, 30), "claude-opus-5", 1.0),     # -> first commit
+        (at(10, 30), "claude-opus-5", 2.0),    # -> second commit
+        (at(11, 59), "claude-opus-5", 4.0),    # -> second commit
+        (at(12, 30), "claude-opus-5", 8.0),    # after the last commit: no row
+        (at(11, 0), "claude-opus-5", None),    # unpriced turns add nothing
+    ]
+    rows = ledger.bucket_milestones(commits, events, start)
+    assert [r["commit"] for r in rows] == ["aaaaaaaa", "bbbbbbbb"], rows
+    assert rows[0]["usd"] == 1.0 and rows[0]["minutes"] == 60.0, rows[0]
+    assert rows[1]["usd"] == 6.0 and rows[1]["minutes"] == 120.0, rows[1]
+    assert rows[1]["subject"] == "beta: crowd pass"
+    # No commits, no invented milestone.
+    assert ledger.bucket_milestones([], events, start) == []
+
+
+def test_pricing_override_precedence():
+    from tokentracker import pricing as P
+    cfg = make_cfg()
+    cfg.pricing = {"claude-opus-5": dict(PRICES["claude-opus-5"])}
+    cfg.local_model = "Qwen3.8-27B-NVFP4"
+    table, source = P.read_pricing_source(cfg)
+    assert source == P.SOURCE_CONFIG
+    assert table["claude-opus-5"]["output"] == 25.0
+    # The local lane costs no API dollars, and is priced rather than unpriced.
+    assert P.is_priced(table["Qwen3.8-27B-NVFP4"])
+    assert table["Qwen3.8-27B-NVFP4"]["source"] == P.LOCAL_SOURCE
+    assert table["Qwen3.8-27B-NVFP4"]["output"] == 0.0
+
+    # The override wins, and is a patch: one field moves, the rest of the row
+    # keeps following config.json.
+    P.write_pricing(cfg, {"claude-opus-5": {"output": 30.0}})
+    table, source = P.read_pricing_source(cfg)
+    assert source == P.SOURCE_OVERRIDE
+    assert table["claude-opus-5"]["output"] == 30.0
+    assert table["claude-opus-5"]["input"] == 5.0, table["claude-opus-5"]
+    assert table["claude-opus-5"]["source"] == "https://example/pricing"
+    stored = json.loads(cfg.pricing_file.read_text(encoding="utf-8"))["pricing"]
+    assert stored == {"claude-opus-5": {"output": 30.0}}, stored
+    # A second set keeps the first, so two corrections do not overwrite.
+    P.write_pricing(cfg, {"claude-sonnet-5": {"input": 2.0, "output": 10.0,
+                                              "cache_write": 2.5,
+                                              "cache_write_1h": 4.0,
+                                              "cache_read": 0.2}})
+    table = P.read_pricing(cfg)
+    assert table["claude-opus-5"]["output"] == 30.0
+    assert P.is_priced(table["claude-sonnet-5"]), table["claude-sonnet-5"]
+    # Four of the five numbers is not a price: a row that cannot bill 1-hour
+    # cache writes must not bill them at the 5-minute rate by omission.
+    P.write_pricing(cfg, {"claude-haiku-4-5": {"input": 1.0, "output": 5.0,
+                                               "cache_write": 1.25,
+                                               "cache_read": 0.1}})
+    assert not P.is_priced(P.read_pricing(cfg)["claude-haiku-4-5"])
+    P.write_pricing(cfg, {"claude-haiku-4-5": {"cache_write_1h": 2.0}})
+    assert P.is_priced(P.read_pricing(cfg)["claude-haiku-4-5"])
+    # A correction to config.json still applies to every field not pinned.
+    cfg.pricing["claude-opus-5"]["input"] = 6.0
+    assert P.read_pricing(cfg)["claude-opus-5"]["input"] == 6.0
+
+    # Junk never unprices a model, and never raises inside the poll.
+    cfg.pricing_file.write_text("{not json", encoding="utf-8")
+    table, source = P.read_pricing_source(cfg)
+    assert source == P.SOURCE_CONFIG and table["claude-opus-5"]["output"] == 25.0
+    assert P.override_warning(cfg) is not None
+    cfg.pricing_file.write_text(json.dumps(
+        {"pricing": {"claude-opus-5": {"output": "free"}}}), encoding="utf-8")
+    assert P.read_pricing(cfg)["claude-opus-5"]["output"] == 25.0
+    # An explicit null is the one way to say "this has no published price".
+    cfg.pricing_file.write_text(json.dumps(
+        {"pricing": {"claude-opus-5": {"output": None}}}), encoding="utf-8")
+    assert not P.is_priced(P.read_pricing(cfg)["claude-opus-5"])
+    assert P.unpriced(P.read_pricing(cfg), ["claude-opus-5"]) == ["claude-opus-5"]
+
+
+def test_pricing_assignment_parsing_and_roles():
+    from tokentracker import ledger
+    from tokentracker import pricing as P
+    patch, errors = P.parse_assignments([
+        "claude-opus-5.output=25", "claude-opus-5.source=https://x/y",
+        # The local model id has a dot in it, so the field is split off at the
+        # LAST dot: this is a price for Qwen3.8-27B-NVFP4, not for "Qwen3".
+        "Qwen3.8-27B-NVFP4.input=0", "claude-opus-5.cache_read=$0.50",
+    ])
+    assert errors == [], errors
+    assert patch["claude-opus-5"] == {"output": 25.0, "source": "https://x/y",
+                                      "cache_read": 0.5}, patch
+    assert patch["Qwen3.8-27B-NVFP4"] == {"input": 0.0}, patch
+    for bad in ("claude-opus-5.output", "outputis=5", "claude-opus-5.rate=5",
+                "claude-opus-5.output=lots", "claude-opus-5.input=-3"):
+        _patch, errs = P.parse_assignments([bad])
+        assert errs, bad
+
+    # Roles are read off the lane's own label, and only a declaration counts.
+    agent = ledger.AGENT_SOURCE
+    assert ledger.role_of("You are the implementer. Implement 1-5.", agent) == "worker"
+    assert ledger.role_of('You are the adversarial reviewer, lens "tests-cli": '
+                          "try to refute it.", agent) == "reviewer"
+    assert ledger.role_of("You are the judge. Weigh the three lenses.",
+                          agent) == "judge"
+    assert ledger.role_of("Synthesis: merge the three review lenses.",
+                          agent) == "synthesis"
+    assert ledger.role_of("You are the fixer. Fix every finding.", agent) == "verify"
+    assert ledger.role_of("You are the author of the README.", agent) == "author"
+    assert ledger.role_of("reviewer", agent) == "reviewer"     # a bare label
+    # A passing mention is not a declaration: this is the failure that filed
+    # every worker lane under `verify`, because the standing brief says so.
+    assert ledger.role_of(
+        "You are the implementer. Verify results with Tools/verify.sh, and "
+        "review the tests before you commit.", agent) == "worker"
+    assert ledger.role_of("Read dev_JSON/BETA.md and build the pods.",
+                          agent) == "worker"
+    # Nothing declared: a session is the director, an agent is a worker.
+    assert ledger.role_of("main session", ledger.MAIN_SOURCE) == "director"
+    assert ledger.role_of("fork session", ledger.FORK_SOURCE) == "director"
+    assert ledger.role_of("", agent) == "worker"
+    assert set(ledger.ROLES) == {"worker", "reviewer", "judge", "synthesis",
+                                 "author", "verify", "director"}
+
+
+def test_cli_pricing_shows_and_sets():
+    from tokentracker import pricing as P
+    from tokentracker.cli import main as cli_main
+    from tokentracker.config import load_config
+    tmp = Path(tempfile.mkdtemp(prefix="tokdist_pricecli_"))
+    (tmp / "config.json").write_text(json.dumps({
+        "pricing": {"claude-opus-5": PRICES["claude-opus-5"]},
+        "pricing_default": None,
+        "local_model": "Qwen3.8-27B-NVFP4",
+    }), encoding="utf-8")
+
+    out = _capture(lambda: cli_main(["--root", str(tmp), "pricing"]))
+    assert f"(source: {P.SOURCE_CONFIG})" in out, out
+    assert "claude-opus-5" in out and "$25.00" in out, out
+    assert "Qwen3.8-27B-NVFP4" in out and "local" in out, out
+    # Both cache-write durations are columns, so the table shows what is billed.
+    assert "wr 5m" in out and "wr 1h" in out, out
+    assert "$6.25" in out and "$10.00" in out, out
+
+    out = _capture(lambda: cli_main(
+        ["--root", str(tmp), "pricing", "set", "claude-opus-5.cache_write_1h=11"]))
+    assert "$11.00" in out, out
+    assert P.read_pricing(load_config(tmp))["claude-opus-5"]["cache_write_1h"] == 11.0
+    _capture(lambda: cli_main(
+        ["--root", str(tmp), "pricing", "set", "claude-opus-5.cache_write_1h=10"]))
+
+    out = _capture(lambda: cli_main(
+        ["--root", str(tmp), "pricing", "set", "claude-opus-5.output=30"]))
+    assert f"(source: {P.SOURCE_OVERRIDE})" in out, out
+    assert "$30.00" in out, out
+    cfg = load_config(tmp)
+    assert P.read_pricing(cfg)["claude-opus-5"]["output"] == 30.0
+    # config.json is never rewritten by a set.
+    raw = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+    assert raw["pricing"]["claude-opus-5"]["output"] == 25.0, raw["pricing"]
+
+    # Unparseable assignments are refused without touching the override.
+    assert cli_main(["--root", str(tmp), "pricing", "set",
+                     "claude-opus-5.output=lots"]) == 1
+    # An assignment without the `set` verb is refused by the parser itself.
+    try:
+        _capture(lambda: cli_main(["--root", str(tmp), "pricing",
+                                   "claude-opus-5.output=1"]))
+        raise AssertionError("accepted an assignment without 'set'")
+    except SystemExit as exc:
+        assert exc.code == 2, exc.code
+    assert P.read_pricing(load_config(tmp))["claude-opus-5"]["output"] == 30.0
+    # A model with no published price prints as unpriced rather than as $0.
+    _capture(lambda: cli_main(["--root", str(tmp), "pricing", "set",
+                               "claude-sonnet-5.input=2"]))
+    out = _capture(lambda: cli_main(["--root", str(tmp), "pricing"]))
+    assert P.UNPRICED in out, out
+
+
+def test_pricing_page_renders_the_cost_section():
+    from tokentracker import ledger
+    cfg = _ledger_cfg()
+    cfg.pricing = {"claude-opus-5": PRICES["claude-opus-5"]}
+    page = ledger.generate(cfg, "manual", hours=1.0)
+    html = page.read_text(encoding="utf-8")
+    assert "__DATA__" not in html and ledger.TITLE_PLACEHOLDER not in html
+    assert ">What it cost</h2>" in html, "the cost section title"
+    for marker in ("cost-chart", "cost-tier-chart", "cost-role-chart",
+                   "cost-hourly-chart", "cost-milestone-table", "pricing-used",
+                   "--cost-input", "drawCost(",
+                   # the fifth cost segment, its ink, and the five-term formula
+                   "--cost-write-1h", "--cost-write-1h-ink", "Cache write 1h",
+                   "cache_write_1h_price"):
+        assert marker in html, marker
+    # The 1-hour token counts reach the page, both cuts of them.
+    assert "cache_creation_1h_tokens" in html and "cache_write_1h_share" in html
+    # The data the section reads is spliced in, cost block and all.
+    data = json.loads(
+        (cfg.reports_dir / f"{page.name[:16]}-summary.json").read_text(
+            encoding="utf-8"))
+    assert data["cost"]["total_usd"] > 0, data["cost"]
+    assert '"cost"' in html and "total_usd" in html
+
+
+def test_repo_config_ships_the_priced_table():
+    from tokentracker import pricing as P
+    from tokentracker.config import load_config
+    cfg = load_config(ROOT)
+    # Read the checked-in table, not the resolved one: a local state/pricing.json
+    # must not decide whether the repo ships prices.
+    table = P.normalize(cfg.pricing)
+    for model in ("claude-opus-5", "claude-fable-5-1", "claude-sonnet-5",
+                  "claude-opus-4-8", "claude-haiku-4-5-20251001"):
+        row = table.get(model)
+        assert P.is_priced(row), (model, row)
+        assert str(row["source"]).startswith("http"), (model, row)
+        assert row["checked"], (model, row)
+        assert row["cache_write_1h"] > row["cache_write"] > row["input"] > 0, \
+            (model, row)
+        assert row["output"] > row["input"] > row["cache_read"] > 0, (model, row)
+        # The published multipliers, which is what makes these two prices and
+        # not one: 1.25x base input for a 5-minute write, 2x for a 1-hour one.
+        assert abs(row["cache_write"] - 1.25 * row["input"]) < 1e-9, (model, row)
+        assert abs(row["cache_write_1h"] - 2.0 * row["input"]) < 1e-9, (model, row)
+    # The published figures, as fetched (USD per 1M tokens).
+    assert table["claude-opus-5"]["input"] == 5.0
+    assert table["claude-opus-5"]["output"] == 25.0
+    assert table["claude-opus-5"]["cache_write_1h"] == 10.0
+    assert table["claude-fable-5-1"]["cache_read"] == 0.25
+    assert table["claude-fable-5-1"]["cache_write_1h"] == 20.0
+    assert table["claude-sonnet-5"]["output"] == 10.0
+    assert table["claude-sonnet-5"]["cache_write_1h"] == 4.0
+    assert table["claude-haiku-4-5-20251001"]["input"] == 1.0
+    assert table["claude-haiku-4-5-20251001"]["cache_write_1h"] == 2.0
+    # The local lane is free, and says so.
+    assert table[cfg.local_model]["source"] == P.LOCAL_SOURCE
+    assert table[cfg.local_model]["output"] == 0.0
+    # Nothing is billed at a stand-in rate for a model nobody priced.
+    assert cfg.pricing_default is None
+    assert P.default_row(cfg) is None
+    # Every model the graph can name is priced, so a report cannot come out
+    # with the whole executive tier unpriced.
+    from tokentracker import graph as G
+    assert P.unpriced(P.read_pricing(cfg), G.known_models(cfg)) == []
 
 
 def main() -> int:

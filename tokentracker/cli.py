@@ -609,6 +609,38 @@ def cmd_graph(cfg: Config, assignments: list[str] | None) -> int:
     return 0
 
 
+def cmd_pricing(cfg: Config, assignments: list[str] | None) -> int:
+    """Print the price table, or set prices from `model.field=value` pairs."""
+    from .pricing import (
+        default_row,
+        format_table,
+        override_warning,
+        parse_assignments,
+        read_pricing_source,
+        write_pricing,
+    )
+
+    ignored = override_warning(cfg)
+    table, source = read_pricing_source(cfg)
+    if assignments:
+        # A patch, like `graph set`: only the fields named here stop following
+        # config.json, so correcting one output price never freezes the rest of
+        # the published table.
+        patch, errors = parse_assignments(assignments)
+        for error in errors:
+            print(f"error: {error}")
+        if errors:
+            return 1
+        write_pricing(cfg, patch)
+        table, source = read_pricing_source(cfg)
+    print(f"model prices, USD per 1M tokens (source: {source})")
+    if ignored and not assignments:
+        print(ignored)
+    for line in format_table(table, default_row(cfg)):
+        print(line)
+    return 0
+
+
 def cmd_add(cfg: Config, args: argparse.Namespace) -> int:
     dispatcher = Dispatcher(cfg)
     task = TaskSpec(
@@ -687,6 +719,14 @@ def main(argv: list[str] | None = None) -> int:
     graph_p.add_argument("assignments", nargs="*", metavar="tier.field=value",
                          help="e.g. workers.count=20 advisory.model=claude-opus-5")
 
+    price_p = sub.add_parser(
+        "pricing", help="show or set the per-model list prices the report bills at")
+    price_p.add_argument("action", nargs="?", choices=("set",), default=None,
+                         help="'set' to edit prices; omit to print the table")
+    price_p.add_argument("assignments", nargs="*", metavar="model.field=usd",
+                         help="e.g. claude-opus-5.output=25 "
+                              "claude-opus-5.source=https://...")
+
     add_p = sub.add_parser("add", help="queue a task")
     add_p.add_argument("--id", required=True)
     add_p.add_argument("--prompt", required=True)
@@ -721,6 +761,11 @@ def main(argv: list[str] | None = None) -> int:
                 print("error: use 'graph set tier.field=value'")
                 return 1
             return cmd_graph(cfg, args.assignments if args.action == "set" else None)
+        if args.cmd == "pricing":
+            if args.action != "set" and args.assignments:
+                print("error: use 'pricing set model.field=usd'")
+                return 1
+            return cmd_pricing(cfg, args.assignments if args.action == "set" else None)
         if args.cmd == "add":
             return cmd_add(cfg, args)
         if args.cmd == "list":

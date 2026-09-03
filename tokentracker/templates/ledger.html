@@ -26,6 +26,30 @@
     --m-opus-48: #43C9A9;
     --m-opus-5: #08947F;
 
+    /* cost components: identity, not magnitude, so a categorical set - blue /
+       orange / aqua / yellow, the first four slots of the validated default
+       order. Adjacent-pair gates pass in both modes (worst CVD dE 9.1 light,
+       8.4 dark; normal-vision 22.9 / 19.8). Aqua and yellow sit under 3:1 on
+       the light surface, which the direct USD labels and the table twin below
+       the chart relieve.
+
+       The two cache writes are ONE hue at two lightnesses rather than two
+       hues: 5-minute and 1-hour writes are the same thing billed at two rates
+       (1.25x and 2x base input), they always sit adjacent in the stack, and a
+       lightness step reads as "the darker half of cache write" where a fifth
+       hue would read as an unrelated fifth category. */
+    --cost-input: #2A78D6;
+    --cost-output: #EB6834;
+    --cost-write: #1BAF7A;
+    --cost-write-1h: #0B6B4C;
+    --cost-read: #EDA100;
+    /* Label ink for text sitting ON a segment. The three warm/green fills are
+       light enough for near-black in both themes; the blue and the deep 1-hour
+       green are not, and flip. */
+    --cost-ink: #12161C;
+    --cost-input-ink: #FFFFFF;
+    --cost-write-1h-ink: #FFFFFF;
+
     /* ordered category ramp, executive -> hands-on (single hue, monotone L) */
     --cat-1: #9FB3D4;
     --cat-2: #8399BF;
@@ -51,6 +75,15 @@
       --warn: #E8A33F;
       --crit: #E06561;
       --ok: #4FBF7A;
+      --cost-input: #3987E5;
+      --cost-output: #D95926;
+      --cost-write: #199E70;
+      /* the 1-hour write steps AWAY from the surface in each theme: darker on
+         the light page, lighter on the dark one, so the ink flips with it */
+      --cost-write-1h: #62D8AF;
+      --cost-read: #C98500;
+      --cost-input-ink: #0F141A;
+      --cost-write-1h-ink: #0F141A;
       --cat-1: #44567A;
       --cat-2: #576D95;
       --cat-3: #6D85AE;
@@ -71,6 +104,13 @@
     --warn: #E8A33F;
     --crit: #E06561;
     --ok: #4FBF7A;
+    --cost-input: #3987E5;
+    --cost-output: #D95926;
+    --cost-write: #199E70;
+    --cost-write-1h: #62D8AF;
+    --cost-read: #C98500;
+    --cost-input-ink: #0F141A;
+    --cost-write-1h-ink: #0F141A;
     --cat-1: #44567A;
     --cat-2: #576D95;
     --cat-3: #6D85AE;
@@ -255,6 +295,26 @@
   #totals-table th, #totals-table td { padding-right: 8px; }
   .row-key { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
   .row-key .swatch { width: 10px; height: 10px; flex: none; }
+  /* An unpriced model is greyed everywhere it appears: it is not cheap, it is
+     unknown, and it must never read as a small dollar figure. */
+  tr.is-unpriced td, tr.is-unpriced td.n { color: var(--muted); }
+  .tag-unpriced {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border: 1px solid var(--rule);
+    padding: 1px 5px;
+    margin-left: 8px;
+    white-space: nowrap;
+  }
+  .stat .fig.is-cost { color: var(--ink); }
+  .price-list { display: flex; flex-direction: column; gap: 6px; }
+  .price-list .price-row { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+  .price-list .price-model { font-family: var(--font-mono); font-size: 12px; color: var(--ink); }
+  .price-list .price-nums { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 12px; }
+  .price-list .price-src { font-size: 12px; word-break: break-all; }
 
   details { border-top: 1px solid var(--rule); padding-top: 10px; }
   summary { cursor: pointer; font-size: 12.5px; color: var(--muted); font-family: var(--font-mono); letter-spacing: 0.05em; }
@@ -326,6 +386,72 @@
     <div>
       <h3>Evidence</h3>
       <ul class="list" id="v-evidence" style="padding-top:10px"></ul>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="cost-h">
+    <h2 id="cost-h">What it cost</h2>
+    <p class="sub">The same turns, billed at the models' published list prices instead of the weighted proxy. Every figure below comes from the transcripts' own usage records multiplied by a price with a source and a date behind it; a model nothing prices is shown as <span class="tag-unpriced">unpriced</span> rather than billed at a guess.</p>
+    <div class="verdict-top">
+      <div class="stat">
+        <div class="label">List-price cost of the window</div>
+        <div class="fig is-cost" id="c-total">n/a</div>
+        <div class="sub-note" id="c-total-note"></div>
+      </div>
+      <div class="stat">
+        <div class="label">Priced share of weighted cost</div>
+        <div class="fig" id="c-priced">n/a</div>
+        <div class="sub-note" id="c-priced-note"></div>
+      </div>
+      <div class="stat">
+        <div class="label">Costliest model</div>
+        <div id="c-top-wrap"><span class="pill" id="c-top">n/a</span></div>
+        <div class="sub-note" id="c-top-note"></div>
+      </div>
+    </div>
+    <div id="c-unpriced-banner" hidden></div>
+
+    <div class="cols2">
+      <div class="panel">
+        <h3>Cost per model, split by what was billed</h3>
+        <p class="caption">One bar per model on a shared scale, stacked left to right: input, output, cache write at the 5-minute duration, cache write at the 1-hour duration, cache read. The two cache-write segments are one hue at two lightnesses because they are one thing at two prices, 1.25&times; and 2&times; base input. Segments are labelled with their own dollars where they are wide enough; the figure past the bar is the model's total.</p>
+        <div class="legend" id="cost-legend"></div>
+        <div class="chart-wrap"><svg class="chart" id="cost-chart" role="img" aria-label="Stacked bars of USD cost per model, split into input, output, 5-minute cache write, 1-hour cache write and cache read"></svg></div>
+      </div>
+
+      <div class="panel">
+        <h3>Where the dollars went</h3>
+        <p class="caption">The same total twice: by tier (who spent it) and by lane role (what it was spent doing). Roles come from each lane's own brief, so review and judge spend is separated from build spend.</p>
+        <div class="legend" id="cost-tier-legend"></div>
+        <div class="chart-wrap"><svg class="chart" id="cost-tier-chart" role="img" aria-label="Bars of USD cost by model tier"></svg></div>
+        <div class="chart-wrap"><svg class="chart" id="cost-role-chart" role="img" aria-label="Bars of USD cost by lane role"></svg></div>
+        <details id="cost-sinks-wrap">
+          <summary>Table view: the costliest lanes</summary>
+          <div class="scroll-x" id="cost-sinks-table"></div>
+        </details>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Tokens and dollars per model</h3>
+      <div class="scroll-x" id="cost-table"></div>
+    </div>
+
+    <div class="panel">
+      <h3>Cost per hour, stacked by model</h3>
+      <p class="caption">Dollars per UTC hour on the same model colours as the output chart further down, so a handoff between models is visible where the colour steps. Hours whose models are unpriced are empty here and present there.</p>
+      <div class="legend" id="cost-hourly-legend"></div>
+      <div class="chart-wrap"><svg class="chart" id="cost-hourly-chart" role="img" aria-label="Stacked bar chart of hourly USD cost by model"></svg></div>
+      <details id="cost-hourly-table-wrap">
+        <summary>Table view: hourly cost</summary>
+        <div class="scroll-x" id="cost-hourly-table"></div>
+      </details>
+    </div>
+
+    <div class="panel">
+      <h3>Cost between commits</h3>
+      <p class="caption">One row per commit in the tracked repo, covering the span that ended with it: the previous commit, or the start of the window for the first. Work done after the last commit belongs to no milestone and is not listed, so these rows total less than the window.</p>
+      <div class="scroll-x" id="cost-milestone-table"></div>
     </div>
   </section>
 
@@ -403,7 +529,14 @@
         <h3>Weighted cost</h3>
         <p style="padding-top:8px">Every "weighted" figure on this page is computed with one formula, so the tiers compare on a single scale:</p>
         <p style="padding-top:8px"><span class="formula">weighted_cost = output + 0.1 &times; (input + cache_creation) + 0.01 &times; cache_read</span></p>
-        <p style="padding-top:8px">It is a comparison proxy built from transcript usage records. It is not a bill, and it does not model per-model pricing.</p>
+        <p style="padding-top:8px">It is a comparison proxy built from transcript usage records. It is not a bill. The dollars under <strong class="kicker">What it cost</strong> are an estimate of one, and they use one formula too:</p>
+        <p style="padding-top:8px"><span class="formula">cost_usd = (input &times; input_price + output &times; output_price + cache_5m &times; cache_write_price + cache_1h &times; cache_write_1h_price + cache_read &times; cache_read_price) &divide; 1,000,000</span></p>
+        <p style="padding-top:8px">Five terms, because cache writes carry two prices and the usage records carry both counts: <span class="formula">cache_5m + cache_1h = cache_creation</span>, where the 1-hour writes bill at 2&times; base input and the 5-minute ones at 1.25&times;. Charging the whole creation figure at the 5-minute rate would understate every dollar on this page. What the formula still does not model is listed under <strong class="kicker">Caveats</strong>.</p>
+      </div>
+      <div>
+        <h3>Prices used</h3>
+        <p style="padding-top:8px">USD per 1M tokens, per model, with the source each figure was read from and the date it was read. Five figures per model, because the two cache-write durations are two published prices. Nothing here is inferred from a neighbouring model: a model missing any of the five is billed at nothing and reported as unpriced.</p>
+        <div class="price-list" id="pricing-used" style="padding-top:12px"></div>
       </div>
       <div>
         <h3>Sources</h3>
@@ -757,6 +890,561 @@ const DATA = __DATA__;
     li.appendChild(el("span", null, String(e)));
     evList.appendChild(li);
   });
+
+  /* --------------------------------------------------------- what it cost */
+
+  var C = (D.cost && typeof D.cost === "object") ? D.cost : null;
+  var UNPRICED = "unpriced";
+  var COST_PARTS = [
+    { key: "input", name: "Input", color: "var(--cost-input)", ink: "var(--cost-input-ink)" },
+    { key: "output", name: "Output", color: "var(--cost-output)", ink: "var(--cost-ink)" },
+    { key: "cache_write", name: "Cache write 5m", color: "var(--cost-write)", ink: "var(--cost-ink)" },
+    { key: "cache_write_1h", name: "Cache write 1h", color: "var(--cost-write-1h)", ink: "var(--cost-write-1h-ink)" },
+    { key: "cache_read", name: "Cache read", color: "var(--cost-read)", ink: "var(--cost-ink)" }
+  ];
+  var ROLE_ORDER = ["director", "worker", "reviewer", "judge", "synthesis",
+                    "author", "verify"];
+
+  function fmtUsd(v) {
+    var n = num(v);
+    if (n === null) return UNPRICED;
+    var a = Math.abs(n);
+    if (a >= 1000) return "$" + Math.round(n).toLocaleString("en-US");
+    if (a >= 0.01 || n === 0) return "$" + n.toFixed(2);
+    return "$" + n.toFixed(4);
+  }
+  function fmtUsdTight(v) {
+    var n = num(v);
+    if (n === null) return UNPRICED;
+    if (Math.abs(n) >= 1000) return "$" + (n / 1000).toFixed(1) + "k";
+    return "$" + n.toFixed(2);
+  }
+  function shortModel(model) {
+    var m = String(model || "unknown");
+    return m.length > 20 ? m.slice(0, 19) + "…" : m;
+  }
+  function costMap(key) {
+    var raw = C ? C[key] : null;
+    return (raw && typeof raw === "object" && !Array.isArray(raw)) ? raw : {};
+  }
+  function noData(host, message) {
+    if (host && host.parentNode) host.parentNode.appendChild(el("p", "caption", message));
+    // style, not the hidden attribute: the UA's [hidden] rule does not reach an
+    // SVG element inside an HTML document in every engine.
+    if (host) host.style.display = "none";
+  }
+
+  // totals_by_model + cost.by_model(_components) -> one row per model
+  function costRows() {
+    var raw = (D.totals_by_model && typeof D.totals_by_model === "object")
+      ? D.totals_by_model : {};
+    var byModel = costMap("by_model");
+    var comps = costMap("by_model_components");
+    var names = {};
+    Object.keys(raw).forEach(function (m) { names[m] = 1; });
+    Object.keys(byModel).forEach(function (m) { names[m] = 1; });
+    var rows = Object.keys(names).map(function (m) {
+      var r = (raw[m] && typeof raw[m] === "object") ? raw[m] : {};
+      var u = (r.usage && typeof r.usage === "object") ? r.usage : r;
+      var parts = (comps[m] && typeof comps[m] === "object") ? comps[m] : null;
+      var usd = num(byModel[m]);
+      // cache_creation is ONE counter over TWO prices; the 1-hour share is a
+      // subset of it, so the 5-minute line is the remainder, never the whole.
+      var creation = pickNum(u, ["cache_creation_tokens", "cache_creation", "cache_creation_input_tokens"]);
+      var hour = pickNum(u, ["cache_creation_1h_tokens", "cache_creation_1h_input_tokens"]);
+      if (hour !== null && creation !== null) hour = Math.min(hour, creation);
+      return {
+        model: m,
+        input: pickNum(u, ["input_tokens", "input"]),
+        output: pickNum(u, ["output_tokens", "output"]),
+        cache_write: (creation === null || hour === null) ? creation : creation - hour,
+        cache_write_1h: hour,
+        cache_read: pickNum(u, ["cache_read_tokens", "cache_read", "cache_read_input_tokens"]),
+        usd: usd,
+        parts: parts,
+        unpriced: r.unpriced === true || (parts === null && usd === null)
+      };
+    });
+    rows.sort(function (a, b) {
+      if (a.unpriced !== b.unpriced) return a.unpriced ? 1 : -1;
+      return (b.usd === null ? 0 : b.usd) - (a.usd === null ? 0 : a.usd);
+    });
+    return rows;
+  }
+
+  function drawCostHeadline(rows) {
+    var total = C ? num(C.total_usd) : null;
+    var share = C ? frac(C.priced_share) : null;
+    byId("c-total").textContent = total === null ? "n/a" : fmtUsd(total);
+    byId("c-total-note").textContent = C
+      ? ("list prices" + (C.pricing_source ? " from " + C.pricing_source : ""))
+      : "no cost block in the source file";
+    byId("c-priced").textContent = share === null ? "n/a" : fmtPct(share);
+    byId("c-priced-note").textContent =
+      "share of weighted cost with a published price behind it";
+
+    var priced = rows.filter(function (r) { return !r.unpriced && r.usd !== null; });
+    var pill = byId("c-top");
+    clear(pill);
+    if (priced.length) {
+      pill.className = "pill";
+      pill.style.color = modelColor(priced[0].model);
+      pill.appendChild(el("span", "dot"));
+      pill.appendChild(document.createTextNode(priced[0].model));
+      byId("c-top-note").textContent = fmtUsd(priced[0].usd) + " of "
+        + fmtUsd(total) + (total ? " (" + fmtPct(priced[0].usd / total) + ")" : "");
+    } else {
+      pill.textContent = "n/a";
+    }
+
+    var unpriced = (C && Array.isArray(C.unpriced_models)) ? C.unpriced_models : [];
+    if (unpriced.length) {
+      var b = byId("c-unpriced-banner");
+      b.hidden = false;
+      b.className = "banner";
+      b.appendChild(el("strong", null, "UNPRICED"));
+      b.appendChild(el("p", null,
+        "No published price for " + unpriced.join(", ") + ". Their tokens are in "
+        + "every token figure on this page and in none of the dollar figures, so "
+        + "the real bill is higher than the number above by whatever they cost."));
+    }
+  }
+
+  function drawCostModels(rows) {
+    var host = byId("cost-chart");
+    var legend = byId("cost-legend");
+    COST_PARTS.forEach(function (p) {
+      var k = el("span", "key");
+      var sw = el("span", "swatch");
+      sw.style.background = p.color;
+      k.appendChild(sw);
+      k.appendChild(el("span", null, p.name));
+      legend.appendChild(k);
+    });
+    if (!rows.length) { noData(host, "n/a — no per-model cost in the source file."); return; }
+
+    var w = 660, m = { t: 16, r: 74, b: 26, l: 132 };
+    var barH = 22, rowGap = 12;
+    var h = m.t + m.b + rows.length * (barH + rowGap);
+    var pw = w - m.l - m.r;
+    host.setAttribute("viewBox", "0 0 " + w + " " + h);
+    host.setAttribute("preserveAspectRatio", "xMidYMid meet");
+
+    var max = 0;
+    rows.forEach(function (r) { if (r.usd !== null && r.usd > max) max = r.usd; });
+    var scale = max > 0 ? max : 1;
+
+    var y = m.t;
+    rows.forEach(function (r) {
+      var name = svg("text", { x: m.l - 10, y: y + 15, "text-anchor": "end",
+        "font-size": 11.5, "font-family": "var(--font-mono)",
+        fill: r.unpriced ? "var(--muted)" : "var(--ink)" });
+      name.textContent = shortModel(r.model);
+      host.appendChild(name);
+
+      if (r.unpriced || !r.parts) {
+        var note = svg("text", { x: m.l, y: y + 15, "font-size": 11,
+          "font-family": "var(--font-mono)", fill: "var(--muted)",
+          "letter-spacing": "0.06em" });
+        note.textContent = UNPRICED.toUpperCase() + " · "
+          + fmtTok(r.output) + " OUTPUT TOKENS, NO PUBLISHED PRICE";
+        host.appendChild(note);
+        y += barH + rowGap;
+        return;
+      }
+
+      var x = m.l;
+      COST_PARTS.forEach(function (p) {
+        var v = num(r.parts[p.key]) || 0;
+        var segW = (v / scale) * pw;
+        if (segW > 0.4) {
+          // 2px surface gap between segments, so neighbours never fuse
+          var drawW = Math.max(0.8, segW - 2);
+          var rect = svg("rect", { x: x, y: y, width: drawW, height: barH,
+            fill: p.color });
+          var ttl = svg("title");
+          ttl.textContent = r.model + " · " + p.name + " · " + fmtUsd(v);
+          rect.appendChild(ttl);
+          host.appendChild(rect);
+          if (drawW > 48) {
+            var lab = svg("text", { x: x + 6, y: y + 15, "font-size": 11,
+              "font-family": "var(--font-mono)", "font-weight": 500,
+              fill: p.ink });
+            lab.textContent = fmtUsdTight(v);
+            host.appendChild(lab);
+          }
+        }
+        x += segW;
+      });
+      var tot = svg("text", { x: Math.min(x + 8, w - 4), y: y + 15,
+        "font-size": 11.5, "font-family": "var(--font-mono)", "font-weight": 500,
+        fill: "var(--ink)" });
+      tot.textContent = fmtUsd(r.usd);
+      host.appendChild(tot);
+      y += barH + rowGap;
+    });
+
+    var scaleNote = svg("text", { x: m.l, y: h - 8, "font-size": 10.5,
+      "font-family": "var(--font-mono)", fill: "var(--muted)",
+      "letter-spacing": "0.06em" });
+    scaleNote.textContent = "SHARED SCALE · 0 → " + fmtUsd(scale);
+    host.appendChild(scaleNote);
+
+    // table twin - also the relief for the two light-mode segment colours that
+    // sit under 3:1 on the page surface
+    var tbl = el("table");
+    tbl.appendChild(el("caption", null,
+      "Cache writes are split by duration because they are billed at two rates: "
+      + "5-minute writes at 1.25× base input, 1-hour writes at 2×. The two "
+      + "columns add up to the cache-creation figure used everywhere else on this "
+      + "page. USD per 1k output tokens is the whole bill over the output it "
+      + "produced, cache and input included, so it is what a token of finished "
+      + "work cost."));
+    var thead = el("thead"), hr = el("tr");
+    ["Model", "Tokens in", "Out", "Cache wr 5m", "Cache wr 1h", "Cache rd",
+     "USD", "USD / 1k out"]
+      .forEach(function (hd, i) { hr.appendChild(el("th", i ? "n" : null, hd)); });
+    thead.appendChild(hr); tbl.appendChild(thead);
+    var tb = el("tbody");
+    rows.forEach(function (r) {
+      var tr = el("tr");
+      if (r.unpriced) tr.className = "is-unpriced";
+      var td = el("td");
+      var key = el("span", "row-key");
+      var sw = el("span", "swatch");
+      sw.style.background = r.unpriced ? "var(--muted)" : modelColor(r.model);
+      key.appendChild(sw);
+      var nm = el("span", "mono", r.model); nm.style.fontSize = "12px";
+      key.appendChild(nm);
+      td.appendChild(key);
+      if (r.unpriced) td.appendChild(el("span", "tag-unpriced", UNPRICED));
+      tr.appendChild(td);
+      [r.input, r.output, r.cache_write, r.cache_write_1h, r.cache_read]
+        .forEach(function (v) {
+          tr.appendChild(el("td", "n", v === null ? "n/a" : fmtTok(v)));
+        });
+      tr.appendChild(el("td", "n", r.unpriced ? UNPRICED : fmtUsd(r.usd)));
+      var per = (r.unpriced || r.usd === null || !r.output)
+        ? UNPRICED : fmtUsd((r.usd / r.output) * 1000);
+      tr.appendChild(el("td", "n", r.unpriced ? UNPRICED : per));
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    byId("cost-table").appendChild(tbl);
+  }
+
+  // one shared routine for the two single-measure bar charts (tier, role)
+  function drawUsdBars(host, bars, colorFor) {
+    var rows = bars.filter(function (b) { return num(b.usd) !== null; });
+    if (!rows.length) { noData(host, "n/a — no priced spend to break down."); return; }
+    var w = 660, m = { t: 10, r: 84, b: 10, l: 108 };
+    var barH = 18, rowGap = 10;
+    var h = m.t + m.b + rows.length * (barH + rowGap) - rowGap;
+    var pw = w - m.l - m.r;
+    host.setAttribute("viewBox", "0 0 " + w + " " + h);
+    host.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    var max = rows.reduce(function (a, b) { return Math.max(a, b.usd); }, 0) || 1;
+    var y = m.t;
+    rows.forEach(function (b) {
+      var lab = svg("text", { x: m.l - 10, y: y + 13, "text-anchor": "end",
+        "font-size": 11.5, "font-family": "var(--font-mono)", fill: "var(--ink)" });
+      lab.textContent = b.name;
+      host.appendChild(lab);
+      var bw = Math.max(0.8, (b.usd / max) * pw);
+      var rect = svg("rect", { x: m.l, y: y, width: bw, height: barH,
+        fill: colorFor(b) });
+      var ttl = svg("title");
+      ttl.textContent = b.name + " · " + fmtUsd(b.usd);
+      rect.appendChild(ttl);
+      host.appendChild(rect);
+      var val = svg("text", { x: Math.min(m.l + bw + 8, w - 4), y: y + 13,
+        "font-size": 11.5, "font-family": "var(--font-mono)", fill: "var(--ink)" });
+      val.textContent = fmtUsd(b.usd);
+      host.appendChild(val);
+      y += barH + rowGap;
+    });
+  }
+
+  function drawCostTiers() {
+    var tiers = costMap("by_tier");
+    var legend = byId("cost-tier-legend");
+    [["Executive tier", "var(--fable)"], ["Worker tier", "var(--opus)"]]
+      .forEach(function (pair) {
+        var k = el("span", "key");
+        var sw = el("span", "swatch");
+        sw.style.background = pair[1];
+        k.appendChild(sw);
+        k.appendChild(el("span", null, pair[0]));
+        legend.appendChild(k);
+      });
+    drawUsdBars(byId("cost-tier-chart"), [
+      { name: "executive", usd: num(tiers.executive), color: "var(--fable)" },
+      { name: "worker", usd: num(tiers.worker), color: "var(--opus)" }
+    ], function (b) { return b.color; });
+  }
+
+  function drawCostRoles() {
+    var roles = costMap("by_role");
+    var keys = ROLE_ORDER.filter(function (r) { return roles[r] !== undefined; });
+    Object.keys(roles).forEach(function (r) { if (keys.indexOf(r) < 0) keys.push(r); });
+    var bars = keys.map(function (r) { return { name: r, usd: num(roles[r]) }; })
+      .filter(function (b) { return b.usd !== null && b.usd > 0; })
+      .sort(function (a, b) { return b.usd - a.usd; });
+    // one measure, so one hue: the bars differ in length, not in identity
+    drawUsdBars(byId("cost-role-chart"), bars, function () { return "var(--cat-4)"; });
+  }
+
+  function drawCostSinks() {
+    var rows = (C && Array.isArray(C.top_sinks)) ? C.top_sinks : [];
+    var host = byId("cost-sinks-table");
+    if (!rows.length) {
+      byId("cost-sinks-wrap").hidden = true;
+      return;
+    }
+    var tbl = el("table");
+    tbl.appendChild(el("caption", null,
+      "The costliest sessions and Workflow lanes in the window, at list prices."));
+    var thead = el("thead"), hr = el("tr");
+    [["#", "n"], ["Source", null], ["Lane", null], ["Model", null],
+     ["USD", "n"], ["Output M", "n"], ["Cache read M", "n"]]
+      .forEach(function (c) { hr.appendChild(el("th", c[1], c[0])); });
+    thead.appendChild(hr); tbl.appendChild(thead);
+    var tb = el("tbody");
+    rows.forEach(function (r, i) {
+      if (!r || typeof r !== "object") return;
+      var usd = num(r.usd);
+      var tr = el("tr");
+      if (usd === null) tr.className = "is-unpriced";
+      tr.appendChild(el("td", "n", String(i + 1)));
+      tr.appendChild(el("td", null, txt(r.source)));
+      var lane = el("td", "id", txt(r.id_or_label));
+      lane.title = txt(r.what);
+      tr.appendChild(lane);
+      tr.appendChild(el("td", "id", txt(r.model)));
+      tr.appendChild(el("td", "n", usd === null ? UNPRICED : fmtUsd(usd)));
+      tr.appendChild(el("td", "n", fmtTok(r.tokens_out)));
+      tr.appendChild(el("td", "n", fmtTok(r.cache_read)));
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    host.appendChild(tbl);
+  }
+
+  function normCostHours() {
+    var arr = (C && Array.isArray(C.per_hour)) ? C.per_hour : [];
+    var hourSet = {}, byModel = {};
+    arr.forEach(function (p) {
+      if (!p || typeof p !== "object") return;
+      var hour = pick(p, ["hour", "t", "time", "timestamp"]);
+      if (!hour) return;
+      hourSet[String(hour)] = 1;
+      var per = p.usd_by_model;
+      if (!per || typeof per !== "object") return;
+      Object.keys(per).forEach(function (model) {
+        var v = num(per[model]);
+        if (v === null) return;
+        if (!byModel[model]) byModel[model] = {};
+        byModel[model][String(hour)] = (byModel[model][String(hour)] || 0) + v;
+      });
+    });
+    return { hours: Object.keys(hourSet).sort(), byModel: byModel };
+  }
+
+  function drawCostHourly() {
+    var H = normCostHours();
+    var host = byId("cost-hourly-chart");
+    var legend = byId("cost-hourly-legend");
+    var models = Object.keys(H.byModel).sort(function (a, b) {
+      var d = modelOrder(a) - modelOrder(b);
+      return d !== 0 ? d : a.localeCompare(b);
+    });
+    models.forEach(function (mo) {
+      var k = el("span", "key");
+      var sw = el("span", "swatch");
+      sw.style.background = modelColor(mo);
+      k.appendChild(sw);
+      k.appendChild(el("span", null, mo));
+      legend.appendChild(k);
+    });
+    if (!H.hours.length || !models.length) {
+      noData(host, "n/a — no priced hours in the source file.");
+      byId("cost-hourly-table-wrap").hidden = true;
+      return;
+    }
+
+    var w = 1060, h = 300, m = { t: 22, r: 12, b: 46, l: 64 };
+    var pw = w - m.l - m.r, ph = h - m.t - m.b;
+    host.setAttribute("viewBox", "0 0 " + w + " " + h);
+    host.setAttribute("preserveAspectRatio", "xMidYMid meet");
+
+    var totals = H.hours.map(function (hr) {
+      return models.reduce(function (a, mo) { return a + (H.byModel[mo][hr] || 0); }, 0);
+    });
+    var maxTotal = Math.max.apply(null, totals.concat([0]));
+    var top = niceMax(maxTotal);
+    var peakIdx = totals.indexOf(maxTotal);
+    function Y(v) { return m.t + (1 - v / top) * ph; }
+
+    for (var i = 0; i <= 4; i++) {
+      var v = (top * i) / 4;
+      host.appendChild(svg("line", { x1: m.l, x2: m.l + pw, y1: Y(v), y2: Y(v),
+        stroke: "var(--rule)", "stroke-width": 1, "shape-rendering": "crispEdges" }));
+      var t = svg("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end",
+        fill: "var(--muted)", "font-size": 11, "font-family": "var(--font-mono)" });
+      t.textContent = fmtUsdTight(v);
+      host.appendChild(t);
+    }
+    var yl = svg("text", { x: 0, y: m.t - 8, fill: "var(--muted)", "font-size": 10.5,
+      "font-family": "var(--font-mono)", "letter-spacing": "0.08em" });
+    yl.textContent = "USD PER HOUR";
+    host.appendChild(yl);
+
+    var band = pw / H.hours.length;
+    var barW = Math.min(26, band * 0.62);
+    H.hours.forEach(function (hr, hi) {
+      var cx = m.l + band * (hi + 0.5);
+      var x = cx - barW / 2;
+      var segs = models.map(function (mo) { return { model: mo, v: H.byModel[mo][hr] || 0 }; })
+        .filter(function (s) { return s.v > 0; });
+      var running = 0, stackTop = null;
+      segs.forEach(function (s, si) {
+        var y0 = Y(running + s.v), y1 = Y(running);
+        var isTop = si === segs.length - 1;
+        var gap = isTop ? 0 : 2;
+        var drawH = Math.max(0.8, (y1 - y0) - gap);
+        var node = isTop
+          ? svg("path", { d: topRoundRect(x, y0, barW, drawH, 4), fill: modelColor(s.model) })
+          : svg("rect", { x: x, y: y0 + gap, width: barW, height: drawH, fill: modelColor(s.model) });
+        var ttl = svg("title");
+        ttl.textContent = hourLabel(hr) + " UTC · " + s.model + " · " + fmtUsd(s.v);
+        node.appendChild(ttl);
+        host.appendChild(node);
+        running += s.v;
+        stackTop = y0;
+      });
+      if (hi === peakIdx && stackTop !== null) {
+        var pl = svg("text", { x: cx, y: stackTop - 8, "text-anchor": "middle",
+          fill: "var(--ink)", "font-size": 11.5, "font-family": "var(--font-mono)",
+          "font-weight": 500 });
+        pl.textContent = fmtUsd(totals[hi]);
+        host.appendChild(pl);
+      }
+      var xt = svg("text", { x: cx, y: m.t + ph + 18, "text-anchor": "middle",
+        fill: "var(--muted)", "font-size": 11, "font-family": "var(--font-mono)" });
+      xt.textContent = hourLabel(hr);
+      host.appendChild(xt);
+      if (hi === 0 || dayLabel(hr) !== dayLabel(H.hours[hi - 1])) {
+        var dt = svg("text", { x: cx, y: m.t + ph + 33, "text-anchor": "middle",
+          fill: "var(--muted)", "font-size": 10, "font-family": "var(--font-mono)" });
+        dt.textContent = dayLabel(hr);
+        host.appendChild(dt);
+      }
+    });
+
+    var tbl = el("table");
+    tbl.appendChild(el("caption", null, "USD per UTC hour, by model."));
+    var thead = el("thead"), hr2 = el("tr");
+    hr2.appendChild(el("th", null, "Hour (UTC)"));
+    models.forEach(function (mo) { hr2.appendChild(el("th", "n", mo)); });
+    hr2.appendChild(el("th", "n", "Total"));
+    thead.appendChild(hr2); tbl.appendChild(thead);
+    var tb = el("tbody");
+    H.hours.forEach(function (hrk, hi) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "id", stamp(hrk)));
+      models.forEach(function (mo) {
+        var v = H.byModel[mo][hrk];
+        tr.appendChild(el("td", "n", v === undefined ? "—" : fmtUsd(v)));
+      });
+      tr.appendChild(el("td", "n", fmtUsd(totals[hi])));
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    byId("cost-hourly-table").appendChild(tbl);
+  }
+
+  function drawCostMilestones() {
+    var rows = (C && Array.isArray(C.per_milestone)) ? C.per_milestone : [];
+    var host = byId("cost-milestone-table");
+    if (!rows.length) {
+      host.appendChild(el("p", "caption",
+        "n/a — no commits in the window, or the tracked repo could not be read."));
+      return;
+    }
+    var tbl = el("table");
+    var thead = el("thead"), hr = el("tr");
+    [["Commit", null], ["Subject", null], ["USD", "n"], ["Minutes", "n"]]
+      .forEach(function (c) { hr.appendChild(el("th", c[1], c[0])); });
+    thead.appendChild(hr); tbl.appendChild(thead);
+    var tb = el("tbody");
+    var total = 0;
+    rows.forEach(function (r) {
+      if (!r || typeof r !== "object") return;
+      var usd = num(r.usd);
+      if (usd !== null) total += usd;
+      var tr = el("tr");
+      tr.appendChild(el("td", "id", txt(r.commit)));
+      tr.appendChild(el("td", "what", txt(r.subject)));
+      tr.appendChild(el("td", "n", usd === null ? UNPRICED : fmtUsd(usd)));
+      var mins = num(r.minutes);
+      tr.appendChild(el("td", "n", mins === null ? "n/a" : mins.toFixed(1)));
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    tbl.appendChild(el("caption", null,
+      rows.length + " commit(s), " + fmtUsd(total) + " attributed to a milestone."));
+    host.appendChild(tbl);
+  }
+
+  function drawPricingUsed() {
+    var used = costMap("pricing_used");
+    var host = byId("pricing-used");
+    var models = Object.keys(used);
+    if (!models.length) {
+      host.appendChild(el("p", "caption", "n/a — no pricing table in the source file."));
+      return;
+    }
+    models.forEach(function (model) {
+      var row = used[model] || {};
+      var line = el("div", "price-row");
+      line.appendChild(el("span", "price-model", model));
+      var nums = el("span", "price-nums");
+      if (row.unpriced === true) {
+        nums.appendChild(el("span", "tag-unpriced", UNPRICED));
+      } else {
+        nums.textContent = fmtUsd(row.input) + " in / " + fmtUsd(row.output)
+          + " out / " + fmtUsd(row.cache_write) + " cache wr 5m / "
+          + fmtUsd(row.cache_write_1h) + " cache wr 1h / "
+          + fmtUsd(row.cache_read) + " cache rd, per 1M tokens";
+      }
+      line.appendChild(nums);
+      var src = el("span", "price-src");
+      var where = row.source ? String(row.source) : "no source recorded";
+      if (/^https?:\/\//.test(where)) {
+        var a = el("a", null, where);
+        a.href = where;
+        a.rel = "noreferrer";
+        src.appendChild(a);
+      } else {
+        src.appendChild(document.createTextNode(where));
+      }
+      if (row.checked) src.appendChild(document.createTextNode(" · checked " + row.checked));
+      line.appendChild(src);
+      host.appendChild(line);
+    });
+  }
+
+  function drawCost() {
+    var rows = costRows();
+    drawCostHeadline(rows);
+    drawCostModels(rows);
+    drawCostTiers();
+    drawCostRoles();
+    drawCostSinks();
+    drawCostHourly();
+    drawCostMilestones();
+    drawPricingUsed();
+  }
 
   /* ------------------------------------------------- chart 1: utilization */
 
@@ -1255,6 +1943,7 @@ const DATA = __DATA__;
     });
   }
 
+  try { drawCost(); } catch (e) { console.error("cost section", e); }
   try { drawUtil(); } catch (e) { console.error("util chart", e); }
   try { drawTiers(); } catch (e) { console.error("tier chart", e); try { drawTotals(); } catch (e2) {} }
   try { drawLedger(); } catch (e) { console.error("ledger", e); }

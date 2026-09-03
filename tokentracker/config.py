@@ -57,6 +57,12 @@ class Config:
     # graph.apply_graph; see tokentracker/graph.py.
     graph: dict[str, Any] = field(default_factory=dict)
     known_models: list[str] = field(default_factory=list)
+    # Published list prices per model, USD per 1M tokens, each row carrying the
+    # source and the date it was read (tokentracker/pricing.py). A model that is
+    # missing here is reported as "unpriced"; nothing is ever guessed.
+    pricing: dict[str, Any] = field(default_factory=dict)
+    # The row to bill a model the table does not name. Null on purpose.
+    pricing_default: dict[str, Any] | None = None
     # Work-distribution report (tokentracker/ledger.py).
     report_repo: str = "C:/Users/chenw/StarGTA"
     report_on_milestone: bool = True
@@ -124,6 +130,11 @@ class Config:
     def graph_file(self) -> Path:
         """Per-user agentic-graph override; wins over config.json like goal.json."""
         return self.state_dir / "graph.json"
+
+    @property
+    def pricing_file(self) -> Path:
+        """Per-user price override; wins over config.json like goal/graph.json."""
+        return self.state_dir / "pricing.json"
 
     @property
     def report_file(self) -> Path:
