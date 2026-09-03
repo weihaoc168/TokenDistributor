@@ -935,13 +935,13 @@ def test_status_prints_report_line():
         usage.fetch_usage = real_fetch
 
 
-def test_repo_config_arms_the_fork_on_opus_5():
+def test_repo_config_arms_the_fork_on_the_executive_model():
     # The shipped config.json is what actually revives the handover.
     from tokentracker import cli, handover
     from tokentracker.config import load_config
     cfg = load_config(ROOT)
     assert cfg.throttle_fork_enabled and cfg.fork_in_pace
-    assert cfg.throttle_model == "claude-opus-5", cfg.throttle_model
+    assert cfg.throttle_model == "claude-fable-5-1", cfg.throttle_model  # user directive: executive tier is Fable 5.1
     assert cfg.fork_cooldown_seconds == 120
     assert cfg.main_session_ids[0].startswith("329cb798"), cfg.main_session_ids
     prompt = cfg.throttle_prompt
@@ -2155,7 +2155,7 @@ def test_repo_config_ships_the_graph():
     from tokentracker.config import load_config
     cfg = load_config(ROOT)
     g = G.read_graph(cfg)
-    assert g[G.EXECUTIVE]["model"] == "claude-opus-5", g
+    assert g[G.EXECUTIVE]["model"] == "claude-fable-5-1", g  # user directive 2026-09-03
     assert g[G.ADVISORY]["count"] == 3 and g[G.WORKERS]["count"] == 10, g
     assert g[G.WORKERS]["surge_count"] == 20, g
     assert G.validate_graph(g, G.known_models(cfg)) == []
