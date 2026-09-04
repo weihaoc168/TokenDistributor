@@ -6670,6 +6670,264 @@ def test_alloc_ladder_holds_a_rung_for_the_dwell():
     assert _alloc_poll(loose, ahead, NOW).step == 2
 
 
+def test_alloc_warmup_holds_the_ladder_in_a_fresh_window():
+    """Fifty minutes of a busy morning cannot price a seven-day window.
+
+    The live failure of 2026-09-04 07:51 CT: 51 minutes after the weekly and
+    Fable windows reset, 3% used, a rate of 3.92%/h measured across those
+    minutes, 167 hours of extrapolation and therefore 657% "expected at
+    reset" - and the ladder pinned at rung 5 of 5, throttling hardest exactly
+    when the budget was freshest. The arithmetic was right; the conclusion was
+    not, because the measurement was fifty minutes old.
+    """
+    from tokentracker import allocator as A
+    from tokentracker import graph as G
+
+    # Fifty minutes into a fresh week: the reset is 167.17h out, so the window
+    # (168h long) opened 50 minutes ago.
+    cfg = _alloc_cfg(advisory=3)
+    fresh = [(50, 0.00, 0.00, 0.02), (0, 0.03, 0.02, 0.05)]
+    _alloc_history(cfg, fresh, NOW, reset_h=167.17)
+    fable = A.read_buckets(cfg, None, NOW)[A.FABLE]
+    assert abs(fable.elapsed_hours - 50.0 / 60.0) < 0.01, fable.elapsed_hours
+    assert abs(fable.window_hours - 168.0) < 1e-6, fable.window_hours
+    assert fable.fresh is True, fable
+    # The reading itself is unchanged: the pace still says "ahead", and
+    # `pace_state` still reports it. The gate is in `evaluate`.
+    assert fable.rate > 0.03, fable.rate
+    assert fable.pace_state(A.AHEAD_STEP, A.BEHIND_STEP) == "ahead", fable
+
+    # Two consecutive polls ahead of pace would have cost a rung. They do not.
+    A.evaluate(cfg, None, NOW)
+    held = _alloc_poll(cfg, fresh, NOW + timedelta(minutes=5), reset_h=167.17)
+    assert held.step == 0, held.step
+    assert held.graph[G.ADVISORY]["count"] == 3, held.graph
+    # ... and the reason says so plainly, naming the window's age in minutes.
+    warm = [r for r in held.reasons if "warm-up" in r]
+    assert warm, held.reasons
+    assert "50m old" in warm[0] and "fable window is only" in warm[0], warm
+    assert held.top_reason() == warm[0], held.reasons
+    # The agreement is kept armed, exactly as it is under the dwell, so nothing
+    # is thrown away by waiting.
+    assert A.read_decision(cfg)["up_polls"] == A.UP_POLLS
+
+    # Three hours in, the same shape of reading may climb: the window has run
+    # long enough for its own rate to mean something.
+    older = _alloc_cfg(advisory=3)
+    warmed = [(180, 0.00, 0.00, 0.02), (0, 0.12, 0.02, 0.05)]
+    _alloc_history(older, warmed, NOW, reset_h=165.0)
+    bucket = A.read_buckets(older, None, NOW)[A.FABLE]
+    assert abs(bucket.elapsed_hours - 3.0) < 0.01, bucket.elapsed_hours
+    assert bucket.fresh is False, bucket
+    A.evaluate(older, None, NOW)
+    climbed = _alloc_poll(older, warmed, NOW + timedelta(minutes=5),
+                          reset_h=165.0)
+    assert climbed.step == 1, climbed.step
+    assert climbed.graph[G.ADVISORY]["count"] == 2, climbed.graph
+
+    # A warm-up of zero is the old behaviour, for anyone who wants it back.
+    off = _alloc_cfg(advisory=3)
+    off.allocation = {"warmup_hours": 0}
+    _alloc_history(off, fresh, NOW, reset_h=167.17)
+    A.evaluate(off, None, NOW)
+    assert _alloc_poll(off, fresh, NOW + timedelta(minutes=5),
+                       reset_h=167.17).step == 1
+
+
+def test_alloc_warmup_holds_the_worker_lanes_off_the_floor():
+    """The other half of 07:51: the lanes were at their floor of 2 as well.
+
+    The rung and the lane count are two throttles reading the same too-young
+    rate, so the window-age rule has to cover both. Inside the warm-up the
+    lanes may still RISE - giving budget back is never the failure - but a cut
+    priced off fifty minutes of a fresh week is held, and the count the
+    previous window ended throttled to is handed back.
+    """
+    from tokentracker import allocator as A
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg(workers=10, surge=20)
+    workers = {"count": 10, "surge_count": 20}
+
+    def weekly(elapsed_h, rate, util=0.04, hours=166.7):
+        """The live shape: 4% used, ~3%/h measured, a week of budget left."""
+        return A.Bucket(name=A.WEEKLY, utilization=util, hours_to_reset=hours,
+                        goal=1.0, stop=1.0, rate_long=rate, span_hours=elapsed_h,
+                        window_hours=168.0, elapsed_hours=elapsed_h,
+                        warmup_hours=2.0)
+
+    young = weekly(1.35, 0.0315)
+    assert young.fresh is True and abs(young.age_minutes - 81.0) < 0.1
+    # Standing at the floor of 2 the raw controller wants 1, i.e. the floor
+    # again - the exact number the live loop was pinned to this morning.
+    unheld = A.Bucket(name=A.WEEKLY, utilization=0.04, hours_to_reset=166.7,
+                      goal=1.0, stop=1.0, rate_long=0.0315, span_hours=1.35)
+    assert A.worker_target(cfg, unheld, None, workers, running=2)[0] == 2
+    # Inside the warm-up it goes back to the configured count instead, and the
+    # reason names the window's age rather than calling it an auto surge.
+    lanes, why = A.worker_target(cfg, young, None, workers, running=2)
+    assert lanes == 10, (lanes, why)
+    assert why and "the weekly window is only 81m old" in why, why
+    assert "warm-up 120m" in why and "workers 2->10" in why, why
+    assert "auto surge" not in why, why
+
+    # A standing surge is not cut back to the configured count either: the rule
+    # is that the lanes may rise inside the warm-up, never that they must.
+    assert A.worker_target(cfg, young, None, workers, running=16)[0] == 16
+    # ... and a genuine raise inside the warm-up still reads as a surge.
+    behind = weekly(1.35, 0.001, util=0.20)
+    lanes, why = A.worker_target(cfg, behind, None, workers, running=10)
+    assert lanes == 20 and "auto surge" in why, (lanes, why)
+
+    # The five-hour guard is the hard brake and still wins over the hold.
+    guard = A.Bucket(name=A.FIVE_HOUR, utilization=0.90, hours_to_reset=1.0,
+                     goal=0.95, stop=0.95, rate_long=0.10, span_hours=1.0)
+    assert A.worker_target(cfg, young, guard, workers, running=2)[0] == 2
+
+    # Past the warm-up the measurement is trusted again and the cut lands.
+    old = weekly(6.0, 0.0315)
+    assert old.fresh is False
+    lanes, why = A.worker_target(cfg, old, None, workers, running=2)
+    assert lanes == A.min_workers(cfg), (lanes, why)
+
+    # End to end, on the shape the live loop woke up in: rung 0 by the warm-up
+    # AND the lanes off the floor, in one poll.
+    live = _alloc_cfg(workers=10, surge=20, advisory=3)
+    A.write_state(live, A._build(live, G.read_graph(live), 5, 2, False), {},
+                  {"up_polls": 2, "down_polls": 0}, NOW)
+    assert A.read_decision(live)["worker_count"] == 2
+    _alloc_history(live, [(81, 0.00, 0.00, 0.02), (0, 0.04, 0.04, 0.17)],
+                   NOW, reset_h=166.7)
+    woken = A.evaluate(live, None, NOW)
+    assert woken.step == 0, woken.step
+    assert woken.worker_count == 10, woken.worker_count
+    assert any("too early to read the window's pace to hold lanes down" in r
+               for r in woken.reasons), woken.reasons
+
+
+def test_alloc_reset_drops_the_ladder_to_rung_zero():
+    """A new window starts on a clean slate, not on the last one's rung."""
+    from tokentracker import allocator as A
+    from tokentracker import graph as G
+
+    cfg = _alloc_cfg(advisory=3)
+    history = usage.UsageHistory(cfg)
+    opened = NOW - timedelta(hours=158)          # the OLD window's opening
+    rolls_at = opened + timedelta(hours=168)     # ... and its reset, 10h out
+
+    def write(stamp, util, resets_at, weekly, weekly_reset):
+        history.append(UsageSnapshot(
+            fetched_at=stamp,
+            five_hour=WindowUsage(0.20, stamp + timedelta(hours=2)),
+            seven_day=WindowUsage(weekly, weekly_reset),
+            extra={"fable": WindowUsage(util, resets_at)}))
+
+    # Late in a spent window, well ahead of pace: the ladder climbs.
+    write(NOW - timedelta(hours=6), 0.70, rolls_at, 0.70, rolls_at)
+    write(NOW, 0.85, rolls_at, 0.85, rolls_at)
+    A.evaluate(cfg, None, NOW)
+    climbed = A.evaluate(cfg, None, NOW + timedelta(minutes=5))
+    assert climbed.step == 1, climbed.step
+    assert A.read_decision(cfg)["window_starts"][A.FABLE] == opened
+
+    # 11 hours later both windows have rolled: the reported reset has moved a
+    # week forward and the utilization is back to nothing.
+    after = rolls_at + timedelta(minutes=51)
+    next_reset = rolls_at + timedelta(hours=168)
+    write(rolls_at + timedelta(minutes=1), 0.00, next_reset, 0.00, next_reset)
+    write(after, 0.03, next_reset, 0.02, next_reset)
+    dropped = A.evaluate(cfg, None, after)
+
+    assert dropped.step == 0, dropped.step
+    assert dropped.graph[G.ADVISORY]["count"] == 3, dropped.graph
+    standing = A.read_decision(cfg)
+    assert (standing["step"], standing["up_polls"], standing["down_polls"]) \
+        == (0, 0, 0), standing
+    assert standing["window_starts"][A.FABLE] == rolls_at, standing
+    # The reason names the bucket and the reset, on the operator's clock.
+    reset = [r for r in dropped.reasons if "window reset at" in r]
+    assert reset, dropped.reasons
+    assert reset[0].startswith("fable window reset at "), reset
+    assert A.reset_label(rolls_at, cfg) in reset[0], (reset, rolls_at)
+    assert "rung 0 from 1" in reset[0], reset
+    # The window that has NOT rolled is not reported as one that has.
+    assert not any("5h window reset" in r for r in dropped.reasons), dropped.reasons
+
+    # And the very next poll does not climb straight back out of the reset:
+    # the new window is minutes old, so the warm-up holds it at 0.
+    again = A.evaluate(cfg, None, after + timedelta(minutes=5))
+    assert again.step == 0, again.step
+
+    # The rollover no poll was there to see - a restart, a fetch gap, or the
+    # upgrade that added this rule - is caught by the rung itself: a rung can
+    # no longer be EARNED inside the warm-up, so one standing there was
+    # inherited from the window before it.
+    stale = _alloc_cfg(advisory=3)
+    A.write_state(stale, A._build(stale, G.read_graph(stale), 5, 2, False), {},
+                  {"up_polls": 2, "down_polls": 0}, NOW)
+    assert A.read_decision(stale)["step"] == 5
+    _alloc_history(stale, [(50, 0.00, 0.00, 0.02), (0, 0.03, 0.02, 0.05)],
+                   NOW, reset_h=167.17)
+    cleared = A.evaluate(stale, None, NOW)
+    assert cleared.step == 0, cleared.step
+    assert cleared.graph[G.ADVISORY]["count"] == 3, cleared.graph
+    assert any("was inherited from the window before it" in r
+               for r in cleared.reasons), cleared.reasons
+    assert any("50m old" in r for r in cleared.reasons), cleared.reasons
+    assert A.read_decision(stale)["up_polls"] == 0
+
+
+def test_alloc_horizon_caps_the_forecast_not_the_required_pace():
+    """One busy hour is not extrapolated across a week; the target is untouched."""
+    from tokentracker import allocator as A
+
+    def bucket(horizon):
+        return A.Bucket(name=A.FABLE, utilization=0.03, hours_to_reset=167.0,
+                        goal=0.90, stop=A.FABLE_STOP, rate_long=0.0392,
+                        span_hours=0.85, max_horizon_hours=horizon)
+
+    capped, uncapped = bucket(48.0), bucket(None)
+    # 3% + 3.92%/h x 167h = 657%, the number that pinned the ladder at rung 5.
+    assert abs(uncapped.expected_at_reset - 6.5764) < 1e-4, uncapped.expected_at_reset
+    assert abs(capped.expected_at_reset - 1.9116) < 1e-4, capped.expected_at_reset
+    assert capped.horizon_hours == 48.0 and capped.capped is True
+    assert uncapped.horizon_hours == 167.0 and uncapped.capped is False
+    # The pace it has to hold still divides by the REAL time to reset, so the
+    # long-run target - and the band the ladder is gated on - is unchanged.
+    assert capped.required == uncapped.required, capped.required
+    assert abs(capped.required - (0.90 - 0.03) / 167.0) < 1e-12
+    assert capped.tolerance(A.AHEAD_STEP) == uncapped.tolerance(A.AHEAD_STEP)
+    assert (capped.pace_state(A.AHEAD_STEP, A.BEHIND_STEP)
+            == uncapped.pace_state(A.AHEAD_STEP, A.BEHIND_STEP) == "ahead")
+    # The phrase that heads every reason names the horizon it was carried to.
+    assert "over the next 48h" in A.pace_phrase(capped), A.pace_phrase(capped)
+    assert "at reset" in A.pace_phrase(uncapped), A.pace_phrase(uncapped)
+
+    # Off the real config: the default is 48h, and it reaches read_buckets.
+    cfg = _alloc_cfg()
+    fresh = [(50, 0.00, 0.00, 0.02), (0, 0.03, 0.02, 0.05)]
+    _alloc_history(cfg, fresh, NOW, reset_h=167.0)
+    row = A.read_buckets(cfg, None, NOW)[A.FABLE]
+    assert row.horizon_hours == A.MAX_HORIZON_HOURS, row.horizon_hours
+    assert abs(row.required - (0.90 - 0.03) / 167.0) < 1e-6, row.required
+    assert row.expected_at_reset < 2.5, row.expected_at_reset
+    # A horizon of zero is "no cap", which is what the file used to do.
+    cfg.allocation = {"max_horizon_hours": 0}
+    wide = A.read_buckets(cfg, None, NOW)[A.FABLE]
+    assert wide.horizon_hours == wide.hours_to_reset, wide.horizon_hours
+    assert wide.expected_at_reset > 6.0, wide.expected_at_reset
+
+    # The printed table states the horizon it used, and the window's age.
+    cfg.allocation = {}
+    allocation = A.evaluate(cfg, None, NOW)
+    printed = A.format_buckets(allocation, cfg)
+    horizon_line = [l for l in printed if "max_horizon_hours" in l]
+    assert horizon_line, printed
+    assert "48h" in horizon_line[0] and "fable 167h" in horizon_line[0], printed
+    assert "need/h still targets the real reset" in horizon_line[0], printed
+    assert any("window age:" in l and "(warm-up)" in l for l in printed), printed
+
+
 def test_alloc_replaying_the_real_history_does_not_oscillate():
     """The recorded shape that walked the ladder 35 times in a day now holds.
 

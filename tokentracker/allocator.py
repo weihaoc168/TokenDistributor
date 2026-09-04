@@ -36,6 +36,24 @@ hours_elapsed`) shrinks as the window runs instead of staying pinned at one
 percent per hour. The trailing 60m/3h slopes are still measured, and still
 written to state/allocation.json, but only for display.
 
+A rate also has an AGE, and three rules follow from it. Each bucket derives its
+window's start (`resets_at` minus the window's own length, learned from the
+previous reset stamp in history and falling back to the nominal period), and:
+
+    warm-up   below `allocation.warmup_hours` the ladder may give a rung back
+              but may not climb, and the lanes may rise but not be cut. Fifty
+              minutes of a busy morning cannot tell you the pace of a seven-day
+              window, and throttling hardest when the budget is freshest is
+              exactly backwards (2026-09-04 07:51 CT: 3% used, 3.92%/h
+              measured, 657% "expected at reset", rung 5 of 5, lanes at 2)
+    reset      when a window start moves, the new window starts from a clean
+               slate - rung 0, counters cleared - rather than inheriting the
+               rung the previous window ended on
+    horizon    `allocation.max_horizon_hours` caps how far a rate is
+               extrapolated, so one busy hour is not carried across a week.
+               `required` still targets the REAL reset, so the long-run pace
+               the ladder is gated on is unchanged
+
 The FABLE bucket drives a six-rung ladder that protects the executive and gives
 up the cheaper things first (`_build`); the WEEKLY bucket drives the worker lane
 count between `allocation.min_workers` and the graph's own `surge_count`
@@ -144,6 +162,18 @@ MAX_FORK_COOLDOWN_SECONDS = 1800.0
 # counts polls, and a signal saturated in one direction for ten polls running
 # walks the whole ladder in minutes; the dwell is what bounds that in time.
 MIN_DWELL_SECONDS = 1800.0
+# How long a window must have run before its rate may cost a rung. The rate is
+# anchored at the window's opening, so early in a window the whole estimate is
+# whatever the last few minutes did: at 07:51 CT on 2026-09-04, 51 minutes into
+# a fresh week, one screenshot render and one director run read as 3.92%/h and
+# forecast 657% at reset. Below this the ladder may still give rungs BACK -
+# holding a throttle nobody can justify is the failure being fixed.
+WARMUP_HOURS = 2.0
+# The furthest ahead a measured rate is carried. `expected_at_reset` is a rate
+# multiplied by hours, and 167 of them turn a busy hour into a forecast that
+# says nothing about the week. The pace the bucket is REQUIRED to hold still
+# divides by the real time to reset, so the target itself is untouched.
+MAX_HORIZON_HOURS = 48.0
 # The dataclass default for `fork_cooldown_seconds`, repeated rather than
 # imported from `cli` (which pulls in the dispatcher, and this module is
 # reached from `load_config`).
@@ -155,6 +185,8 @@ ALLOC_DEFAULTS: dict[str, float] = {
     "min_workers": float(MIN_WORKERS),
     "max_fork_cooldown_seconds": MAX_FORK_COOLDOWN_SECONDS,
     "min_dwell_seconds": MIN_DWELL_SECONDS,
+    "warmup_hours": WARMUP_HOURS,
+    "max_horizon_hours": MAX_HORIZON_HOURS,
 }
 # Hysteresis: a rung costs two polls of agreement to climb and three to give
 # back, so one noisy reading never oscillates the graph.
@@ -173,6 +205,23 @@ MIN_SPAN_MINUTES = 5.0
 UTIL_QUANTUM = 0.01
 # A drop this big between two readings is a window rollover, not negative burn.
 RESET_DROP = 0.05
+# A window length derived from two reset stamps is believed only this near the
+# bucket's nominal period. The endpoint's reset time is fixed inside a window
+# but nothing promises it: a replayed clock, a rolling session window or a
+# single edited line can put two stamps minutes apart, and a length of minutes
+# would make every poll look like the first minute of a fresh window.
+WINDOW_LEN_MIN_FACTOR = 0.5
+WINDOW_LEN_MAX_FACTOR = 2.0
+# What counts as a window having ROLLED rather than drifted. A real rollover
+# moves the start by a whole window; jitter in the reported reset time (and a
+# test clock that walks forward under a fixed offset) moves it by minutes, and
+# clearing the ladder on that would be its own oscillator.
+RESET_SHIFT_FRACTION = 0.25
+RESET_SHIFT_MIN_HOURS = 0.5
+# The buckets whose rollover clears the ladder: the one that drives the rungs
+# and the one that drives the lanes. The five-hour guard rolls several times a
+# day and moves no rung, so it is not one of them.
+RESET_WATCH = (FABLE, WEEKLY)
 # Below this the rate says nothing: hold the configured graph rather than
 # forecasting the whole week off rounding noise.
 MIN_RATE = 0.0005
@@ -226,6 +275,20 @@ def min_dwell(cfg: Any) -> float:
     return max(0.0, alloc_setting(cfg, "min_dwell_seconds"))
 
 
+def warmup_hours(cfg: Any) -> float:
+    """Hours a window must have run before its rate may cost a rung.
+
+    Zero turns the hold off, which is the pre-2026-09-04 behaviour and is left
+    reachable for anyone who wants it back.
+    """
+    return max(0.0, alloc_setting(cfg, "warmup_hours"))
+
+
+def max_horizon(cfg: Any) -> float:
+    """Hours a measured rate may be extrapolated across. Zero = no cap."""
+    return max(0.0, alloc_setting(cfg, "max_horizon_hours"))
+
+
 def throttle_active(cfg: Config) -> bool:
     """The FULL THROTTLE manual override, read straight off state/throttle.json."""
     try:
@@ -269,6 +332,21 @@ def reset_label(when: Any, cfg: Any = None) -> str:
     return fmt_local(moment, "%a %H:%M", cfg, fallback="?")
 
 
+def _zone(cfg: Any = None) -> str:
+    """" CT", the zone label to hang off a rendered time. "" if unknown.
+
+    A reset time on a line that is also read next to ISO UTC state files has to
+    say which clock it is on; nothing here may raise to say it.
+    """
+    try:
+        from .clock import label
+
+        text = str(label(cfg)).strip()
+    except Exception:  # pragma: no cover - a label is never worth a tick
+        return ""
+    return f" {text}" if text else ""
+
+
 # ------------------------------------------------------------------ buckets
 
 @dataclass
@@ -285,6 +363,57 @@ class Bucket:
     rate_3h: float | None = None
     rate_long: float | None = None
     span_hours: float | None = None
+    # When this window OPENED, and how long it runs. Derived in `read_buckets`
+    # from `resets_at` minus the window's own length (the gap to the previous
+    # reset stamp in history, else the bucket's nominal period), because the
+    # endpoint reports only where a window ENDS.
+    window_start: datetime | None = None
+    window_hours: float | None = None
+    # How long it has been running at the moment this bucket was read. None
+    # means the window's start could not be established, which reads as "no
+    # opinion": nothing is gated on an age nobody knows.
+    elapsed_hours: float | None = None
+    warmup_hours: float = WARMUP_HOURS
+    max_horizon_hours: float | None = None
+
+    @property
+    def fresh(self) -> bool:
+        """True while the window is younger than its warm-up.
+
+        The flag the ladder's climb is gated on. A rate anchored at a window
+        that opened forty minutes ago is a measurement of forty minutes, and
+        multiplying it by a week is arithmetic, not evidence.
+        """
+        elapsed = self.elapsed_hours
+        if elapsed is None or not math.isfinite(elapsed):
+            return False
+        return elapsed < max(self.warmup_hours, 0.0)
+
+    @property
+    def age_minutes(self) -> float | None:
+        """The window's age in minutes, for the line that says why it held."""
+        elapsed = self.elapsed_hours
+        if elapsed is None or not math.isfinite(elapsed):
+            return None
+        return elapsed * 60.0
+
+    @property
+    def horizon_hours(self) -> float:
+        """How far this bucket's rate is carried: the reset, or the cap.
+
+        `min(hours_to_reset, allocation.max_horizon_hours)`. Only the FORECAST
+        is capped; `required` keeps dividing by the real time to reset, so the
+        pace the bucket has to hold to land on its goal is untouched.
+        """
+        cap = self.max_horizon_hours
+        if cap is None or not math.isfinite(cap) or cap <= 0:
+            return self.hours_to_reset
+        return min(self.hours_to_reset, cap)
+
+    @property
+    def capped(self) -> bool:
+        """True when the forecast stops short of the reset."""
+        return self.horizon_hours < self.hours_to_reset - 1e-9
 
     @property
     def rate(self) -> float | None:
@@ -303,16 +432,22 @@ class Bucket:
 
     @property
     def expected_at_reset(self) -> float | None:
+        """utilization + rate x the HORIZON, which is at most the reset.
+
+        Capped at `allocation.max_horizon_hours`: extrapolating a rate across
+        167 hours multiplies its noise by 167 too, which is how 3% used at
+        3.92%/h read as 657% at reset and pinned the ladder at its top rung.
+        """
         rate = self.rate
         if rate is None:
             return None
-        return self.utilization + rate * self.hours_to_reset
+        return self.utilization + rate * self.horizon_hours
 
     @property
     def ahead_by(self) -> float | None:
         """expected_at_reset - goal. Positive means it will overshoot.
 
-        Display only. It is a forecast multiplied by `hours_to_reset`, so a
+        Display only. It is a forecast multiplied by the horizon, so a
         one-percent step in the reading moves it by a whole utilization point
         on a weekly window; `pace_state` is what any decision reads.
         """
@@ -370,7 +505,14 @@ class Bucket:
             "rate_quantum": self.rate_quantum,
             "pace_gap": None if rate is None else rate - self.required,
             "hours_to_reset": self.hours_to_reset,
+            "horizon_hours": self.horizon_hours,
             "resets_at": self.resets_at.isoformat() if self.resets_at else None,
+            "window_start": (self.window_start.isoformat()
+                             if self.window_start else None),
+            "window_hours": self.window_hours,
+            "elapsed_hours": self.elapsed_hours,
+            "warmup_hours": self.warmup_hours,
+            "fresh": self.fresh,
             "goal": self.goal,
             "stop": self.stop,
             "expected_at_reset": self.expected_at_reset,
@@ -459,6 +601,95 @@ def _rate_long(points: list[tuple[datetime, float]],
     if span_h * 60.0 < MIN_SPAN_MINUTES:
         return None, None
     return max(0.0, (window[-1][1] - window[0][1]) / span_h), span_h
+
+
+def _reset_stamps(snaps: list[Any], name: str,
+                  now: datetime | None = None) -> list[datetime]:
+    """Every distinct `resets_at` this bucket has reported, oldest first.
+
+    The endpoint says where a window ENDS and never where it began, so the only
+    record of a window's length is the distance between two consecutive reset
+    stamps in state/history.jsonl. Readings later than `now` are dropped, so a
+    replayed poll sees only what that poll could have seen.
+    """
+    pairs: list[tuple[datetime, datetime]] = []
+    for snap in snaps:
+        window = _window_of(snap, name)
+        stamp = getattr(window, "resets_at", None)
+        fetched = getattr(snap, "fetched_at", None)
+        if not isinstance(stamp, datetime) or not isinstance(fetched, datetime):
+            continue
+        if now is not None and fetched > now:
+            continue
+        pairs.append((fetched, stamp))
+    pairs.sort(key=lambda p: p[0])
+    out: list[datetime] = []
+    for _fetched, stamp in pairs:
+        if not out or stamp != out[-1]:
+            out.append(stamp)
+    return out
+
+
+def _window_length(stamps: list[datetime], period_hours: float) -> float:
+    """The window's own length in hours: this reset minus the one before it.
+
+    Falls back to the bucket's nominal period - seven days for the weekly and
+    Fable windows, five hours for the session guard - and only believes a
+    derived length within `WINDOW_LEN_MIN/MAX_FACTOR` of it, because two stamps
+    minutes apart would otherwise make every window look brand new.
+    """
+    if len(stamps) >= 2:
+        try:
+            hours = (stamps[-1] - stamps[-2]).total_seconds() / 3600.0
+        except (TypeError, OverflowError, ValueError):
+            hours = math.nan
+        if (math.isfinite(hours)
+                and period_hours * WINDOW_LEN_MIN_FACTOR
+                <= hours <= period_hours * WINDOW_LEN_MAX_FACTOR):
+            return hours
+    return period_hours
+
+
+def _window_start(resets_at: Any, length_hours: float) -> datetime | None:
+    """When the window opened: its reset, less its own length. Never raises."""
+    if not isinstance(resets_at, datetime):
+        return None
+    if not math.isfinite(length_hours) or length_hours <= 0:
+        return None
+    try:
+        return resets_at - timedelta(hours=length_hours)
+    except (OverflowError, ValueError, OSError):
+        return None
+
+
+def _rolled_over(buckets: dict[str, Bucket],
+                 seen: dict[str, datetime]) -> list[tuple[str, datetime]]:
+    """The watched buckets whose window START moved since the last poll.
+
+    A rollover moves the start by a whole window; the reported reset time
+    drifting by minutes does not, and clearing the ladder on that would be its
+    own oscillator. Nothing is reported for a bucket with no stored start,
+    which is what keeps the first poll after an upgrade quiet.
+    """
+    rolled: list[tuple[str, datetime]] = []
+    for name in RESET_WATCH:
+        bucket = buckets.get(name)
+        previous = seen.get(name)
+        if bucket is None or not isinstance(previous, datetime):
+            continue
+        start = bucket.window_start
+        if not isinstance(start, datetime):
+            continue
+        try:
+            shift = (start - previous).total_seconds() / 3600.0
+        except (TypeError, OverflowError, ValueError):
+            continue
+        length = _finite(bucket.window_hours,
+                         float(BUCKETS.get(name, {}).get("period_hours",
+                                                         WEEK_HOURS)))
+        if shift >= max(length * RESET_SHIFT_FRACTION, RESET_SHIFT_MIN_HOURS):
+            rolled.append((name, start))
+    return rolled
 
 
 def _hours_to_reset(resets_at: Any, period_hours: float, now: datetime) -> float:
@@ -581,6 +812,8 @@ def read_buckets(cfg: Config, snap: Any = None, now: datetime | None = None,
         if not any(getattr(s, "fetched_at", None) == stamp for s in snaps):
             snaps = list(snaps) + [snap]
     out: dict[str, Bucket] = {}
+    warmup = warmup_hours(cfg)
+    horizon = max_horizon(cfg)
     for name in BUCKET_ORDER:
         spec = BUCKETS[name]
         period = float(spec.get("period_hours", WEEK_HOURS))
@@ -597,6 +830,12 @@ def read_buckets(cfg: Config, snap: Any = None, now: datetime | None = None,
         resets_at = getattr(window, "resets_at", None)
         goal = bucket_goal(cfg, name)
         long_rate, span = _rate_long(points, now)
+        # Where this window OPENED: its reset less its own length, the length
+        # taken from the previous reset stamp this bucket has shown.
+        length = _window_length(_reset_stamps(snaps, name, now), period)
+        start = _window_start(resets_at, length)
+        elapsed = (None if start is None
+                   else max(0.0, (now - start).total_seconds() / 3600.0))
         out[name] = Bucket(
             name=name,
             utilization=min(max(util, 0.0), 1.5),
@@ -608,12 +847,22 @@ def read_buckets(cfg: Config, snap: Any = None, now: datetime | None = None,
             rate_3h=_rate(points, RATE_MINUTES_SLOW, now),
             rate_long=long_rate,
             span_hours=span,
+            window_start=start,
+            window_hours=length,
+            elapsed_hours=elapsed,
+            warmup_hours=warmup,
+            max_horizon_hours=horizon if horizon > 0 else None,
         )
     return out
 
 
 def pace_phrase(bucket: Bucket | None) -> str:
-    """"fable 6% ahead of pace at reset Fri 07:00", the head of every reason."""
+    """"fable 6% ahead of pace at reset Fri 07:00", the head of every reason.
+
+    When the forecast stopped short of the reset it says which horizon it used
+    instead - "over the next 48h (reset Thu 07:00)" - because "at reset" would
+    otherwise name a moment the number was never carried to.
+    """
     if bucket is None:
         return "no reading"
     label = BUCKETS.get(bucket.name, {}).get("label", bucket.name)
@@ -621,6 +870,10 @@ def pace_phrase(bucket: Bucket | None) -> str:
     if ahead is None:
         return f"{label} pace unknown (no burn rate yet)"
     where = "ahead of" if ahead >= 0 else "behind"
+    if bucket.capped:
+        return (f"{label} {abs(ahead):.0%} {where} pace over the next "
+                f"{bucket.horizon_hours:.0f}h "
+                f"(reset {reset_label(bucket.resets_at)})")
     return (f"{label} {abs(ahead):.0%} {where} pace at reset "
             f"{reset_label(bucket.resets_at)}")
 
@@ -864,7 +1117,12 @@ def worker_target(cfg: Config, weekly: Bucket | None, five_hour: Bucket | None,
 
     `configured` and `surge` survive only as the clamp and as the "cfg xN"
     wording. With no usable rate the configured count is held: a forecast built
-    on rounding noise is worse than the number the operator set.
+    on rounding noise is worse than the number the operator set - and a rate
+    whose window is still inside `allocation.warmup_hours` (`Bucket.fresh`) is
+    unusable for the same reason, so inside the warm-up the lanes may still
+    RISE but never fall below what is running or configured. That is the other
+    half of the 2026-09-04 07:51 CT failure: the rung pinned at 5 and the lanes
+    pinned at their floor of 2, both off fifty minutes of a fresh week.
     """
     configured = int(workers.get("count", 1) or 1)
     surge = max(int(workers.get("surge_count", configured) or configured),
@@ -889,6 +1147,17 @@ def worker_target(cfg: Config, weekly: Bucket | None, five_hour: Bucket | None,
         per_lane = rate / max(standing, 1)
         want = int(math.ceil(required / per_lane)) if per_lane > 0 else standing
     want = min(max(want, low), surge)
+    # The window-age rule the ladder is under, applied to the lanes. The count
+    # standing when a window opens is the PREVIOUS window's throttle, and the
+    # rate that would cut it further is a measurement of the minutes since the
+    # reset; cutting on it throttles hardest when the budget is freshest, which
+    # is the whole defect. Raising is never the failure being guarded against,
+    # so only the CUT is held - and the five-hour clamp below still overrides
+    # this, because that guard is the loop's hard brake.
+    floor_fresh = min(max(standing, configured), surge)
+    warm = bool(getattr(weekly, "fresh", False)) and want < floor_fresh
+    if warm:
+        want = floor_fresh
     if five_hour is not None:
         # The five-hour guard is the loop's own hard brake (it produces
         # `blocked`); forecast to trip it, the allocator must not be the thing
@@ -903,6 +1172,16 @@ def worker_target(cfg: Config, weekly: Bucket | None, five_hour: Bucket | None,
         return standing, None
     head = pace_phrase(weekly)
     tail = (f" [cfg x{configured}]" if standing != configured else "")
+    if warm and want > standing:
+        # Not an auto surge: the lanes the previous window ended throttled to,
+        # handed back because nothing measured in this one can justify them.
+        # `want` is the configured count here by construction, so the "cfg xN"
+        # tail every other reason carries would only repeat the number.
+        age = _finite(getattr(weekly, "age_minutes", None), 0.0)
+        return want, (f"{head}; the weekly window is only {age:.0f}m old "
+                      f"(warm-up {warmup_hours(cfg) * 60.0:.0f}m) -> workers "
+                      f"{standing}->{want} (the configured count), too early "
+                      "to read the window's pace to hold lanes down")
     if want > standing:
         return want, (f"{head} -> workers {standing}->{want} "
                       f"(auto surge, ceiling {surge}){tail}")
@@ -935,6 +1214,16 @@ def read_decision(cfg: Config) -> dict[str, Any]:
         lanes = None
     else:
         lanes = max(1, int(lanes))
+    # The window openings this decision was made against, so the next poll can
+    # see a bucket roll over. Anything unparseable is simply absent, which
+    # reads as "no previous window" and reports no rollover.
+    starts: dict[str, datetime] = {}
+    raw_starts = raw.get("window_starts")
+    if isinstance(raw_starts, dict):
+        for key, value in raw_starts.items():
+            moment = parse_iso(value)
+            if moment is not None:
+                starts[str(key)] = moment
     return {
         "step": clamp_step(raw.get("step", 0)),
         "up_polls": max(0, int(_finite(raw.get("up_polls", 0), 0))),
@@ -943,6 +1232,7 @@ def read_decision(cfg: Config) -> dict[str, Any]:
         # When the rung last moved, for the dwell. None ("never") lets the
         # first move through, which is what a fresh install wants.
         "last_step_at": parse_iso(raw.get("last_step_at")),
+        "window_starts": starts,
     }
 
 
@@ -952,6 +1242,8 @@ def write_state(cfg: Config, allocation: Allocation,
     """Persist the poll's buckets, decision and reasons. Returns what was written."""
     now = now or utcnow()
     last_step = decision.get("last_step_at")
+    starts = decision.get("window_starts")
+    starts = starts if isinstance(starts, dict) else {}
     payload = {
         "buckets": {name: bucket.to_dict() for name, bucket in buckets.items()},
         "decision": {**allocation.to_dict(),
@@ -959,7 +1251,11 @@ def write_state(cfg: Config, allocation: Allocation,
                      "down_polls": int(decision.get("down_polls", 0)),
                      "last_step_at": (last_step.isoformat()
                                       if isinstance(last_step, datetime)
-                                      else last_step)},
+                                      else last_step),
+                     "window_starts": {
+                         str(name): (value.isoformat()
+                                     if isinstance(value, datetime) else value)
+                         for name, value in starts.items()}},
         "reasons": list(allocation.reasons),
         "notes": list(allocation.notes),
         "generated_at": now.isoformat(),
@@ -1016,7 +1312,7 @@ def evaluate(cfg: Config, snap: Any = None, now: datetime | None = None,
              history: Any = None) -> Allocation:
     """One poll of the allocator: measure, move the ladder, persist, return it.
 
-    Three gates, and a rung needs all three:
+    Four gates, and a CLIMB needs all four:
 
       pace       `Bucket.pace_state` in RATE space, with a dead band floored at
                  the measurement quantum. The utilization-space band this
@@ -1031,6 +1327,20 @@ def evaluate(cfg: Config, snap: Any = None, now: datetime | None = None,
                  ladder needs a bound in wall-clock time as well. The counter
                  stays armed while the dwell runs, so the rung moves on the
                  first poll after it and no agreement is thrown away.
+      warm-up    `allocation.warmup_hours` of window age (and the same gate
+                 holds the LANES up in `worker_target`, which is the other half
+                 of the same throttle). A rate anchored at a
+                 window that opened forty minutes ago measures forty minutes,
+                 and the ladder must not throttle hardest when the budget is
+                 freshest. Giving a rung BACK is never held back by it, and the
+                 counter stays armed exactly as it does under the dwell.
+
+    And ahead of all four, the reset drop: a window whose start has moved has
+    ROLLED, so the new window begins at rung 0 with the counters cleared rather
+    than inheriting whatever the last one ended on. A rung standing while the
+    window is still inside its warm-up is dropped on the same grounds even when
+    no poll saw the rollover (a restart, a fetch gap): under the warm-up rule
+    such a rung cannot have been earned in the window it is standing in.
 
     Never raises: it is called from inside the tick, and a broken bucket has to
     degrade to "hold what stands".
@@ -1045,6 +1355,10 @@ def evaluate(cfg: Config, snap: Any = None, now: datetime | None = None,
         override = throttle_active(cfg)
         notes: list[str] = []
         reasons: list[str] = []
+        # The warm-up hold and the reset drop explain the RUNG itself rather
+        # than a change to it, so they lead the reasons the panel and the
+        # fork's brief are handed - they are the answer to "why is it there".
+        gates: list[str] = []
 
         fable = buckets.get(FABLE)
         step = decision["step"]
@@ -1072,7 +1386,38 @@ def evaluate(cfg: Config, snap: Any = None, now: datetime | None = None,
                          f"{dwell / 60.0:.0f}m - holding {remaining / 60.0:.0f}m "
                          "more")
 
-        if state is None:
+        # A window that has ROLLED since the last poll: the rung the previous
+        # window ended on says nothing about this one, and inheriting it is
+        # what left the ladder at 5 of 5 across the 07:00 reset on 2026-09-04.
+        # Checked before the pace, because a clean slate is not a pace verdict.
+        rolled = _rolled_over(buckets, decision["window_starts"])
+        # ... and the same conclusion reached from the rung itself, for the
+        # reset no poll was there to see: a restart, a fetch gap or the upgrade
+        # that added this rule. A rung can no longer be EARNED inside the
+        # warm-up, so a rung standing while the window is still that young was
+        # inherited from the window before it, whatever the file remembers.
+        inherited = step > 0 and fable is not None and fable.fresh and not rolled
+
+        if rolled or inherited:
+            tail = (f"ladder back to rung 0 from {step}" if step > 0
+                    else "ladder held at rung 0")
+            for name, start in rolled:
+                gates.append(
+                    f"{BUCKETS.get(name, {}).get('label', name)} window reset "
+                    f"at {reset_label(start, cfg)}{_zone(cfg)}; {tail} "
+                    "(a new window starts on a clean slate)")
+            if inherited:
+                gates.append(
+                    f"the fable window is only {fable.age_minutes or 0.0:.0f}m "
+                    f"old (reset {reset_label(fable.window_start, cfg)}"
+                    f"{_zone(cfg)}), so rung {step} was inherited from the "
+                    f"window before it - {tail}")
+            if step > 0:
+                # The drop IS a move, so it stamps the dwell: the ladder does
+                # not climb straight back out of the reset it just cleared.
+                last_step_at = now
+            step, up, down = 0, 0, 0
+        elif state is None:
             notes.append("no Fable burn rate yet; holding the configured graph")
             up = down = 0
         elif not on_fable:
@@ -1082,7 +1427,17 @@ def evaluate(cfg: Config, snap: Any = None, now: datetime | None = None,
             # At the top of the ladder there is nothing left to give up, so the
             # counter is parked rather than left to climb forever.
             up, down = (0 if step >= MAX_STEP else up + 1), 0
-            if up >= UP_POLLS and step < MAX_STEP:
+            if fable is not None and fable.fresh:
+                # The warm-up hold. The agreement is kept armed, exactly as it
+                # is under the dwell, so the first poll past the warm-up moves.
+                age = fable.age_minutes or 0.0
+                up = min(up, UP_POLLS)
+                gates.append(
+                    f"{pace_phrase(fable)}; the fable window is only "
+                    f"{age:.0f}m old (warm-up "
+                    f"{warmup_hours(cfg) * 60.0:.0f}m) - holding rung {step}, "
+                    "too early to read the window's pace")
+            elif up >= UP_POLLS and step < MAX_STEP:
                 if may_move:
                     step, up = step + 1, 0
                     last_step_at = now
@@ -1120,6 +1475,8 @@ def evaluate(cfg: Config, snap: Any = None, now: datetime | None = None,
         counts = allocation.counts()
         adv_alloc, adv_conf = counts[ADVISORY]
         if not override:
+            # Why the rung is where it is, before what it changed.
+            reasons.extend(gates)
             if adv_alloc != adv_conf:
                 reasons.append(f"{head} -> advisory {adv_conf}->{adv_alloc}")
             if allocation.advisory_effort != EFFORT_FULL:
@@ -1143,9 +1500,17 @@ def evaluate(cfg: Config, snap: Any = None, now: datetime | None = None,
                          f"is ignored, workers pinned to x{allocation.worker_count}")
         allocation.reasons = reasons
         allocation.notes = notes
+        # The window openings this poll saw, over the ones it was handed: a
+        # bucket that could not be read this poll keeps its remembered start
+        # rather than losing it, so a fetch gap cannot swallow a rollover.
+        starts = dict(decision["window_starts"])
+        starts.update({name: bucket.window_start
+                       for name, bucket in buckets.items()
+                       if isinstance(bucket.window_start, datetime)})
         decision = {"step": step, "up_polls": up, "down_polls": down,
                     "worker_count": allocation.worker_count,
-                    "last_step_at": last_step_at}
+                    "last_step_at": last_step_at,
+                    "window_starts": starts}
         write_state(cfg, allocation, buckets, decision, now)
         return allocation
     except Exception:  # pragma: no cover - the poll must survive anything
@@ -1186,12 +1551,20 @@ def format_buckets(allocation: Allocation, cfg: Any = None) -> list[str]:
     `rate/h` beside `need/h` and their difference, because the ladder is gated
     on exactly that comparison; `at reset` is the forecast the two of them
     imply, and it is the readable summary rather than the decision.
+
+    A window whose reset is further off than `allocation.max_horizon_hours` is
+    forecast only to that horizon, and the footer says so: "at reset" over a
+    week of remaining budget would otherwise name a number no rate was carried
+    to, and the age of each window is what says how much the rate is worth.
     """
     from .clock import label
 
     lines = ["  " + "".join(_cell(name, width)
                             for name, width in BUCKET_COLUMNS)
              + f"  resets at ({label(cfg)})"]
+    capped: list[str] = []
+    ages: list[str] = []
+    cap_hours = math.nan
     for name in BUCKET_ORDER:
         row = allocation.buckets.get(name)
         if not isinstance(row, dict):
@@ -1212,6 +1585,21 @@ def format_buckets(allocation: Allocation, cfg: Any = None) -> list[str]:
             _cell(text, width) for text, (_label, width)
             in zip(cells, BUCKET_COLUMNS))
             + f"  {reset_label(row.get('resets_at'), cfg)}")
+        horizon = _finite(row.get("horizon_hours"), math.nan)
+        left = _finite(row.get("hours_to_reset"), math.nan)
+        if math.isfinite(horizon) and math.isfinite(left) and horizon < left:
+            capped.append(f"{name} {left:.0f}h")
+            cap_hours = horizon
+        elapsed = _finite(row.get("elapsed_hours"), math.nan)
+        if math.isfinite(elapsed):
+            ages.append(f"{name} {elapsed:.1f}h"
+                        + (" (warm-up)" if row.get("fresh") else ""))
+    if capped and math.isfinite(cap_hours):
+        lines.append(f"  at reset = now + rate x {cap_hours:.0f}h "
+                     f"(allocation.max_horizon_hours; {', '.join(capped)} to "
+                     "reset), need/h still targets the real reset")
+    if ages:
+        lines.append(f"  window age: {', '.join(ages)}")
     return lines
 
 
