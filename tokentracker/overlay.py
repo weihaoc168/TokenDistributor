@@ -145,6 +145,24 @@ LADDER_PIN_R = 2.0
 # "xN" column lands on the same x down all three.
 LADDER_STEP_W = 17
 LADDER_STEP_GAP = 3
+# The collapse box at the right end of the AGENTIC GRAPH header row, in the
+# minimize button's style but smaller: it has to sit inside a label row, not a
+# title bar. Collapsed, the whole block is the header row plus one digest line.
+LADDER_TOGGLE_W = 13
+LADDER_DIGEST_H = 15
+# The digest's three forms, widest first. A 300px card cannot hold the full
+# form at every graph (the surge suffix alone is 30-50px), so the drawer takes
+# the widest one that fits rather than ellipsising the line - a digest reading
+# "W opus-5 x2/1..." names neither a count nor a ceiling.
+DIGEST_FULL = "full"
+DIGEST_COMPACT = "compact"
+DIGEST_TIGHT = "tight"
+DIGEST_FORMS = (DIGEST_FULL, DIGEST_COMPACT, DIGEST_TIGHT)
+DIGEST_SEP = " | "
+DIGEST_SEP_TIGHT = "·"
+# The collapsed header's own tags: the allocator is off rung 0 (the counts in
+# the digest are not the configured ones), and a tier is on its fallback.
+DIGEST_ALLOC_TAG = "ALLOC"
 # REPORT row: a wide VIEW REPORT button beside a narrow REPORT NOW tap target,
 # with the report's age on its own line underneath.
 REPORT_BTN_H = 26
@@ -510,6 +528,73 @@ def _shots_line(cfg) -> str | None:
         return None
 
 
+def graph_digest(graph, configured=None, active=None,
+                 form: str = DIGEST_FULL) -> str:
+    """The one line the AGENTIC GRAPH block collapses to.
+
+    "E fable-5.1 x1 | A fable-5.1 x2/3 | W opus-5 x2/10 (surge 20)": per tier,
+    its initial, the model ACTUALLY in use, and the count the allocator is
+    running - over the configured count when the two differ, which is the one
+    thing a collapsed block still has to say. `active` is `active_graph`'s map;
+    a tier missing from it falls back to the model the graph names, and a tier
+    the allocator moved off `configured`'s model is named for where it moved
+    to - `active` resolves against the ceiling, so it still names the old one.
+
+    Pure, and it never raises: `tiers_of` completes a half-written graph, so a
+    hand-edited config.json degrades to the built-in tier rather than taking
+    the refresh timer down. `form` trades width for detail, widest first:
+    `full` is the line above, `compact` swaps the separators and shortens the
+    surge suffix to `s20`, `tight` drops the surge budget altogether.
+    """
+    blocks = dict(zip(TIERS, tiers_of(graph)))
+    ceiling = dict(zip(TIERS, tiers_of(graph if configured is None else configured)))
+    live = active if isinstance(active, dict) else {}
+    sep = DIGEST_SEP if form == DIGEST_FULL else DIGEST_SEP_TIGHT
+    parts: list[str] = []
+    for tier in TIERS:
+        block = blocks[tier]
+        count = int(block["count"])
+        want = int(ceiling[tier]["count"])
+        counts = f"x{count}" if count == want else f"x{count}/{want}"
+        row = live.get(tier)
+        row = row if isinstance(row, dict) else {}
+        # The same repair the expanded rung makes: `active_graph` resolves every
+        # tier against the CEILING, so a tier the allocator moved (the advisory
+        # lenses onto the workers' model, the ladder's fourth rung) would come
+        # back still named for config.json's model. Only when nothing live has
+        # already moved off it - a running row's `model_used` is the harder
+        # fact, and the folded line must not disagree with the rung it replaced.
+        alloc_model = str(block.get("model") or "")
+        cfg_model = str(ceiling[tier].get("model") or "")
+        live_model = str(row.get("model") or "")
+        moved = bool(alloc_model) and alloc_model != cfg_model
+        model = short_model(alloc_model if (moved and live_model == cfg_model)
+                            else (live_model or alloc_model))
+        text = f"{tier[0].upper()} {model} {counts}"
+        if tier == WORKERS:
+            surge = int(block.get("surge_count", count) or count)
+            if surge > count and form != DIGEST_TIGHT:
+                text += (f" (surge {surge})" if form == DIGEST_FULL
+                         else f" s{surge}")
+        parts.append(text)
+    return sep.join(parts)
+
+
+def digest_tags(alloc: bool = False, limited: bool = False) -> list[tuple[str, str]]:
+    """[(label, colour)] for the collapsed header row, left to right.
+
+    Two words, because the collapsed block has hidden the two things that
+    would otherwise say them: the ALLOCATION line under the ladder, and the
+    red tag on the rung whose primary is limited.
+    """
+    tags: list[tuple[str, str]] = []
+    if alloc:
+        tags.append((DIGEST_ALLOC_TAG, BLUE))
+    if limited:
+        tags.append((LIMITED_TAG, RED))
+    return tags
+
+
 class Overlay:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -535,7 +620,11 @@ class Overlay:
         self._report_age = report_age(cfg)
         self._shots = _shots_line(cfg)
         self._after_id: str | None = None
-        self._collapsed = self._load_collapsed()
+        self._collapsed = self._load_flag("collapsed")
+        # The AGENTIC GRAPH block's own fold, remembered separately from the
+        # whole panel's: the two are independent, and a panel reopened with its
+        # ladder unexpectedly back is the bug this file exists to avoid.
+        self._graph_collapsed = self._load_flag("graph_collapsed")
 
         _enable_dpi_awareness()
         self.root = tk.Tk()
@@ -594,6 +683,7 @@ class Overlay:
         self.canvas.tag_bind("goal_plus", "<Button-1>", self._click_goal_plus)
         self.canvas.tag_bind("graph_minus", "<Button-1>", self._click_graph_minus)
         self.canvas.tag_bind("graph_plus", "<Button-1>", self._click_graph_plus)
+        self.canvas.tag_bind("graph_toggle", "<Button-1>", self._toggle_graph)
         self.canvas.tag_bind("view_report", "<Button-1>", self._click_view_report)
         self.canvas.tag_bind("report_now", "<Button-1>", self._click_report_now)
         self.canvas.tag_bind("min_btn", "<Button-1>", self._toggle_collapsed)
@@ -603,20 +693,43 @@ class Overlay:
     def _collapsed_file(self) -> Path:
         return self.cfg.state_dir / "overlay.json"
 
-    def _load_collapsed(self) -> bool:
+    def _read_overlay_state(self) -> dict:
+        """state/overlay.json as a dict, or {}. Never raises."""
         try:
             data = json.loads(self._collapsed_file().read_text(encoding="utf-8"))
-            return bool(isinstance(data, dict) and data.get("collapsed"))
-        except (OSError, json.JSONDecodeError, AttributeError):
-            return False
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _load_flag(self, key: str) -> bool:
+        return bool(self._read_overlay_state().get(key))
+
+    def _write_flag(self, key: str, value: bool) -> None:
+        """Persist ONE pane flag, keeping every other key in the file.
+
+        A write of `{key: value}` alone would drop the panel's own `collapsed`
+        the first time the graph was folded (and vice versa), so the file is
+        read back and merged: every flag here is another pane's memory.
+        """
+        data = self._read_overlay_state()
+        data[key] = bool(value)
+        try:
+            path = self._collapsed_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data), encoding="utf-8")
+        except OSError:
+            pass
 
     def _toggle_collapsed(self, _event: tk.Event) -> str:
         self._collapsed = not self._collapsed
-        try:
-            self._collapsed_file().write_text(
-                json.dumps({"collapsed": self._collapsed}), encoding="utf-8")
-        except OSError:
-            pass
+        self._write_flag("collapsed", self._collapsed)
+        self._refresh()
+        return "break"
+
+    def _toggle_graph(self, _event: tk.Event) -> str:
+        """Fold the AGENTIC GRAPH block down to its one-line digest, or back."""
+        self._graph_collapsed = not self._graph_collapsed
+        self._write_flag("graph_collapsed", self._graph_collapsed)
         self._refresh()
         return "break"
 
@@ -998,9 +1111,33 @@ class Overlay:
             lines.append((alloc, RED if override else BLUE, "alloc_note"))
         return lines
 
+    def _draw_graph_toggle(self, cx: float, cy: float, collapsed: bool) -> None:
+        """The AGENTIC GRAPH block's fold box, in the minimize button's style.
+
+        A chevron rather than that button's line, and pointing the way the
+        block will move: down while the ladder is folded away (tap to bring it
+        back), up while it is showing.
+        """
+        h = self._pxf(LADDER_TOGGLE_W) / 2
+        self._round_rect(cx - h, cy - h, cx + h, cy + h, self._pxf(3),
+                         fill=SUB_BG, outline=BORDER, width=1,
+                         tags="graph_toggle")
+        w = self._pxf(3)
+        dy = self._pxf(1.5)
+        near, far = (cy - dy, cy + dy) if collapsed else (cy + dy, cy - dy)
+        self.canvas.create_line(cx - w, near, cx, far, cx + w, near,
+                                fill=FG, width=max(1, self._px(1.5)),
+                                tags="graph_toggle")
+
     def _ladder_height(self) -> int:
         """What `_draw_graph_ladder` will occupy, so the card can grow for it."""
         P = self._px
+        if self._graph_collapsed:
+            # The header row and the digest under it, and nothing else: the
+            # rungs, the share bars, both notes and the worker taps are all
+            # folded away, and the card shrinks by exactly their height.
+            return (self._text_row(LADDER_LABEL_H, self._font_small)
+                    + self._text_row(LADDER_DIGEST_H, self._font_small))
         notes = (len(self._ladder_notes())
                  * self._text_row(LADDER_NOTE_H, self._font_small))
         rung = max(P(LADDER_RUNG_H), self._share_geometry()[2])
@@ -1074,6 +1211,28 @@ class Overlay:
                 font=FONT_MONO, anchor="e", fill=color if emphasis else DIM,
                 tags=("ladder", f"share_{kind}_{tier}"))
 
+    def _draw_graph_digest(self, x0: float, y0: float, x1: float,
+                           row_h: float) -> None:
+        """The folded block's one line: every tier, its model and its counts.
+
+        The widest of `graph_digest`'s forms that fits, rather than the full
+        form ellipsised: the digest exists to be read at a glance, and a line
+        ending "W opus-5 x2/1..." has lost the number it was folded for. Only
+        when even the tightest form is too wide does it get an ellipsis.
+        """
+        avail = x1 - x0
+        text = ""
+        for form in DIGEST_FORMS:
+            text = graph_digest(self._alloc.graph, self._graph, self._active,
+                                form)
+            if self._font_small.measure(text) <= avail:
+                break
+        self.canvas.create_text(
+            x0, y0 + row_h / 2,
+            text=self._fit(text, self._font_small, avail),
+            font=FONT_SMALL, fill=SILVER, anchor="w",
+            tags=("ladder", "graph_digest"))
+
     def _draw_graph_ladder(self, x0: float, y0: float, x1: float) -> None:
         """The AGENTIC GRAPH ladder chart: a rung per tier, top to bottom.
 
@@ -1099,6 +1258,11 @@ class Overlay:
         The three "xN" share one right edge, and so do the six share labels,
         which is what lets them be compared down the rungs instead of read one
         at a time.
+
+        The header row carries a fold box at its right end. Folded, everything
+        under that row goes away and one digest line takes its place, with the
+        two words the hidden rows would have said (ALLOC, LIMITED) beside the
+        label - the block is then three lines shorter and the card with it.
         """
         P = self._px
         rung_h = max(P(LADDER_RUNG_H), self._share_geometry()[2])
@@ -1122,13 +1286,37 @@ class Overlay:
         workers = blocks[WORKERS]
         surge = int(workers.get("surge_count", workers["count"]))
 
-        self.canvas.create_text(x0, y0 + label_h / 2,
+        head_y = y0 + label_h / 2
+        # The fold box owns the right end of the header row; everything else on
+        # that row (the surge budget expanded, the tags folded) stops short of
+        # it, so the tap target is never printed over.
+        toggle_w = self._pxf(LADDER_TOGGLE_W)
+        self._draw_graph_toggle(x1 - toggle_w / 2, head_y, self._graph_collapsed)
+        head_right = x1 - toggle_w - P(6)
+        self.canvas.create_text(x0, head_y,
                                 text="AGENTIC GRAPH", font=FONT_SMALL,
                                 fill=DIM, anchor="w", tags="ladder")
+        if self._graph_collapsed:
+            limited = bool(self._limited) and any(
+                self._limited == blocks[t].get("model") for t in TIERS)
+            # "The allocator is not holding the ceiling", in one word: the
+            # ALLOCATION line that says which rung and why is folded away with
+            # everything else, and the manual override counts as off-rung.
+            off_rung = bool(getattr(self._alloc, "step", 0)
+                            or getattr(self._alloc, "override", False))
+            for label, color in reversed(digest_tags(off_rung, limited)):
+                self.canvas.create_text(head_right, head_y, text=label,
+                                        font=FONT_SMALL, fill=color, anchor="e",
+                                        tags=("ladder", f"digest_{label.lower()}"))
+                head_right -= self._font_small.measure(label) + P(6)
+            self._draw_graph_digest(
+                x0, y0 + label_h, x1,
+                self._text_row(LADDER_DIGEST_H, self._font_small))
+            return
         if surge > int(workers["count"]):
             # The surge budget has no column of its own (a second number would
             # break the xN alignment), so the label names it.
-            self.canvas.create_text(x1, y0 + label_h / 2,
+            self.canvas.create_text(head_right, head_y,
                                     text=f"surge x{surge}", font=FONT_SMALL,
                                     fill=DIM, anchor="e", tags="ladder")
 

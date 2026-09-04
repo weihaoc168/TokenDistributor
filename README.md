@@ -4,7 +4,7 @@ Spend Claude Code's weekly token budget before it resets, without ever starving 
 
 <p align="center"><img src="docs/overlay.png" width="360" alt="TokenDistributor overlay"></p>
 
-The overlay: three rings (5-hour, weekly with the gear mascot and an amber goal tick, Fable), live sessions with the main session pinned, token distribution and the current mode, an **AGENTIC GRAPH** ladder chart showing the model each tier is *actually* running on right now over two bars carrying that tier's share of the window's input and output tokens, a `- GOAL 90% +` stepper row, START / STOP, the `AUTO` / `THROTTLE ON` toggle, and VIEW REPORT / REPORT NOW. Each rung carries the count TokenDistributor **allocated** for this poll, with the configured ceiling dimmed beside it (`cfg x3`) whenever they differ, and an `ALLOCATION` line under the ladder naming the rung and the pace reading that put it there.
+The overlay: three rings (5-hour, weekly with the gear mascot and an amber goal tick, Fable), live sessions with the main session pinned, token distribution and the current mode, an **AGENTIC GRAPH** ladder chart showing the model each tier is *actually* running on right now over two bars carrying that tier's share of the window's input and output tokens, a `- GOAL 90% +` stepper row, START / STOP, the `AUTO` / `THROTTLE ON` toggle, and VIEW REPORT / REPORT NOW. Each rung carries the count TokenDistributor **allocated** for this poll, with the configured ceiling dimmed beside it (`cfg x3`) whenever they differ, and an `ALLOCATION` line under the ladder naming the rung and the pace reading that put it there. The chevron at the right of the **AGENTIC GRAPH** header folds all of that ([collapsed](docs/overlay-graph-collapsed.png)) into one digest line, `E fable-5-1 x1 | A fable-5-1 x2/3 | W opus-5 x4/10 (surge 20)`, with `ALLOC` and `LIMITED` tags beside the label; the card shrinks to match and the fold is remembered in `state/overlay.json`.
 
 ## What it does
 
@@ -121,7 +121,7 @@ State files under `state/`:
 | `ledger_cache.json` | per-transcript tallies keyed on path + mtime + size + window start, with the message ids each one counted, so an unchanged transcript is never parsed twice |
 | `pricing.json` | per-user price override `tracker.py pricing set` writes; a patch, so only the fields set here stop following `config.json` |
 | `report.json` | the last work-distribution report: path, reason, window |
-| `overlay.json` | the overlay's collapsed / expanded state |
+| `overlay.json` | the overlay's collapsed / expanded state (`collapsed`), and the AGENTIC GRAPH block's own fold (`graph_collapsed`) |
 | `history.jsonl` | the log of usage snapshots the pacer reads back |
 
 Reports land in `reports/`: `<UTC timestamp>-ledger.html`, the `<timestamp>-summary.json` it was built from, and `latest.html` (a copy of the newest, the one **VIEW REPORT** opens).
@@ -129,7 +129,7 @@ Reports land in `reports/`: `<UTC timestamp>-ledger.html`, the `<timestamp>-summ
 ## Tests
 
 ```powershell
-py -3.13 tests/test_all.py               # 189/189
+py -3.13 tests/test_all.py               # 211/211
 ```
 
 ## Acknowledgements

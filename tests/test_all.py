@@ -2012,6 +2012,157 @@ def test_overlay_exposes_control_and_close_buttons():
         assert callable(getattr(overlay.Overlay, name)), name
 
 
+def test_overlay_exposes_the_graph_fold():
+    import inspect
+    try:
+        import tkinter  # noqa: F401  - absent on headless builds
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    src = inspect.getsource(overlay.Overlay)
+    assert 'tag_bind("graph_toggle"' in src
+    assert 'tags="graph_toggle"' in src
+    for name in ("_toggle_graph", "_draw_graph_toggle", "_draw_graph_digest",
+                 "_read_overlay_state", "_load_flag", "_write_flag"):
+        assert callable(getattr(overlay.Overlay, name)), name
+    # The fold must swallow its click, or the canvas drag binding under it
+    # moves the whole panel every time the block is folded.
+    assert 'return "break"' in inspect.getsource(overlay.Overlay._toggle_graph)
+
+
+def test_overlay_graph_fold_round_trips_without_clobbering_collapsed():
+    try:
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    cfg = make_cfg()
+    fake = overlay.Overlay.__new__(overlay.Overlay)
+    fake.cfg = cfg
+    fake._refresh = lambda: None
+    # Both flags default to False, with no file on disk at all.
+    fake._collapsed = fake._load_flag("collapsed")
+    fake._graph_collapsed = fake._load_flag("graph_collapsed")
+    assert (fake._collapsed, fake._graph_collapsed) == (False, False)
+    assert fake._toggle_collapsed(None) == "break"
+    assert fake._toggle_graph(None) == "break"
+    path = cfg.state_dir / "overlay.json"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    # The panel's own flag survives the graph's write, which is the whole
+    # reason the file is read back and merged rather than overwritten.
+    assert stored == {"collapsed": True, "graph_collapsed": True}, stored
+    fake._toggle_graph(None)
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored == {"collapsed": True, "graph_collapsed": False}, stored
+    fake._toggle_collapsed(None)
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored == {"collapsed": False, "graph_collapsed": False}, stored
+    # A next panel reads both back off disk, and keys it does not own are kept.
+    path.write_text(json.dumps({"collapsed": True, "graph_collapsed": True,
+                                "pane_x": 3}), encoding="utf-8")
+    assert fake._load_flag("collapsed") is True
+    assert fake._load_flag("graph_collapsed") is True
+    fake._graph_collapsed = True
+    fake._toggle_graph(None)
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored == {"collapsed": True, "graph_collapsed": False,
+                      "pane_x": 3}, stored
+    # A junk file is "expanded", never an exception: this runs in __init__.
+    for junk in ("{not json", "[]", '"collapsed"'):
+        path.write_text(junk, encoding="utf-8")
+        assert fake._load_flag("graph_collapsed") is False, junk
+        assert fake._read_overlay_state() == {}, junk
+
+
+def test_graph_digest_names_the_active_and_configured_counts():
+    try:
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    from tokentracker import graph as G
+    allocated = {G.EXECUTIVE: {"model": "claude-fable-5-1", "count": 1},
+                 G.ADVISORY: {"model": "claude-fable-5-1", "count": 2},
+                 G.WORKERS: {"model": "claude-opus-5", "count": 2,
+                             "surge_count": 20}}
+    ceiling = {G.EXECUTIVE: {"model": "claude-fable-5-1", "count": 1},
+               G.ADVISORY: {"model": "claude-fable-5-1", "count": 3},
+               G.WORKERS: {"model": "claude-opus-5", "count": 10,
+                           "surge_count": 20}}
+    # Allocated over configured wherever they differ, the surge budget once.
+    assert overlay.graph_digest(allocated, ceiling) == (
+        "E fable-5-1 x1 | A fable-5-1 x2/3 | W opus-5 x2/10 (surge 20)")
+    # With no ceiling to compare against, every count stands on its own.
+    assert overlay.graph_digest(allocated) == (
+        "E fable-5-1 x1 | A fable-5-1 x2 | W opus-5 x2 (surge 20)")
+    # The model is the one ACTUALLY in use when the panel knows it, exactly as
+    # the rungs label it: the fork here is still running on opus-5.
+    active = {G.EXECUTIVE: {"model": "claude-opus-5"}, G.WORKERS: {}}
+    assert overlay.graph_digest(allocated, ceiling, active).startswith(
+        "E opus-5 x1 | ")
+    # Ladder rung 4 moves the advisory lenses onto the workers' model. The
+    # active map resolves every tier against the CEILING, so it still names
+    # config.json's model for that tier - the digest must name the one the
+    # allocator moved to, exactly as the expanded rung does ("opus-5  cfg
+    # fable-5-1"). Anything else announces ALLOC and then prints the model it
+    # moved away from.
+    moved = {**allocated, G.ADVISORY: {"model": "claude-opus-5", "count": 2}}
+    stale = {G.EXECUTIVE: {"model": "claude-fable-5-1"},
+             G.ADVISORY: {"model": "claude-fable-5-1"},
+             G.WORKERS: {"model": "claude-opus-5"}}
+    line = overlay.graph_digest(moved, ceiling, stale)
+    assert "A opus-5 x2/3" in line, line
+    assert "A fable-5-1" not in line, line
+    # A tier the allocator did NOT move still takes the live model over the
+    # configured one, which is the case above it.
+    assert line.startswith("E fable-5-1 x1"), line
+    # ... and a live row that has already moved off the configured model wins
+    # over the allocated one: `model_used` is the harder fact.
+    running = {**stale, G.ADVISORY: {"model": "claude-sonnet-5"}}
+    assert "A sonnet-5 x2/3" in overlay.graph_digest(moved, ceiling, running)
+    # A surge budget equal to the lane count is not worth a suffix.
+    flat = {**ceiling, G.WORKERS: {"model": "claude-opus-5", "count": 10,
+                                   "surge_count": 10}}
+    assert overlay.graph_digest(flat, flat).endswith("W opus-5 x10"), flat
+    # The narrower forms, widest first: the separators tighten, then the surge
+    # suffix shortens, then it goes - the counts are never what is given up.
+    compact = overlay.graph_digest(allocated, ceiling, form=overlay.DIGEST_COMPACT)
+    tight = overlay.graph_digest(allocated, ceiling, form=overlay.DIGEST_TIGHT)
+    assert "s20" in compact and "(surge" not in compact, compact
+    assert compact.endswith("W opus-5 x2/10 s20"), compact
+    assert tight.endswith("W opus-5 x2/10"), tight
+    assert "surge" not in tight and "s20" not in tight, tight
+    for form in overlay.DIGEST_FORMS:
+        line = overlay.graph_digest(allocated, ceiling, form=form)
+        assert "x2/3" in line and "x2/10" in line, (form, line)
+        assert len(line) <= len(overlay.graph_digest(allocated, ceiling)), form
+    # It is called from the refresh timer, so hostile input degrades to the
+    # built-in tiers rather than taking the panel down.
+    for junk in (None, "nonsense", {"workers": 7}, {"executive": None}):
+        line = overlay.graph_digest(junk, junk)
+        assert line.startswith("E ") and line.count("|") == 2, (junk, line)
+
+
+def test_digest_tags_name_only_what_the_fold_hid():
+    try:
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    assert overlay.digest_tags() == []
+    assert overlay.digest_tags(alloc=True) == [("ALLOC", overlay.BLUE)]
+    assert overlay.digest_tags(limited=True) == [("LIMITED", overlay.RED)]
+    assert overlay.digest_tags(True, True) == [("ALLOC", overlay.BLUE),
+                                               ("LIMITED", overlay.RED)]
+    # The red word is the same one the rung carries; they must not drift apart.
+    assert overlay.digest_tags(limited=True)[0][0] == overlay.LIMITED_TAG
+
+
 # Runs in its own interpreter: a bad close handler takes the whole process down
 # with an access violation, which would otherwise swallow the suite's output.
 _TK_PROBE = r'''
@@ -2335,6 +2486,80 @@ for tier in TIER_NAMES:
     assert ov.canvas.find_withtag("pinned_%s" % tier), tier
 
 
+def check_graph_fold(tag):
+    """Both states of the AGENTIC GRAPH block; returns the height it saves."""
+    ov._graph_collapsed = False
+    ov._refresh()
+    ov.root.update_idletasks()
+    tall = int(ov.canvas["height"])
+    open_texts = [t for t, _a, _b in spans()]
+    for want in ("AGENTIC GRAPH", "EXECUTIVE", "ADVISORY", "WORKERS"):
+        assert want in open_texts, (tag, want, open_texts)
+    assert ov.canvas.find_withtag("graph_toggle"), tag
+    check_ladder_texts("open-%s" % tag)
+    # The models the rungs name, to hold the folded line to: the digest replaces
+    # these rows, so it may not disagree with them about what is running.
+    rungs = {t: ov.canvas.itemcget(ov.canvas.find_withtag("model_%s" % t)[0],
+                                   "text")
+             for t in TIER_NAMES}
+    assert all(m and "..." not in m for m in rungs.values()), (tag, rungs)
+
+    ov._graph_collapsed = True
+    ov._refresh()
+    ov.root.update_idletasks()
+    short = int(ov.canvas["height"])
+    assert short < tall, (tag, short, tall)
+    texts = [t for t, _a, _b in spans()]
+    # The header row stays; everything it was heading goes.
+    assert "AGENTIC GRAPH" in texts, (tag, texts)
+    for absent in ("EXECUTIVE", "ADVISORY", "WORKERS", "in 0%", "out 60%"):
+        assert absent not in texts, (tag, absent, texts)
+    for absent in ("graph_minus", "graph_plus", "ladder_spine", "alloc_note",
+                   "ladder_note", "rung_in_executive", "track_out_workers",
+                   "share_in_workers", "model_workers", "limited_executive"):
+        assert not ov.canvas.find_withtag(absent), (tag, absent)
+    # ... replaced by one digest line naming every tier, unellipsised, with
+    # the two words the hidden rows would have said beside the label.
+    digest = ov.canvas.find_withtag("graph_digest")
+    assert digest, (tag, texts)
+    line = ov.canvas.itemcget(digest[0], "text")
+    # Every tier, the model each one is ACTUALLY on (the fork is still on
+    # opus-5 here), and the allocated lanes over the ceiling - whole, at every
+    # scale: an ellipsis here would cost the digest the numbers it exists for.
+    assert "..." not in line, (tag, line)
+    for tier, counts in zip(TIER_NAMES, ("x1", "x2/3", "x4/10")):
+        want = "%s %s %s" % (tier[0].upper(), rungs[tier], counts)
+        assert want in line, (tag, want, line, rungs)
+    for want in ("digest_alloc", "digest_limited"):
+        assert ov.canvas.find_withtag(want), (tag, want, texts)
+    # Nothing in the folded block touches anything else in it, the fold box
+    # included, and the goal row below is still clear of all of it.
+    band = ov.canvas.bbox("ladder")
+    inside = [ov.canvas.bbox(i) for i in ov.canvas.find_all()
+              if ov.canvas.type(i) == "text"
+              and ov.canvas.bbox(i)[1] >= band[1] - 2
+              and ov.canvas.bbox(i)[3] <= band[3] + 2]
+    # The fold box as one target (its outline and chevron are two items).
+    inside.append(ov.canvas.bbox("graph_toggle"))
+    assert len(inside) >= 4, (tag, inside)
+    for i, a in enumerate(inside):
+        for b in inside[i + 1:]:
+            assert (a[2] <= b[0] or b[2] <= a[0]
+                    or a[3] <= b[1] or b[3] <= a[1]), (tag, a, b)
+    goal = ov.canvas.bbox("goal_minus")
+    assert band[3] <= goal[1], (tag, band, goal)
+    assert max(b[2] for b in inside) <= ov.width, (tag, inside, ov.width)
+    lowest = max(ov.canvas.bbox(i)[3] for i in ov.canvas.find_all())
+    assert lowest <= int(ov.canvas["height"]) + 2, (tag, lowest)
+
+    # Unfolding puts every pixel back, so the card is not a one-way door.
+    ov._graph_collapsed = False
+    ov._refresh()
+    ov.root.update_idletasks()
+    assert int(ov.canvas["height"]) == tall, (tag, tall)
+    return tall - short
+
+
 def set_scale(scale):
     """Re-scale tk and the overlay's fonts; False when this build cannot."""
     try:
@@ -2433,6 +2658,67 @@ ov._refresh()
 ov.root.update_idletasks()
 texts = [t for t, _a, _b in spans()]
 assert "AUTO (tap for full throttle)" in texts, texts
+
+# ------------------------------------------------ the AGENTIC GRAPH fold
+# The block folds to its header row plus one digest line: the rungs, the share
+# bars, the ALLOCATION line and the worker taps all go, the card shrinks by
+# exactly their height, and the two words those rows carried (the allocator is
+# off rung 0, a tier is limited) become tags beside the label. Checked at
+# 100 / 125 / 150% DPI, where the text grows faster than the design pixels do.
+graph.write_limited(cfg, graph.read_graph(cfg)[graph.EXECUTIVE]["model"],
+                    "529 overloaded")
+folds = 0
+for scale in (1.0, 1.25, 1.5):
+    if not set_scale(scale):
+        continue
+    saved = check_graph_fold("fold-%s" % scale)
+    folds += 1
+    print("fold at %sx saves %spx" % (scale, saved))
+assert folds, "no scale could be set for the fold check"
+set_scale(1.0)
+
+# Rung 4 of the ladder is the one that moves a MODEL: the advisory lenses go
+# onto the workers' primary. `active_graph` resolves every tier against the
+# ceiling, so the active row for advisory still names config.json's model - the
+# folded line must name the one the allocator moved to, the same as the rung it
+# replaced, or the block announces ALLOC and then prints the model it left.
+moved = allocator._build(cfg, graph.read_graph(cfg), 4, 4, False)
+assert moved.graph[graph.ADVISORY]["model"] != moved.configured[
+    graph.ADVISORY]["model"], moved.graph
+allocator.write_state(cfg, moved, {}, {"up_polls": 0, "down_polls": 0},
+                      overlay.utcnow())
+ov._refresh()
+ov.root.update_idletasks()
+rung = ov.canvas.itemcget(ov.canvas.find_withtag("model_advisory")[0], "text")
+assert rung == overlay.short_model(moved.graph[graph.ADVISORY]["model"]), rung
+print("fold at step 4 agrees with the rung: %s" % rung)
+check_graph_fold("fold-step4")
+allocator.write_state(cfg, allocation, {}, {"up_polls": 0, "down_polls": 0},
+                      overlay.utcnow())
+graph.clear_limited(cfg)
+ov._graph_collapsed = False
+ov._refresh()
+ov.root.update_idletasks()
+
+# The box is a tap target, not just a drawing: a click on it folds the block,
+# records the flag and leaves every other key in state/overlay.json alone.
+(cfg.state_dir / "overlay.json").write_text(
+    json.dumps({"collapsed": False, "keep": 1}), encoding="utf-8")
+ov._graph_collapsed = False
+ov._refresh()
+ov.root.update_idletasks()
+box = ov.canvas.bbox("graph_toggle")
+assert box, "no fold box drawn"
+ov.canvas.event_generate("<ButtonPress-1>", x=int((box[0] + box[2]) // 2),
+                         y=int((box[1] + box[3]) // 2))
+ov.root.update()
+assert ov._graph_collapsed, "the fold box did not fold the block"
+stored = json.loads((cfg.state_dir / "overlay.json").read_text(encoding="utf-8"))
+assert stored == {"collapsed": False, "keep": 1, "graph_collapsed": True}, stored
+assert ov.canvas.find_withtag("graph_digest"), "no digest after the click"
+ov._graph_collapsed = False
+ov._refresh()
+ov.root.update_idletasks()
 
 # With the allocation cleared the ladder is the ceiling again, and the line
 # under it goes away rather than sitting there saying "step 0".
