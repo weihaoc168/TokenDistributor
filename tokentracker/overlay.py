@@ -8,7 +8,7 @@ import tkinter.font as tkfont
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .allocator import allocate
+from .allocator import MAX_STEP, allocate
 from .config import Config, reload_config
 from .control import RUNNING as CONTROL_RUNNING
 from .control import OPERATOR as CONTROL_OPERATOR
@@ -172,6 +172,89 @@ REPORT_AGE_H = 16
 # The screenshot policy's line, under the report age: how old the gallery is
 # and which of the two triggers fires next.
 SHOTS_LINE_H = 15
+# ------------------------------------------------------------- the two modes
+# The panel had grown to eleven blocks and nine tap targets, which is more than
+# a 300px card can say at a glance. BASIC is what the panel is *for* - the three
+# rings, what the loop is doing, the switch, the report - and everything that
+# tunes the loop rather than reporting it lives in the settings panels behind
+# the gear. GURU is the old panel, every block open, for a session spent driving
+# the allocator. The mode is remembered in state/overlay.json like every other
+# fold, so the panel comes back the way it was left.
+UI_BASIC = "basic"
+UI_GURU = "guru"
+UI_MODES = (UI_BASIC, UI_GURU)
+UI_MODE_KEY = "ui_mode"
+
+# The blocks the card can draw, named so `visible_blocks` can be a pure
+# function of the mode and the folds rather than a walk through `_refresh`.
+BLOCK_HEADER = "header"
+BLOCK_RINGS = "rings"
+BLOCK_STATUS = "status"
+BLOCK_CONTROLS = "controls"
+BLOCK_REPORT = "report"
+BLOCK_FOOTER = "footer"
+BLOCK_SETTINGS = "settings"
+BLOCK_SESSIONS = "sessions"
+BLOCK_DISTRIBUTION = "distribution"
+BLOCK_GRAPH = "graph"
+BLOCK_GOAL = "goal"
+BLOCK_THROTTLE = "throttle"
+BLOCK_ALLOC = "alloc"
+BLOCK_SHARES = "shares"
+BLOCK_REPORT_NOW = "report_now"
+BLOCK_SHOTS = "shots"
+# What BASIC shows outright. `settings` is the thin strip, not a panel.
+BASIC_BLOCKS = (BLOCK_HEADER, BLOCK_RINGS, BLOCK_STATUS, BLOCK_CONTROLS,
+                BLOCK_REPORT, BLOCK_FOOTER, BLOCK_SETTINGS)
+
+PANEL_BUDGET = "budget"
+PANEL_GRAPH = "graph"
+PANEL_SESSIONS = "sessions"
+PANELS = (PANEL_BUDGET, PANEL_GRAPH, PANEL_SESSIONS)
+PANEL_TITLES = {
+    PANEL_BUDGET: "Budget & pacing",
+    PANEL_GRAPH: "Agentic graph",
+    PANEL_SESSIONS: "Sessions & reports",
+}
+# Each panel's fold is its own key, so folding one never disturbs another.
+PANEL_FLAGS = {
+    PANEL_BUDGET: "panel_budget_open",
+    PANEL_GRAPH: "panel_graph_open",
+    PANEL_SESSIONS: "panel_sessions_open",
+}
+PANEL_BLOCKS = {
+    PANEL_BUDGET: (BLOCK_GOAL, BLOCK_THROTTLE, BLOCK_ALLOC, BLOCK_SHARES),
+    PANEL_GRAPH: (BLOCK_GRAPH,),
+    PANEL_SESSIONS: (BLOCK_SESSIONS, BLOCK_DISTRIBUTION, BLOCK_REPORT_NOW,
+                     BLOCK_SHOTS),
+}
+SETTINGS_KEY = "settings_open"
+SETTINGS_BLOCKS = tuple(b for p in PANELS for b in PANEL_BLOCKS[p])
+ALL_BLOCKS = BASIC_BLOCKS + SETTINGS_BLOCKS
+# Draw order. GURU is the panel exactly as it was; BASIC puts the switch right
+# under the status band and hangs the settings strip off it. ALLOC and SHARES
+# are not rows of their own in GURU - the ALLOCATION line is drawn under the
+# ladder there and the shares ARE the ladder's bars - so they are visible
+# without being placed.
+GURU_ORDER = (BLOCK_SESSIONS, BLOCK_DISTRIBUTION, BLOCK_GRAPH, BLOCK_GOAL,
+              BLOCK_CONTROLS, BLOCK_THROTTLE, BLOCK_REPORT)
+BASIC_ORDER = (BLOCK_STATUS, BLOCK_CONTROLS, BLOCK_SETTINGS, BLOCK_REPORT)
+# BASIC's own status band: the mode word on one row, the reason and the resume
+# time on the red band under it (the same sentence `tracker.py status` prints).
+STATUS_ROW_H = 26
+# The thin "Settings" strip under START/STOP, and the panel rows it opens.
+SETTINGS_STRIP_H = 22
+PANEL_HEAD_H = 20
+PANEL_DIGEST_H = 15
+PANEL_TOGGLE_W = 13
+PANEL_GAP = 4
+# The gear menu: a canvas overlay at the top of the card, drawn last so it sits
+# over whatever it covers, and dismissed by the gear again or a tap outside it.
+MENU_TOP = 34
+MENU_ROW_H = 22
+MENU_PAD = 5
+MENU_RADIO_R = 3.5
+MENU_TEXT_X = 24
 # Red band naming the stop point, drawn under the mode label when stop.json is
 # on disk (expanded), or across the usage readouts (collapsed).
 STOP_BAND_H = 20
@@ -596,7 +679,71 @@ def digest_tags(alloc: bool = False, limited: bool = False) -> list[tuple[str, s
     return tags
 
 
+def normalize_mode(value) -> str:
+    """`value` as one of UI_MODES; anything else reads as BASIC.
+
+    BASIC is the default on purpose: a hand-edited or half-written
+    state/overlay.json must degrade to the small card, never to the big one.
+    """
+    return value if value in UI_MODES else UI_BASIC
+
+
+def visible_blocks(mode: str, settings_open: bool = False,
+                   panels=None) -> set[str]:
+    """Which blocks the expanded card draws, for this mode and these folds.
+
+    Pure, and the single answer both `_refresh`'s layout walk and the tests
+    read. GURU is every block. BASIC is the six essentials plus the settings
+    strip, and a settings block appears only while the strip is open AND its
+    own panel is unfolded - which is what makes the basic card materially
+    shorter than the guru one rather than the same card with a lid on it.
+    """
+    if normalize_mode(mode) == UI_GURU:
+        return set(ALL_BLOCKS)
+    blocks = set(BASIC_BLOCKS)
+    if settings_open:
+        folds = panels if isinstance(panels, dict) else {}
+        for panel in PANELS:
+            if folds.get(panel):
+                blocks |= set(PANEL_BLOCKS[panel])
+    return blocks
+
+
+def menu_items(mode: str, throttle: bool = False) -> list[tuple[str, str, object]]:
+    """(tag, label, checked) for the gear menu, top to bottom. Pure.
+
+    `checked` is None for a plain item and a bool for the two mode radios.
+    "Settings..." is a BASIC item only: in GURU every panel is already open, so
+    the entry would have nothing to expand.
+    """
+    guru = normalize_mode(mode) == UI_GURU
+    items: list[tuple[str, str, object]] = [
+        ("menu_basic", "Basic mode", not guru),
+        ("menu_guru", "Guru mode", guru),
+    ]
+    if not guru:
+        items.append(("menu_settings", "Settings...", None))
+    items += [
+        ("menu_report", "Report now", None),
+        ("menu_throttle",
+         "Full throttle off" if throttle else "Full throttle on", None),
+        ("menu_open", "Open latest report", None),
+        ("menu_close", "Close overlay", None),
+    ]
+    return items
+
+
+MENU_TAGS = tuple(tag for tag, _l, _c in menu_items(UI_BASIC))
+
+
 class Overlay:
+    # Class-level so an Overlay built with __new__ (the tests' half-built
+    # panel, and any handler reached before __init__ finished) still has a
+    # mode and a closed menu to read.
+    _ui_mode = UI_BASIC
+    _menu_open = False
+    _settings_open = False
+    _menu_press = None
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.delta = (cfg.overlay_offset_x, cfg.overlay_offset_y)
@@ -626,6 +773,18 @@ class Overlay:
         # whole panel's: the two are independent, and a panel reopened with its
         # ladder unexpectedly back is the bug this file exists to avoid.
         self._graph_collapsed = self._load_flag("graph_collapsed")
+        # BASIC unless the operator switched to GURU and the file remembers it.
+        self._ui_mode = normalize_mode(
+            self._read_overlay_state().get(UI_MODE_KEY))
+        # The settings strip's own fold, and one fold per panel under it. All
+        # four are separate keys for the same reason `graph_collapsed` is:
+        # folding one pane must never reopen another.
+        self._settings_open = self._load_flag(SETTINGS_KEY)
+        self._panel_open = {p: self._load_flag(PANEL_FLAGS[p]) for p in PANELS}
+        # The gear menu is never persisted: a panel that came back with a menu
+        # hanging open would be a panel nobody could read.
+        self._menu_open = False
+        self._session_count = 0
 
         _enable_dpi_awareness()
         self.root = tk.Tk()
@@ -689,6 +848,22 @@ class Overlay:
         self.canvas.tag_bind("report_now", "<Button-1>", self._click_report_now)
         self.canvas.tag_bind("min_btn", "<Button-1>", self._toggle_collapsed)
         self.canvas.tag_bind("close_btn", "<Button-1>", self._click_close)
+        self.canvas.tag_bind("gear_btn", "<Button-1>", self._toggle_menu)
+        self.canvas.tag_bind("settings_strip", "<Button-1>",
+                             self._toggle_settings)
+        self.canvas.tag_bind("panel_budget", "<Button-1>",
+                             self._toggle_panel_budget)
+        self.canvas.tag_bind("panel_graph", "<Button-1>",
+                             self._toggle_panel_graph)
+        self.canvas.tag_bind("panel_sessions", "<Button-1>",
+                             self._toggle_panel_sessions)
+        self.canvas.tag_bind("menu_basic", "<Button-1>", self._menu_basic)
+        self.canvas.tag_bind("menu_guru", "<Button-1>", self._menu_guru)
+        self.canvas.tag_bind("menu_settings", "<Button-1>", self._menu_settings)
+        self.canvas.tag_bind("menu_report", "<Button-1>", self._menu_report)
+        self.canvas.tag_bind("menu_throttle", "<Button-1>", self._menu_throttle)
+        self.canvas.tag_bind("menu_open", "<Button-1>", self._menu_open_report)
+        self.canvas.tag_bind("menu_close", "<Button-1>", self._menu_close)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
 
     def _collapsed_file(self) -> Path:
@@ -706,14 +881,20 @@ class Overlay:
         return bool(self._read_overlay_state().get(key))
 
     def _write_flag(self, key: str, value: bool) -> None:
-        """Persist ONE pane flag, keeping every other key in the file.
+        """Persist ONE pane flag, keeping every other key in the file."""
+        self._write_setting(key, bool(value))
+
+    def _write_setting(self, key: str, value) -> None:
+        """Persist ONE key, keeping every other key in the file.
 
         A write of `{key: value}` alone would drop the panel's own `collapsed`
         the first time the graph was folded (and vice versa), so the file is
-        read back and merged: every flag here is another pane's memory.
+        read back and merged: every flag here is another pane's memory. The
+        mode goes through the same door, which is why it is a value rather than
+        a flag: `ui_mode` is a word, not a bool.
         """
         data = self._read_overlay_state()
-        data[key] = bool(value)
+        data[key] = value
         try:
             path = self._collapsed_file()
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -733,6 +914,99 @@ class Overlay:
         self._write_flag("graph_collapsed", self._graph_collapsed)
         self._refresh()
         return "break"
+
+    # ------------------------------------------------- the mode and the menu
+
+    def _claim_press(self, event) -> None:
+        """Record which press a gear/menu tap has already answered.
+
+        A canvas ITEM binding returning "break" does not stop the canvas's own
+        widget binding, so the press that opens the menu still reaches
+        `_drag_start` - which would close it again in the same click. The
+        serial is claimed here and skipped there.
+        """
+        self._menu_press = getattr(event, "serial", None)
+
+    def _set_ui_mode(self, mode: str) -> str:
+        """Switch BASIC <-> GURU and remember it, closing the menu behind it."""
+        self._ui_mode = normalize_mode(mode)
+        self._write_setting(UI_MODE_KEY, self._ui_mode)
+        self._menu_open = False
+        self._refresh()
+        return "break"
+
+    def _toggle_menu(self, event: tk.Event) -> str:
+        """The gear: open the menu, or close the one already open."""
+        self._claim_press(event)
+        self._menu_open = not self._menu_open
+        self._refresh()
+        return "break"
+
+    def _menu_basic(self, event: tk.Event) -> str:
+        self._claim_press(event)
+        return self._set_ui_mode(UI_BASIC)
+
+    def _menu_guru(self, event: tk.Event) -> str:
+        self._claim_press(event)
+        return self._set_ui_mode(UI_GURU)
+
+    def _menu_settings(self, event: tk.Event) -> str:
+        """"Settings...": expand the settings panels, from the menu."""
+        self._claim_press(event)
+        self._menu_open = False
+        self._settings_open = True
+        self._write_flag(SETTINGS_KEY, True)
+        self._refresh()
+        return "break"
+
+    def _menu_report(self, event: tk.Event) -> str:
+        self._claim_press(event)
+        self._menu_open = False
+        return self._click_report_now(event)
+
+    def _menu_throttle(self, event: tk.Event) -> str:
+        self._claim_press(event)
+        self._menu_open = False
+        return self._toggle_throttle(event)
+
+    def _menu_open_report(self, event: tk.Event) -> str:
+        self._claim_press(event)
+        self._menu_open = False
+        self._refresh()
+        return self._click_view_report(event)
+
+    def _menu_close(self, event: tk.Event) -> str:
+        self._claim_press(event)
+        self._menu_open = False
+        return self._click_close(event)
+
+    # ----------------------------------------------- the settings panel folds
+
+    def _toggle_settings(self, _event: tk.Event) -> str:
+        """The thin "Settings" strip under START/STOP."""
+        self._settings_open = not self._settings_open
+        self._write_flag(SETTINGS_KEY, self._settings_open)
+        self._refresh()
+        return "break"
+
+    def _toggle_panel(self, panel: str) -> str:
+        folds = getattr(self, "_panel_open", None)
+        if not isinstance(folds, dict):
+            folds = {}
+            self._panel_open = folds
+        folds[panel] = not folds.get(panel)
+        self._write_flag(PANEL_FLAGS[panel], folds[panel])
+        self._refresh()
+        return "break"
+
+    def _toggle_panel_budget(self, _event: tk.Event) -> str:
+        return self._toggle_panel(PANEL_BUDGET)
+
+    def _toggle_panel_graph(self, _event: tk.Event) -> str:
+        return self._toggle_panel(PANEL_GRAPH)
+
+    def _toggle_panel_sessions(self, _event: tk.Event) -> str:
+        return self._toggle_panel(PANEL_SESSIONS)
 
     def _draw_min_button(self, cx: float, cy: float, collapsed: bool) -> None:
         # Custom because the window has no OS title bar (overrideredirect).
@@ -757,10 +1031,36 @@ class Overlay:
         self.canvas.create_line(cx - w, cy + w, cx + w, cy - w, fill=FG,
                                 width=stroke, tags="close_btn")
 
+    def _draw_gear_button(self, cx: float, cy: float) -> None:
+        """The settings gear, left of close: the menu's only tap target.
+
+        A ring with four teeth rather than the mascot's animated wheel - it has
+        to read as a control at 16 design px, in the same box style as the two
+        buttons beside it, and it must never be mistaken for the gear turning
+        in the middle of the weekly ring.
+        """
+        h = self._pxf(8)
+        self._round_rect(cx - h, cy - h, cx + h, cy + h, self._pxf(4),
+                         fill=SUB_BG, outline=BORDER, width=1, tags="gear_btn")
+        r = self._pxf(4.0)
+        stroke = max(1, self._px(1.5))
+        self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill="",
+                                outline=FG, width=stroke, tags="gear_btn")
+        tooth = self._pxf(2.0)
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            self.canvas.create_line(cx + dx * r, cy + dy * r,
+                                    cx + dx * (r + tooth), cy + dy * (r + tooth),
+                                    fill=FG, width=stroke, tags="gear_btn")
+
     def _draw_title_buttons(self, min_cx: float, cy: float,
-                            collapsed: bool) -> None:
+                            collapsed: bool, gear: bool = False) -> None:
         # Close sits immediately left of minimize; minimize keeps its corner.
-        self._draw_close_button(min_cx - self._pxf(TITLE_BTN_STEP), cy)
+        # The gear takes the next step left, and only on the expanded card:
+        # the one-line collapsed bar is unchanged in both modes.
+        step = self._pxf(TITLE_BTN_STEP)
+        if gear:
+            self._draw_gear_button(min_cx - 2 * step, cy)
+        self._draw_close_button(min_cx - step, cy)
         self._draw_min_button(min_cx, cy, collapsed=collapsed)
 
     def _draw_fork_chip(self, x0: float, cy: float, right_limit: float) -> None:
@@ -897,9 +1197,24 @@ class Overlay:
         self.root.lift()
         self.root.attributes("-topmost", True)
 
-    def _drag_start(self, event: tk.Event) -> None:
+    def _drag_start(self, event: tk.Event):
+        if (self._menu_press is not None
+                and getattr(event, "serial", None) == self._menu_press):
+            # The gear or a menu row already answered THIS press. A canvas item
+            # binding's "break" does not stop the canvas's own widget binding,
+            # so without this the press that opened the menu would arrive here
+            # and close it again in the same click.
+            self._menu_press = None
+            return "break"
+        if self._menu_open:
+            # A tap anywhere else closes the menu and does nothing else -
+            # swallowed, or the same press would start a drag of the panel.
+            self._menu_open = False
+            self._refresh()
+            return "break"
         self._drag_origin = (event.x_root, event.y_root,
                              self.root.winfo_x(), self.root.winfo_y())
+        return None
 
     def _drag_move(self, event: tk.Event) -> None:
         if self._drag_origin is None:
@@ -1101,16 +1416,61 @@ class Overlay:
         return alloc.line()
 
     def _ladder_notes(self) -> list[tuple[str, str, str]]:
-        """The (text, colour, tag) lines drawn under the rungs, in order."""
+        """The (text, colour, tag) lines drawn under the rungs, in order.
+
+        In BASIC the ALLOCATION line belongs to the "Budget & pacing" panel,
+        which is where an operator goes to change the thing it reports; drawing
+        it here as well would print the same sentence twice on one card.
+        """
         lines: list[tuple[str, str, str]] = []
         active = self._active_note()
         if active:
             lines.append((active, AMBER, "ladder_note"))
-        alloc = self._alloc_note()
+        alloc = self._alloc_note() if self._ui_mode == UI_GURU else None
         if alloc:
             override = bool(getattr(self._alloc, "override", False))
             lines.append((alloc, RED if override else BLUE, "alloc_note"))
         return lines
+
+    def _shares_line(self) -> str:
+        """"shares  in E60/A20/W20 · out E20/A20/W60" for the budget panel.
+
+        The same numbers the ladder's bars draw, as one line: the panel that
+        holds the pacing controls should say where the tokens went without
+        needing the ladder open beside it.
+        """
+        shares = self._shares if isinstance(self._shares, dict) else {}
+        cols: list[list[str]] = [[], []]
+        for tier in TIERS:
+            row = shares.get(tier)
+            row = row if isinstance(row, dict) else {}
+            for i, key in enumerate(("input_share", "output_share")):
+                value = float(row.get(key, 0.0) or 0.0)
+                cols[i].append(f"{tier[0].upper()}{min(max(value, 0.0), 1.0):.0%}")
+        return f"shares  in {'/'.join(cols[0])}  ·  out {'/'.join(cols[1])}"
+
+    def _budget_digest(self) -> str:
+        """"goal 95% · AUTO · rung 1/5" - the folded budget panel's one line."""
+        goal = self._goal if isinstance(self._goal, (int, float)) else GOAL_FALLBACK
+        if isinstance(goal, bool) or not math.isfinite(float(goal)):
+            goal = GOAL_FALLBACK
+        lane = "THROTTLE" if self._throttle else "AUTO"
+        step = getattr(self._alloc, "step", 0)
+        step = int(step) if isinstance(step, (int, float)) else 0
+        return f"goal {float(goal):.0%} · {lane} · rung {step}/{MAX_STEP}"
+
+    def _sessions_digest(self) -> str:
+        """"5 sessions · report 4m ago" - the folded sessions panel's line."""
+        count = int(getattr(self, "_session_count", 0) or 0)
+        label = f"{count} session" if count == 1 else f"{count} sessions"
+        return f"{label} · {self._report_age or 'no report yet'}"
+
+    def _panel_digest(self, panel: str, avail: float) -> str:
+        if panel == PANEL_GRAPH:
+            return self._graph_digest_line(avail)
+        if panel == PANEL_BUDGET:
+            return self._budget_digest()
+        return self._sessions_digest()
 
     def _draw_graph_toggle(self, cx: float, cy: float, collapsed: bool) -> None:
         """The AGENTIC GRAPH block's fold box, in the minimize button's style.
@@ -1212,6 +1572,16 @@ class Overlay:
                 font=FONT_MONO, anchor="e", fill=color if emphasis else DIM,
                 tags=("ladder", f"share_{kind}_{tier}"))
 
+    def _graph_digest_line(self, avail: float) -> str:
+        """The widest of `graph_digest`'s forms that fits `avail`."""
+        text = ""
+        for form in DIGEST_FORMS:
+            text = graph_digest(self._alloc.graph, self._graph, self._active,
+                                form)
+            if self._font_small.measure(text) <= avail:
+                break
+        return text
+
     def _draw_graph_digest(self, x0: float, y0: float, x1: float,
                            row_h: float) -> None:
         """The folded block's one line: every tier, its model and its counts.
@@ -1222,15 +1592,10 @@ class Overlay:
         when even the tightest form is too wide does it get an ellipsis.
         """
         avail = x1 - x0
-        text = ""
-        for form in DIGEST_FORMS:
-            text = graph_digest(self._alloc.graph, self._graph, self._active,
-                                form)
-            if self._font_small.measure(text) <= avail:
-                break
         self.canvas.create_text(
             x0, y0 + row_h / 2,
-            text=self._fit(text, self._font_small, avail),
+            text=self._fit(self._graph_digest_line(avail), self._font_small,
+                           avail),
             font=FONT_SMALL, fill=SILVER, anchor="w",
             tags=("ladder", "graph_digest"))
 
@@ -1527,12 +1892,29 @@ class Overlay:
         self._refresh()
         return "break"
 
-    def _draw_report_row(self, x0: float, y0: float, x1: float, y1: float) -> None:
-        """VIEW REPORT (dimmed until one exists) beside a REPORT NOW tap target."""
+    def _draw_report_now(self, x0: float, y0: float, x1: float,
+                         y1: float) -> None:
+        """REPORT NOW on its own, full width: the settings panel's form of it."""
+        P = self._px
+        self._round_rect(x0, y0, x1, y1, self._pxf(12), fill=SUB_BG,
+                         outline=GREEN, width=1, tags="report_now")
+        self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                                text=self._fit("REPORT NOW", self._font_bold,
+                                               (x1 - x0) - P(10)),
+                                font=FONT_BOLD, fill=GREEN, tags="report_now")
+
+    def _draw_report_row(self, x0: float, y0: float, x1: float, y1: float,
+                         now: bool = True) -> None:
+        """VIEW REPORT (dimmed until one exists) beside a REPORT NOW tap target.
+
+        `now=False` is BASIC's form: REPORT NOW has moved into the "Sessions &
+        reports" panel, so VIEW REPORT takes the whole width rather than
+        leaving an 84px hole where a button used to be.
+        """
         P = self._px
         gap = P(CTL_BTN_GAP)
         now_w = P(REPORT_NOW_W)
-        view_x1 = max(x0 + P(60), x1 - now_w - gap)
+        view_x1 = x1 if not now else max(x0 + P(60), x1 - now_w - gap)
         have = self._report is not None
         color = BLUE if have else DIM
         self._round_rect(x0, y0, view_x1, y1, self._pxf(12), fill=SUB_BG,
@@ -1542,6 +1924,8 @@ class Overlay:
                                 text=self._fit(label, self._font_bold,
                                                (view_x1 - x0) - P(10)),
                                 font=FONT_BOLD, fill=color, tags="view_report")
+        if not now:
+            return
         self._round_rect(view_x1 + gap, y0, x1, y1, self._pxf(12), fill=SUB_BG,
                          outline=GREEN, width=1, tags="report_now")
         self.canvas.create_text((view_x1 + gap + x1) / 2, (y0 + y1) / 2,
@@ -1612,6 +1996,108 @@ class Overlay:
         self._round_rect(x0, y0, x1, y1, self._pxf(10), fill=SUB_BG,
                          outline=outline, width=1 if outline else 0)
 
+    # ------------------------------------------------- BASIC's own furniture
+
+    def _draw_status_band(self, x0: float, y0: float, x1: float,
+                          label: str | None, mode: str | None,
+                          stop_text: str | None, band_h: float) -> None:
+        """BASIC's one block for "what is the loop doing".
+
+        The mode word in its own colour on a strip of its own, and under it -
+        only when there is one - the red band carrying the reason dispatch is
+        parked and the reset that lifts it, which is the same sentence
+        `tracker.py status` prints.
+        """
+        P = self._px
+        row_h = P(STATUS_ROW_H)
+        color = MODE_COLORS.get(mode or "", FG)
+        self._sub_card(x0, y0, x1, y0 + row_h, outline=color)
+        self.canvas.create_text(
+            (x0 + x1) / 2, y0 + row_h / 2,
+            text=self._fit(label or "?", self._font_bold, (x1 - x0) - P(16)),
+            font=FONT_BOLD, fill=color, tags="status_band")
+        if stop_text:
+            band_y = y0 + row_h + P(6)
+            self._draw_stop_band(x0, band_y, x1, band_y + band_h, stop_text)
+
+    def _draw_settings_strip(self, x0: float, y0: float, x1: float,
+                             y1: float) -> None:
+        """The thin strip that opens the settings panels, under START/STOP."""
+        P = self._px
+        self._round_rect(x0, y0, x1, y1, self._pxf(9), fill=SUB_BG,
+                         outline=BORDER, width=1, tags="settings_strip")
+        self.canvas.create_text(x0 + P(10), (y0 + y1) / 2, text="Settings",
+                                font=FONT_SMALL, fill=DIM, anchor="w",
+                                tags="settings_strip")
+        self.canvas.create_text(
+            x1 - P(10), (y0 + y1) / 2,
+            text="hide" if self._settings_open else "show",
+            font=FONT_SMALL, fill=DIM, anchor="e", tags="settings_strip")
+
+    def _draw_panel_head(self, panel: str, x0: float, y0: float, x1: float,
+                         y1: float) -> None:
+        """One settings panel's header row: its title and its own fold box."""
+        P = self._px
+        tag = f"panel_{panel}"
+        open_ = bool(getattr(self, "_panel_open", {}).get(panel))
+        cy = (y0 + y1) / 2
+        # The whole row is the tap target, not just the box: a 13px chevron is
+        # not a target on a panel this small.
+        self._round_rect(x0, y0, x1, y1, self._pxf(6), fill=CARD_BG,
+                         outline="", width=0, tags=tag)
+        self.canvas.create_text(x0 + P(2), cy, text=PANEL_TITLES[panel],
+                                font=FONT_BOLD, fill=FG if open_ else DIM,
+                                anchor="w", tags=tag)
+        h = self._pxf(PANEL_TOGGLE_W) / 2
+        cx = x1 - h
+        self._round_rect(cx - h, cy - h, cx + h, cy + h, self._pxf(3),
+                         fill=SUB_BG, outline=BORDER, width=1, tags=tag)
+        w = self._pxf(3)
+        dy = self._pxf(1.5)
+        near, far = (cy - dy, cy + dy) if not open_ else (cy + dy, cy - dy)
+        self.canvas.create_line(cx - w, near, cx, far, cx + w, near, fill=FG,
+                                width=max(1, self._px(1.5)), tags=tag)
+
+    def _draw_panel_digest(self, panel: str, x0: float, y0: float, x1: float,
+                           row_h: float) -> None:
+        """The one line a folded settings panel leaves behind."""
+        avail = x1 - x0
+        self.canvas.create_text(
+            x0, y0 + row_h / 2,
+            text=self._fit(self._panel_digest(panel, avail), self._font_small,
+                           avail),
+            font=FONT_SMALL, fill=SILVER, anchor="w",
+            tags=("panel_digest", f"digest_{panel}"))
+
+    def _draw_menu(self, x0: float, y0: float, x1: float) -> None:
+        """The gear menu, drawn last so it sits over whatever it covers."""
+        P = self._px
+        items = menu_items(self._ui_mode, self._throttle)
+        row_h = P(MENU_ROW_H)
+        pad = P(MENU_PAD)
+        y1 = y0 + 2 * pad + len(items) * row_h
+        self._round_rect(x0, y0, x1, y1, self._pxf(10), fill=SUB_BG,
+                         outline=BORDER, width=1, tags="menu_bg")
+        for i, (tag, label, checked) in enumerate(items):
+            ry0 = y0 + pad + i * row_h
+            cy = ry0 + row_h / 2
+            # Each row is filled, not transparent: an unfilled canvas rectangle
+            # only answers clicks on its outline.
+            self._round_rect(x0 + P(3), ry0, x1 - P(3), ry0 + row_h,
+                             self._pxf(6), fill=SUB_BG, outline="", width=0,
+                             tags=tag)
+            if checked is not None:
+                r = self._pxf(MENU_RADIO_R)
+                cx = x0 + P(MENU_TEXT_X) - P(10)
+                self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                        fill=AMBER if checked else "",
+                                        outline=AMBER if checked else DIM,
+                                        width=1, tags=tag)
+            self.canvas.create_text(
+                x0 + P(MENU_TEXT_X), cy,
+                text=self._fit(label, self._font, (x1 - x0) - P(MENU_TEXT_X + 8)),
+                font=FONT, fill=FG, anchor="w", tags=tag)
+
     def _draw_gear_face(self, cx: float, cy: float) -> None:
         f = self._pxf
         self.canvas.create_oval(cx - f(12), cy - f(12), cx + f(12), cy + f(12),
@@ -1672,6 +2158,111 @@ class Overlay:
                                 font=FONT_BIG, fill=FG)
         self.canvas.create_text(cx, cy + self._pxf(13), text=label,
                                 font=FONT_SMALL, fill=DIM)
+
+    def _draw_sessions_block(self, top: float, shown: list, others: list,
+                             has_main: bool, n_total: int, cards_h: float,
+                             card_h: float, card_gap: float) -> None:
+        """"Live sessions" and its cards. GURU's third block, BASIC's panel."""
+        P = self._px
+        width = self.width
+        pad = P(PAD)
+        # `top` is the block's TOP EDGE; the header text is centred a lead-in
+        # below it, so a settings panel head can sit flush against the block
+        # without the "Live sessions" line rising into it.
+        head_y = top + P(8)
+        cards_y = top + P(24)
+        self.canvas.create_text(pad, head_y, text="Live sessions",
+                                font=FONT_BOLD, fill=FG, anchor="w")
+        self.canvas.create_text(width - pad, head_y, text=f"{n_total} active",
+                                font=FONT_SMALL, fill=DIM, anchor="e")
+        if not shown:
+            self.canvas.create_text(pad, cards_y + P(4),
+                                    text="no active sessions",
+                                    font=FONT_SMALL, fill=DIM, anchor="w")
+            return
+        for i, (kind, sess) in enumerate(shown):
+            y0 = cards_y + i * (card_h + card_gap)
+            self._sub_card(pad - P(6), y0, width - pad + P(6), y0 + card_h,
+                           outline=GREEN if kind == "main" else "")
+            name_x = pad + P(6)
+            name_y = y0 + P(13)
+            detail_y = y0 + P(31)
+            if kind == "main":
+                self.canvas.create_oval(pad + P(5), y0 + P(9),
+                                        pad + P(13), y0 + P(17),
+                                        fill=GREEN, outline="")
+                name_x = pad + P(19)
+            name = self._fit(sess["name"], self._font_bold,
+                             (width - pad) - name_x - P(6))
+            self.canvas.create_text(name_x, name_y, text=name,
+                                    font=FONT_BOLD, fill=FG, anchor="w")
+            age_px = self._font_small.measure(sess["age"])
+            detail = self._fit(sess["detail"], self._font_small,
+                               (width - pad - P(6)) - (pad + P(6))
+                               - age_px - P(10))
+            self.canvas.create_text(pad + P(6), detail_y, text=detail,
+                                    font=FONT_SMALL, fill=DIM, anchor="w")
+            self.canvas.create_text(width - pad - P(6), detail_y,
+                                    text=sess["age"],
+                                    font=FONT_SMALL, fill=DIM, anchor="e")
+        if self._max_scroll <= 0:
+            return
+        first_other = 1 if has_main else 0
+        track_y0 = cards_y + first_other * (card_h + card_gap)
+        track_y1 = cards_y + cards_h - card_gap
+        track_x = width - pad + P(9)
+        bar_w = max(2, P(SCROLLBAR_W))
+        self.canvas.create_rectangle(track_x, track_y0, track_x + bar_w,
+                                     track_y1, fill=TRACK, outline="")
+        track_h = track_y1 - track_y0
+        thumb_h = max(self._pxf(14), track_h * OTHERS_VISIBLE / len(others))
+        thumb_y = track_y0 + (track_h - thumb_h) * (
+            self._scroll_idx / self._max_scroll)
+        self.canvas.create_rectangle(track_x, thumb_y, track_x + bar_w,
+                                     thumb_y + thumb_h, fill=DIM, outline="")
+
+    def _draw_distribution_block(self, top: float, rows: list, row_h: float,
+                                 mode, mode_label, stop_text, band_h: float,
+                                 rows_off: float, footer_off: float,
+                                 footer_left: str, footer_right: str) -> None:
+        """"Token distribution": the header, the mode word, the share rows."""
+        P = self._px
+        width = self.width
+        pad = P(PAD)
+        # Same lead-in as the sessions block: `top` is the edge, the header
+        # line is centred P(8) under it.
+        head_y = top + P(8)
+        self.canvas.create_text(pad, head_y, text="Token distribution",
+                                font=FONT_BOLD, fill=FG, anchor="w")
+        if mode_label:
+            avail = (width - 2 * pad
+                     - self._font_bold.measure("Token distribution") - P(10))
+            self.canvas.create_text(
+                width - pad, head_y,
+                text=self._fit(mode_label, self._font_bold, avail),
+                font=FONT_BOLD, anchor="e", fill=MODE_COLORS.get(mode, FG))
+        if stop_text:
+            band_y = head_y + P(12)
+            self._draw_stop_band(pad - P(6), band_y, width - pad + P(6),
+                                 band_y + band_h, stop_text)
+        for i, (dot, label, value) in enumerate(rows):
+            y = top + rows_off + i * row_h + row_h / 2
+            self.canvas.create_oval(pad + P(1), y - P(4), pad + P(9), y + P(4),
+                                    fill=dot, outline="")
+            label = self._fit(label, self._font,
+                              (width - pad) - (pad + P(18))
+                              - self._font.measure(value) - P(10))
+            self.canvas.create_text(pad + P(18), y, text=label, font=FONT,
+                                    fill=FG, anchor="w")
+            self.canvas.create_text(width - pad, y, text=value, font=FONT,
+                                    fill=DIM, anchor="e")
+        if footer_left or footer_right:
+            self.canvas.create_text(pad, top + footer_off + P(6),
+                                    text=footer_left, font=FONT_SMALL,
+                                    fill=DIM, anchor="w")
+            self.canvas.create_text(width - pad, top + footer_off + P(6),
+                                    text=footer_right, font=FONT_SMALL,
+                                    fill=DIM, anchor="e")
 
     def _refresh(self) -> None:
         P = self._px
@@ -1798,6 +2389,7 @@ class Overlay:
                 updated_line = ("updated just now" if age_s < 30
                                 else f"updated {int(age_s // 60)}m ago")
 
+        local_only = False
         if self._control == CONTROL_STOPPED:
             # The operator switch wins over the last written decision, so a
             # stopped overlay never claims to be pacing - and it still says so
@@ -1807,6 +2399,10 @@ class Overlay:
             local_only = self._record.get("mode") == CONTROL_LOCAL_ONLY
             mode = "local-only" if local_only else "stopped"
             mode_label = "LOCAL" if local_only else "STOPPED"
+        # BASIC's status band owns a whole row, so it spells the word out; the
+        # GURU header shares its row with "Token distribution" and cannot.
+        status_label = ("LOCAL-ONLY" if local_only
+                        else mode_label or ("OFFLINE" if state is None else "?"))
 
         main_ids = set(self.cfg.main_session_ids)
         alive = {s["sid"]: s for s in sessions}
@@ -1823,44 +2419,96 @@ class Overlay:
         shown = (([("main", main_sess)] if main_sess else [])
                  + [("other", s) for s in visible])
         n_total = len(sessions)
+        # The folded sessions panel reads this instead of the list it no longer
+        # draws, so the digest has to be refreshed on the same pass that counts.
+        self._session_count = n_total
 
         card_h = P(SESSION_CARD_H)
         card_gap = P(SESSION_CARD_GAP)
         row_h = P(ROW_H)
         gauge_bottom = P(GAUGE_CY) + P(GAUGE_RADIUS)
-        sess_header_y = gauge_bottom + (P(54) if info_line else P(34))
-        cards_y = sess_header_y + P(16)
         cards_h = (len(shown) * (card_h + card_gap)) if shown else P(18)
-        dist_header_y = cards_y + cards_h + P(16)
         stop_text = self._stop_text()
-        # The stop band sits between the mode label and the first share row, so
-        # the rows move down by exactly the band it makes room for.
-        band_y0 = dist_header_y + P(12)
         band_h = P(STOP_BAND_H) if stop_text else 0
-        rows_y = dist_header_y + P(26) + (band_h + P(6) if stop_text else 0)
-        footer_y = rows_y + len(rows) * row_h + P(12)
-        # AGENTIC GRAPH ladder, WEEKLY GOAL row, START/STOP, FULL THROTTLE,
-        # then the report row and its age line: the card grows by each block
-        # plus its gap, so nothing overlaps the bottom status line at any DPI.
-        graph_y = footer_y + P(20)
-        goal_y = graph_y + self._ladder_height() + P(8)
-        ctl_y = goal_y + P(GOAL_ROW_H) + P(BTN_ROW_GAP)
-        btn_y = ctl_y + P(BTN_H) + P(BTN_ROW_GAP)
-        rep_y = btn_y + P(BTN_H) + P(BTN_ROW_GAP)
-        age_y = rep_y + P(REPORT_BTN_H) + P(REPORT_AGE_H) / 2
         shots_h = P(SHOTS_LINE_H) if self._shots else 0
-        shots_y = rep_y + P(REPORT_BTN_H) + P(REPORT_AGE_H) + shots_h / 2
-        height = rep_y + P(REPORT_BTN_H) + P(REPORT_AGE_H) + shots_h + P(30)
+        note_h = self._text_row(LADDER_NOTE_H, self._font_small)
+        guru = self._ui_mode == UI_GURU
+        folds = getattr(self, "_panel_open", {})
+        blocks = visible_blocks(self._ui_mode, self._settings_open, folds)
+        alloc_note = self._alloc_note()
+
+        # Every block's height INCLUDES the gap under it, so the layout below is
+        # one cursor down the card and every combination of modes and folds
+        # lands on a card exactly as tall as what it drew. The stop band sits
+        # between the mode label and the first share row, so the rows move down
+        # by exactly the band that made room for them.
+        dist_rows_off = P(8) + P(26) + (band_h + P(6) if stop_text else 0)
+        dist_footer_off = dist_rows_off + len(rows) * row_h + P(12)
+        heights = {
+            BLOCK_STATUS: (P(STATUS_ROW_H) + (P(6) + band_h if stop_text else 0)
+                           + P(BTN_ROW_GAP)),
+            BLOCK_CONTROLS: P(BTN_H) + P(BTN_ROW_GAP),
+            BLOCK_SETTINGS: P(SETTINGS_STRIP_H) + P(BTN_ROW_GAP),
+            BLOCK_SESSIONS: P(24) + cards_h + P(8),
+            BLOCK_DISTRIBUTION: dist_footer_off + P(12),
+            BLOCK_GRAPH: P(8) + self._ladder_height() + P(8),
+            BLOCK_GOAL: P(GOAL_ROW_H) + P(BTN_ROW_GAP),
+            BLOCK_THROTTLE: P(BTN_H) + P(BTN_ROW_GAP),
+            BLOCK_ALLOC: (note_h + P(2)) if alloc_note else 0,
+            BLOCK_SHARES: note_h + P(2),
+            BLOCK_REPORT_NOW: P(BTN_H) + P(BTN_ROW_GAP),
+            BLOCK_SHOTS: shots_h,
+            # Last in both modes, so it carries no trailing gap of its own:
+            # the card's bottom padding is that gap.
+            BLOCK_REPORT: (P(REPORT_BTN_H) + P(REPORT_AGE_H)
+                           + (shots_h if guru else 0)),
+        }
+        head_h = P(PANEL_HEAD_H) + P(PANEL_GAP)
+        digest_row = self._text_row(PANEL_DIGEST_H, self._font_small)
+        digest_h = digest_row + P(PANEL_GAP)
+
+        # GURU is the panel as it always was: every block, in the old order.
+        # BASIC is the four essentials, with the settings panels wedged between
+        # the switch and the report row while the strip is open.
+        items: list[tuple[str, str]] = []
+        if guru:
+            items = [("block", name) for name in GURU_ORDER]
+        else:
+            items = [("block", BLOCK_STATUS), ("block", BLOCK_CONTROLS),
+                     ("block", BLOCK_SETTINGS)]
+            if self._settings_open:
+                for panel in PANELS:
+                    items.append(("panel", panel))
+                    if folds.get(panel):
+                        items += [("block", b) for b in PANEL_BLOCKS[panel]
+                                  if b in blocks and heights.get(b)]
+                    else:
+                        items.append(("digest", panel))
+            items.append(("block", BLOCK_REPORT))
+
+        # The cursor is a block EDGE, and the two text-headed blocks centre
+        # their first line a lead-in below it, so the old header baselines are
+        # unmoved while a panel head can now sit flush on top of one.
+        y = gauge_bottom + (P(46) if info_line else P(26))
+        placed: list[tuple[str, str, float]] = []
+        for kind, name in items:
+            placed.append((kind, name, y))
+            y += (heights[name] if kind == "block"
+                  else head_h if kind == "panel" else digest_h)
+        height = y + P(30)
 
         self.canvas.config(height=height)
         self._round_card(width, height)
-        # Top-right, above the Fable gauge and inside the corner radius.
-        self._draw_title_buttons(width - P(34), P(22), collapsed=False)
+        # Top-right, above the Fable gauge and inside the corner radius. The
+        # gear joins them on the expanded card only.
+        self._draw_title_buttons(width - P(34), P(22), collapsed=False,
+                                 gear=True)
         if self._fork:
-            # Left end of the same row; the limit is the close button's left
-            # edge (its centre is one TITLE_BTN_STEP left of minimize).
-            close_left = width - P(34) - self._pxf(TITLE_BTN_STEP) - self._pxf(8)
-            self._draw_fork_chip(pad - P(6), P(22), close_left - self._pxf(6))
+            # Left end of the same row; the limit is the gear button's left
+            # edge, two TITLE_BTN_STEPs left of minimize.
+            gear_left = (width - P(34) - 2 * self._pxf(TITLE_BTN_STEP)
+                         - self._pxf(8))
+            self._draw_fork_chip(pad - P(6), P(22), gear_left - self._pxf(6))
 
         center_cx = width // 2
         self._gauge(pad + P(48), five_frac, AMBER, "5 hours")
@@ -1886,115 +2534,96 @@ class Overlay:
             self.canvas.create_text(width / 2, gauge_bottom + P(34),
                                     text=info_line, font=FONT_SMALL, fill=DIM)
 
-        self.canvas.create_text(pad, sess_header_y, text="Live sessions",
-                                font=FONT_BOLD, fill=FG, anchor="w")
-        self.canvas.create_text(width - pad, sess_header_y,
-                                text=f"{n_total} active", font=FONT_SMALL,
-                                fill=DIM, anchor="e")
-        if shown:
-            for i, (kind, sess) in enumerate(shown):
-                y0 = cards_y + i * (card_h + card_gap)
-                self._sub_card(pad - P(6), y0, width - pad + P(6), y0 + card_h,
-                               outline=GREEN if kind == "main" else "")
-                name_x = pad + P(6)
-                name_y = y0 + P(13)
-                detail_y = y0 + P(31)
-                if kind == "main":
-                    self.canvas.create_oval(pad + P(5), y0 + P(9),
-                                            pad + P(13), y0 + P(17),
-                                            fill=GREEN, outline="")
-                    name_x = pad + P(19)
-                name = self._fit(sess["name"], self._font_bold,
-                                 (width - pad) - name_x - P(6))
-                self.canvas.create_text(name_x, name_y, text=name,
-                                        font=FONT_BOLD, fill=FG, anchor="w")
-                age_px = self._font_small.measure(sess["age"])
-                detail = self._fit(sess["detail"], self._font_small,
-                                   (width - pad - P(6)) - (pad + P(6))
-                                   - age_px - P(10))
-                self.canvas.create_text(pad + P(6), detail_y, text=detail,
-                                        font=FONT_SMALL, fill=DIM, anchor="w")
-                self.canvas.create_text(width - pad - P(6), detail_y,
-                                        text=sess["age"],
-                                        font=FONT_SMALL, fill=DIM, anchor="e")
-            if self._max_scroll > 0:
-                first_other = 1 if main_sess else 0
-                track_y0 = cards_y + first_other * (card_h + card_gap)
-                track_y1 = cards_y + cards_h - card_gap
-                track_x = width - pad + P(9)
-                bar_w = max(2, P(SCROLLBAR_W))
-                self.canvas.create_rectangle(
-                    track_x, track_y0, track_x + bar_w, track_y1,
-                    fill=TRACK, outline="")
-                track_h = track_y1 - track_y0
-                thumb_h = max(self._pxf(14), track_h * OTHERS_VISIBLE / len(others))
-                thumb_y = track_y0 + (track_h - thumb_h) * (
-                    self._scroll_idx / self._max_scroll)
-                self.canvas.create_rectangle(
-                    track_x, thumb_y, track_x + bar_w, thumb_y + thumb_h,
-                    fill=DIM, outline="")
-        else:
-            self.canvas.create_text(pad, cards_y + P(4), text="no active sessions",
-                                    font=FONT_SMALL, fill=DIM, anchor="w")
-
-        self.canvas.create_text(pad, dist_header_y, text="Token distribution",
-                                font=FONT_BOLD, fill=FG, anchor="w")
-        if mode_label:
-            avail = (width - 2 * pad
-                     - self._font_bold.measure("Token distribution") - P(10))
-            mode_label = self._fit(mode_label, self._font_bold, avail)
-            self.canvas.create_text(width - pad, dist_header_y, text=mode_label,
-                                    font=FONT_BOLD, anchor="e",
-                                    fill=MODE_COLORS.get(mode, FG))
-        if stop_text:
-            self._draw_stop_band(pad - P(6), band_y0, width - pad + P(6),
-                                 band_y0 + band_h, stop_text)
-
-        for i, (dot, label, value) in enumerate(rows):
-            y = rows_y + i * row_h + row_h / 2
-            self.canvas.create_oval(pad + P(1), y - P(4), pad + P(9), y + P(4),
-                                    fill=dot, outline="")
-            label = self._fit(label, self._font,
-                              (width - pad) - (pad + P(18))
-                              - self._font.measure(value) - P(10))
-            self.canvas.create_text(pad + P(18), y, text=label, font=FONT,
-                                    fill=FG, anchor="w")
-            self.canvas.create_text(width - pad, y, text=value, font=FONT,
-                                    fill=DIM, anchor="e")
-
-        if footer_left or footer_right:
-            self.canvas.create_text(pad, footer_y + P(6), text=footer_left,
-                                    font=FONT_SMALL, fill=DIM, anchor="w")
-            self.canvas.create_text(width - pad, footer_y + P(6), text=footer_right,
-                                    font=FONT_SMALL, fill=DIM, anchor="e")
-        self._draw_graph_ladder(pad, graph_y, width - pad)
-        self._draw_goal_row(pad, goal_y, width - pad, goal_y + P(GOAL_ROW_H))
         ctl_gap = P(CTL_BTN_GAP)
         ctl_w = (width - 2 * pad - ctl_gap) / 2
-        self._draw_ctl_button(pad, ctl_y, pad + ctl_w, ctl_y + P(BTN_H), "start")
-        self._draw_ctl_button(width - pad - ctl_w, ctl_y, width - pad,
-                              ctl_y + P(BTN_H), "stop")
-        self._draw_button(pad, btn_y, width - pad, btn_y + P(BTN_H), self._throttle)
-        self._draw_report_row(pad, rep_y, width - pad, rep_y + P(REPORT_BTN_H))
-        if self._report_age:
-            # Only when there is one to age: with no report the button itself
-            # already says so, and a second "no report yet" line would just
-            # repeat it.
-            self.canvas.create_text(width / 2, age_y, text=self._report_age,
-                                    font=FONT_SMALL, fill=DIM)
-        if self._shots:
-            # The screenshot policy's own line: how stale the gallery is, and
-            # whether end of day or the pre-exhaustion forecast comes first.
-            self.canvas.create_text(
-                width / 2, shots_y,
-                text=self._fit(self._shots, self._font_small, width - 2 * pad),
-                font=FONT_SMALL, fill=DIM)
+        for kind, name, top in placed:
+            if kind == "panel":
+                self._draw_panel_head(name, pad, top, width - pad,
+                                      top + P(PANEL_HEAD_H))
+            elif kind == "digest":
+                self._draw_panel_digest(name, pad, top, width - pad, digest_row)
+            elif name == BLOCK_STATUS:
+                self._draw_status_band(pad - P(6), top, width - pad + P(6),
+                                       status_label, mode, stop_text, band_h)
+            elif name == BLOCK_SESSIONS:
+                self._draw_sessions_block(top, shown, others,
+                                          main_sess is not None, n_total,
+                                          cards_h, card_h, card_gap)
+            elif name == BLOCK_DISTRIBUTION:
+                self._draw_distribution_block(
+                    top, rows, row_h, mode, mode_label, stop_text, band_h,
+                    dist_rows_off, dist_footer_off, footer_left, footer_right)
+            elif name == BLOCK_GRAPH:
+                self._draw_graph_ladder(pad, top + P(8), width - pad)
+            elif name == BLOCK_GOAL:
+                self._draw_goal_row(pad, top, width - pad, top + P(GOAL_ROW_H))
+            elif name == BLOCK_CONTROLS:
+                self._draw_ctl_button(pad, top, pad + ctl_w, top + P(BTN_H),
+                                      "start")
+                self._draw_ctl_button(width - pad - ctl_w, top, width - pad,
+                                      top + P(BTN_H), "stop")
+            elif name == BLOCK_THROTTLE:
+                self._draw_button(pad, top, width - pad, top + P(BTN_H),
+                                  self._throttle)
+            elif name == BLOCK_SETTINGS:
+                self._draw_settings_strip(pad, top, width - pad,
+                                          top + P(SETTINGS_STRIP_H))
+            elif name == BLOCK_ALLOC and alloc_note:
+                # BASIC's home for the ALLOCATION line: the panel that holds
+                # the controls it reports on. `_ladder_notes` drops it there so
+                # the sentence is never printed twice on one card.
+                override = bool(getattr(self._alloc, "override", False))
+                self.canvas.create_text(
+                    pad, top + note_h / 2,
+                    text=self._fit(alloc_note, self._font_small,
+                                   width - 2 * pad),
+                    font=FONT_SMALL, fill=RED if override else BLUE,
+                    anchor="w", tags="alloc_note")
+            elif name == BLOCK_SHARES:
+                self.canvas.create_text(
+                    pad, top + note_h / 2,
+                    text=self._fit(self._shares_line(), self._font_small,
+                                   width - 2 * pad),
+                    font=FONT_SMALL, fill=DIM, anchor="w", tags="shares_line")
+            elif name == BLOCK_REPORT_NOW:
+                self._draw_report_now(pad, top, width - pad, top + P(BTN_H))
+            elif name == BLOCK_SHOTS and self._shots:
+                self.canvas.create_text(
+                    width / 2, top + shots_h / 2,
+                    text=self._fit(self._shots, self._font_small,
+                                   width - 2 * pad),
+                    font=FONT_SMALL, fill=DIM, tags="shots_line")
+            elif name == BLOCK_REPORT:
+                self._draw_report_row(pad, top, width - pad,
+                                      top + P(REPORT_BTN_H), now=guru)
+                if self._report_age:
+                    # Only when there is one to age: with no report the button
+                    # itself already says so, and a second "no report yet" line
+                    # would just repeat it.
+                    self.canvas.create_text(
+                        width / 2,
+                        top + P(REPORT_BTN_H) + P(REPORT_AGE_H) / 2,
+                        text=self._report_age, font=FONT_SMALL, fill=DIM)
+                if guru and self._shots:
+                    # The screenshot policy's own line: how stale the gallery
+                    # is, and whether end of day or the pre-exhaustion forecast
+                    # comes first. BASIC files it under "Sessions & reports".
+                    self.canvas.create_text(
+                        width / 2,
+                        top + P(REPORT_BTN_H) + P(REPORT_AGE_H) + shots_h / 2,
+                        text=self._fit(self._shots, self._font_small,
+                                       width - 2 * pad),
+                        font=FONT_SMALL, fill=DIM, tags="shots_line")
 
         bottom = warn or updated_line
         if bottom:
             bottom = self._fit(bottom, self._font_small, width - 2 * pad)
             self.canvas.create_text(width / 2, height - P(14), text=bottom,
                                     font=FONT_SMALL, fill=AMBER if warn else DIM)
+
+        if self._menu_open:
+            # Last, so it is over everything it covers rather than under it.
+            self._draw_menu(pad - P(6), P(MENU_TOP), width - pad + P(6))
 
         self.root.update_idletasks()
         self._place()

@@ -1,3 +1,4 @@
+import inspect
 import json
 import sys
 import tempfile
@@ -2117,6 +2118,222 @@ def test_overlay_graph_fold_round_trips_without_clobbering_collapsed():
         assert fake._read_overlay_state() == {}, junk
 
 
+def test_overlay_visible_blocks_for_each_mode():
+    """The pure answer to "what does this card draw", per mode and per fold."""
+    try:
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    hidden = (overlay.BLOCK_SESSIONS, overlay.BLOCK_DISTRIBUTION,
+              overlay.BLOCK_GRAPH, overlay.BLOCK_GOAL, overlay.BLOCK_THROTTLE,
+              overlay.BLOCK_ALLOC, overlay.BLOCK_SHARES,
+              overlay.BLOCK_REPORT_NOW, overlay.BLOCK_SHOTS)
+    basic = overlay.visible_blocks(overlay.UI_BASIC)
+    # BASIC is the six essentials plus the strip that holds everything else.
+    assert basic == set(overlay.BASIC_BLOCKS), basic
+    for block in hidden:
+        assert block not in basic, block
+    for block in (overlay.BLOCK_HEADER, overlay.BLOCK_RINGS,
+                  overlay.BLOCK_STATUS, overlay.BLOCK_CONTROLS,
+                  overlay.BLOCK_REPORT, overlay.BLOCK_FOOTER,
+                  overlay.BLOCK_SETTINGS):
+        assert block in basic, block
+    # GURU is everything, whatever the folds say.
+    guru = overlay.visible_blocks(overlay.UI_GURU)
+    assert guru == set(overlay.ALL_BLOCKS), guru
+    assert basic < guru
+    for block in hidden:
+        assert block in guru, block
+    assert overlay.visible_blocks(overlay.UI_GURU, False, {}) == guru
+    # The strip alone shows nothing: a panel has to be unfolded as well, and
+    # only that panel's own blocks come back.
+    assert overlay.visible_blocks(overlay.UI_BASIC, True) == basic
+    only_graph = overlay.visible_blocks(overlay.UI_BASIC, True,
+                                        {overlay.PANEL_GRAPH: True})
+    assert only_graph == basic | {overlay.BLOCK_GRAPH}, only_graph
+    budget = overlay.visible_blocks(overlay.UI_BASIC, True,
+                                    {overlay.PANEL_BUDGET: True})
+    assert budget == basic | set(overlay.PANEL_BLOCKS[overlay.PANEL_BUDGET])
+    assert overlay.BLOCK_GOAL in budget and overlay.BLOCK_SESSIONS not in budget
+    every = overlay.visible_blocks(overlay.UI_BASIC, True,
+                                   {p: True for p in overlay.PANELS})
+    assert every == guru, every
+    # A panel unfolded while the strip is shut is still shut.
+    assert overlay.visible_blocks(
+        overlay.UI_BASIC, False, {p: True for p in overlay.PANELS}) == basic
+    # Junk degrades to the small card, never to the big one.
+    for junk in ("GURU", "", None, 7, {"mode": "guru"}):
+        assert overlay.normalize_mode(junk) == overlay.UI_BASIC, junk
+        assert overlay.visible_blocks(junk) == basic, junk
+    assert overlay.normalize_mode("guru") == overlay.UI_GURU
+    # Every panel block is reachable, and no block is in two panels.
+    seen: list = []
+    for panel in overlay.PANELS:
+        seen += list(overlay.PANEL_BLOCKS[panel])
+    assert len(seen) == len(set(seen)) == len(overlay.SETTINGS_BLOCKS), seen
+    assert not set(seen) & set(overlay.BASIC_BLOCKS), seen
+
+
+def test_overlay_mode_round_trips_without_clobbering_the_other_flags():
+    try:
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    cfg = make_cfg()
+    fake = overlay.Overlay.__new__(overlay.Overlay)
+    fake.cfg = cfg
+    fake._refresh = lambda: None
+    path = cfg.state_dir / "overlay.json"
+    # Nothing on disk at all: BASIC, with every fold shut.
+    assert overlay.normalize_mode(
+        fake._read_overlay_state().get(overlay.UI_MODE_KEY)) == overlay.UI_BASIC
+    assert fake._load_flag(overlay.SETTINGS_KEY) is False
+    # The panel's own flags are written first, then the mode: neither may drop
+    # the other, which is the whole reason the file is read back and merged.
+    fake._collapsed = False
+    fake._graph_collapsed = False
+    fake._toggle_collapsed(None)
+    assert fake._set_ui_mode(overlay.UI_GURU) == "break"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored == {"collapsed": True, "ui_mode": "guru"}, stored
+    fake._toggle_graph(None)
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["ui_mode"] == "guru" and stored["graph_collapsed"] is True
+    assert stored["collapsed"] is True, stored
+    # ... and back, with a key this file has never heard of left alone.
+    path.write_text(json.dumps({**stored, "pane_x": 3}), encoding="utf-8")
+    fake._set_ui_mode(overlay.UI_BASIC)
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored == {"collapsed": True, "graph_collapsed": True,
+                      "ui_mode": "basic", "pane_x": 3}, stored
+    # The three settings folds are three separate keys, for the same reason.
+    fake._settings_open = False
+    fake._panel_open = {p: False for p in overlay.PANELS}
+    assert fake._toggle_settings(None) == "break"
+    assert fake._toggle_panel(overlay.PANEL_SESSIONS) == "break"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["settings_open"] is True, stored
+    assert stored["panel_sessions_open"] is True, stored
+    assert "panel_budget_open" not in stored, stored
+    assert stored["ui_mode"] == "basic" and stored["pane_x"] == 3, stored
+    assert fake._panel_open == {overlay.PANEL_BUDGET: False,
+                                overlay.PANEL_GRAPH: False,
+                                overlay.PANEL_SESSIONS: True}
+    # A next panel reads all of it back off disk.
+    assert fake._load_flag("settings_open") is True
+    assert fake._load_flag("panel_graph_open") is False
+    # A hostile mode on disk reads as BASIC rather than raising in __init__.
+    for junk in ('{"ui_mode": 7}', '{"ui_mode": "GURU"}', "{not json"):
+        path.write_text(junk, encoding="utf-8")
+        assert overlay.normalize_mode(
+            fake._read_overlay_state().get(overlay.UI_MODE_KEY)
+        ) == overlay.UI_BASIC, junk
+
+
+def test_overlay_menu_opens_closes_and_names_its_items():
+    try:
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    # The items, per mode. "Settings..." is BASIC only - in GURU every panel is
+    # already open, so the entry would have nothing to expand.
+    basic = overlay.menu_items(overlay.UI_BASIC)
+    labels = [label for _tag, label, _c in basic]
+    assert labels == ["Basic mode", "Guru mode", "Settings...", "Report now",
+                      "Full throttle on", "Open latest report",
+                      "Close overlay"], labels
+    assert [tag for tag, _l, _c in basic][:3] == ["menu_basic", "menu_guru",
+                                                  "menu_settings"]
+    assert all(tag.startswith("menu_") for tag, _l, _c in basic), basic
+    # Exactly one radio is lit, and it is the mode in force.
+    assert [c for _t, _l, c in basic if c is not None] == [True, False]
+    guru = overlay.menu_items(overlay.UI_GURU)
+    assert [c for _t, _l, c in guru if c is not None] == [False, True]
+    assert "Settings..." not in [label for _t, label, _c in guru], guru
+    # The throttle row reads as the state it would move to.
+    assert ("menu_throttle", "Full throttle off", None) in overlay.menu_items(
+        overlay.UI_BASIC, throttle=True)
+    assert ("menu_throttle", "Full throttle on", None) in basic
+
+    cfg = make_cfg()
+    fake = overlay.Overlay.__new__(overlay.Overlay)
+    fake.cfg = cfg
+    fake._refresh = lambda: None
+    # Closed until the gear is tapped, open after, closed again on the second
+    # tap - and never persisted: a panel reopened with a menu hanging over it
+    # would be a panel nobody could read.
+    assert fake._menu_open is False
+    assert fake._toggle_menu(None) == "break"
+    assert fake._menu_open is True
+    assert fake._toggle_menu(None) == "break"
+    assert fake._menu_open is False
+    assert not (cfg.state_dir / "overlay.json").exists()
+    # Picking a mode closes it; so does opening the settings panels.
+    fake._toggle_menu(None)
+    fake._set_ui_mode(overlay.UI_GURU)
+    assert fake._menu_open is False and fake._ui_mode == overlay.UI_GURU
+    fake._toggle_menu(None)
+    fake._settings_open = False
+    assert fake._menu_settings(None) == "break"
+    assert fake._menu_open is False and fake._settings_open is True
+    stored = json.loads((cfg.state_dir / "overlay.json").read_text(encoding="utf-8"))
+    assert stored == {"ui_mode": "guru", "settings_open": True}, stored
+
+
+def test_overlay_exposes_the_gear_menu_and_the_settings_panels():
+    import inspect
+    try:
+        import tkinter  # noqa: F401  - absent on headless builds
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    src = inspect.getsource(overlay.Overlay)
+    for tag in ("gear_btn", "settings_strip", "panel_budget", "panel_graph",
+                "panel_sessions", "menu_basic", "menu_guru", "menu_settings",
+                "menu_report", "menu_throttle", "menu_open", "menu_close"):
+        assert f'tag_bind("{tag}"' in src, tag
+    assert 'tags="gear_btn"' in src and 'tags="settings_strip"' in src
+    for name in ("_toggle_menu", "_set_ui_mode", "_menu_basic", "_menu_guru",
+                 "_menu_settings", "_menu_report", "_menu_throttle",
+                 "_menu_open_report", "_menu_close", "_toggle_settings",
+                 "_toggle_panel", "_toggle_panel_budget", "_toggle_panel_graph",
+                 "_toggle_panel_sessions", "_draw_menu", "_draw_gear_button",
+                 "_draw_settings_strip", "_draw_panel_head",
+                 "_draw_panel_digest", "_draw_status_band", "_write_setting"):
+        assert callable(getattr(overlay.Overlay, name)), name
+    # Every handler swallows its click, or the drag binding moves the panel
+    # under the finger every time the menu is used.
+    for name in ("_toggle_menu", "_set_ui_mode", "_menu_settings",
+                 "_toggle_settings", "_toggle_panel"):
+        assert 'return "break"' in inspect.getsource(
+            getattr(overlay.Overlay, name)), name
+    # The mode gates the layout, and the collapsed bar is outside it: the
+    # one-line bar is the same in both modes, gear included.
+    refresh = inspect.getsource(overlay.Overlay._refresh)
+    assert "visible_blocks(" in refresh and "UI_GURU" in refresh, refresh
+    assert "_draw_menu" in refresh and "_menu_open" in refresh, refresh
+    collapsed = inspect.getsource(overlay.Overlay._refresh_collapsed)
+    for absent in ("_draw_menu", "visible_blocks", "gear=True",
+                   "_draw_settings_strip"):
+        assert absent not in collapsed, absent
+    # Scaled geometry only: raw design pixels break on a 2x display.
+    for name in ("_draw_menu", "_draw_panel_head", "_draw_status_band",
+                 "_draw_settings_strip"):
+        body = inspect.getsource(getattr(overlay.Overlay, name))
+        assert "P = self._px" in body, name
+        # The status band draws no rounded corner of its own - it delegates to
+        # `_sub_card` and `_draw_stop_band`, which are scaled already.
+        assert "self._pxf(" in body or name == "_draw_status_band", name
+
+
 def test_graph_digest_names_the_active_and_configured_counts():
     try:
         from tokentracker import overlay
@@ -2203,6 +2420,34 @@ def test_digest_tags_name_only_what_the_fold_hid():
     assert overlay.digest_tags(limited=True)[0][0] == overlay.LIMITED_TAG
 
 
+def test_sessions_digest_counts_the_live_sessions():
+    """The folded sessions panel's line carries the count, not a placeholder.
+
+    `_session_count` shipped initialised to 0 and assigned nowhere, so the one
+    line the fold leaves behind read "0 sessions" for every operator who had
+    any - the exact reading it exists to replace. The counter is fed in
+    `_refresh` from the same `len(sessions)` the open block prints as "N
+    active", so this pins both the wiring and the wording.
+    """
+    try:
+        from tokentracker import overlay
+    except ImportError as exc:
+        if exc.name not in ("tkinter", "_tkinter"):
+            raise
+        return
+    ov = overlay.Overlay.__new__(overlay.Overlay)
+    ov._report_age = "report 4m ago"
+    for count, want in ((0, "0 sessions"), (1, "1 session"), (5, "5 sessions")):
+        ov._session_count = count
+        assert overlay.Overlay._sessions_digest(ov) == \
+            "%s · report 4m ago" % want, count
+    # And `_refresh` has to actually set it, or every reading above is of a
+    # counter frozen at its initial 0.
+    src = inspect.getsource(overlay.Overlay._refresh)
+    assert "self._session_count = n_total" in src, src
+    assert "n_total = len(sessions)" in src, src
+
+
 # Runs in its own interpreter: a bad close handler takes the whole process down
 # with an access violation, which would otherwise swallow the suite's output.
 _TK_PROBE = r'''
@@ -2258,6 +2503,13 @@ try:
 except tk.TclError as exc:
     print("SKIP display:", exc)
     raise SystemExit(0)
+
+# The panel ships in BASIC, which draws six blocks and hides the rest behind
+# the gear. Everything from here to "BASIC vs GURU" below is the GURU card -
+# every block open - which is what these checks were written against; the two
+# modes get their own section at the end.
+assert ov._ui_mode == overlay.UI_BASIC, ov._ui_mode
+ov._ui_mode = overlay.UI_GURU
 
 
 def spans():
@@ -2793,6 +3045,197 @@ else:
     one_x = [t for t, _a, _b in spans()]
     assert "cfg fable-5-1" in one_x, one_x
     assert any(t.startswith("in ") for t in one_x), one_x
+
+# ------------------------------------------------- BASIC vs GURU (the modes)
+# BASIC draws the essentials - the rings, the status band, START/STOP, VIEW
+# REPORT - and files everything that TUNES the loop into three folding settings
+# panels behind the gear. GURU is the card above, every block open. Checked at
+# 100 / 125 / 150% DPI: nothing overlaps in any state, and the basic card is
+# materially shorter than the guru one.
+GAUGE_BOTTOM = ov._px(overlay.GAUGE_CY) + ov._px(overlay.GAUGE_RADIUS)
+
+# The probe's sessions dir is empty, so up to here every card drew "0 active" -
+# which is exactly the reading under which a folded digest hard-wired to 0 looks
+# right. Stand five live sessions up for the rest of the file so the folded
+# panel's line has a real number to get wrong.
+LIVE = [{"sid": "sid-%d" % i, "name": "session %d" % i, "age": "%dm ago" % i,
+         "detail": "120.0k / 1.0M", "mtime": 1000.0 - i} for i in range(5)]
+overlay._live_sessions = lambda _cfg: [dict(s) for s in LIVE]
+
+
+def boxes_below_rings():
+    """Every text under the ring row - the whole mode-dependent stack."""
+    out = []
+    for item in ov.canvas.find_all():
+        if ov.canvas.type(item) != "text":
+            continue
+        box = ov.canvas.bbox(item)
+        if box[1] >= GAUGE_BOTTOM:
+            out.append((ov.canvas.itemcget(item, "text"), box))
+    return out
+
+
+def no_overlap(tag):
+    drawn = boxes_below_rings()
+    assert drawn, tag
+    for i, (ta, a) in enumerate(drawn):
+        for tb, b in drawn[i + 1:]:
+            assert (a[2] <= b[0] or b[2] <= a[0]
+                    or a[3] <= b[1] or b[3] <= a[1]), (tag, ta, tb, a, b)
+    lowest = max(ov.canvas.bbox(i)[3] for i in ov.canvas.find_all())
+    assert lowest <= int(ov.canvas["height"]) + 2, (tag, lowest)
+
+
+def show(mode, settings=False, panels=()):
+    ov._ui_mode = mode
+    ov._settings_open = settings
+    ov._panel_open = {p: (p in panels) for p in overlay.PANELS}
+    ov._menu_open = False
+    ov._refresh()
+    ov.root.update_idletasks()
+    return int(ov.canvas["height"]), [t for t, _a, _b in spans()]
+
+
+def click(box):
+    ov.canvas.event_generate("<ButtonPress-1>", x=int((box[0] + box[2]) // 2),
+                             y=int((box[1] + box[3]) // 2))
+    ov.root.update()
+
+
+for scale in (1.0, 1.25, 1.5):
+    if not set_scale(scale):
+        continue
+    basic_h, basic_texts = show(overlay.UI_BASIC)
+    no_overlap("basic-%s" % scale)
+    # Everything that tunes the loop is gone from the face of the card.
+    for gone in ("Live sessions", "Token distribution", "AGENTIC GRAPH",
+                 "REPORT NOW", "AUTO (tap for full throttle)"):
+        assert gone not in basic_texts, (scale, gone, basic_texts)
+    assert not any(t.startswith("GOAL ") for t in basic_texts), basic_texts
+    for tag in ("goal_minus", "goal_plus", "graph_minus", "graph_plus",
+                "throttle_btn", "report_now", "ladder", "shots_line",
+                "alloc_note", "shares_line"):
+        assert not ov.canvas.find_withtag(tag), (scale, tag)
+    # ... and what is left is the header, the rings, the status band, the
+    # switch, VIEW REPORT and the settings strip that holds the rest.
+    for tag in ("gear_btn", "close_btn", "min_btn", "start_btn", "stop_btn",
+                "view_report", "settings_strip", "status_band", "fork_chip"):
+        assert ov.canvas.find_withtag(tag), (scale, tag)
+    assert "Settings" in basic_texts, basic_texts
+    assert "STOPPED" in basic_texts, basic_texts
+    assert any(t.startswith("STOPPED: weekly goal") for t in basic_texts), \
+        basic_texts
+
+    # The strip open with every panel folded: three headers, three digests.
+    open_h, open_texts = show(overlay.UI_BASIC, settings=True)
+    no_overlap("basic-settings-%s" % scale)
+    for title in overlay.PANEL_TITLES.values():
+        assert title in open_texts, (scale, title, open_texts)
+    digests = {}
+    for panel in overlay.PANELS:
+        found = ov.canvas.find_withtag("digest_%s" % panel)
+        assert found, (scale, panel)
+        digests[panel] = ov.canvas.itemcget(found[0], "text")
+    assert digests[overlay.PANEL_BUDGET].startswith("goal "), digests
+    assert "rung" in digests[overlay.PANEL_BUDGET], digests
+    # The digest stands in for the block it folded away, so it has to carry the
+    # block's OWN count, not a placeholder: five live sessions, five in the line.
+    assert digests[overlay.PANEL_SESSIONS].startswith("5 sessions · "), digests
+    assert digests[overlay.PANEL_GRAPH].startswith("E "), digests
+    assert open_h > basic_h, (scale, basic_h, open_h)
+
+    # Every panel unfolded: the hidden blocks are all back, still in BASIC.
+    all_h, all_texts = show(overlay.UI_BASIC, settings=True,
+                            panels=overlay.PANELS)
+    no_overlap("basic-panels-%s" % scale)
+    for want in ("Live sessions", "Token distribution", "AGENTIC GRAPH"):
+        assert want in all_texts, (scale, want, all_texts)
+    for tag in ("goal_minus", "throttle_btn", "report_now", "shares_line"):
+        assert ov.canvas.find_withtag(tag), (scale, tag)
+    assert all_h > open_h, (scale, open_h, all_h)
+    # ... and the same number the unfolded block prints in its corner, so the
+    # two can never drift apart again.
+    active = [t for t in all_texts if t.endswith(" active")]
+    assert active == ["5 active"], (scale, active)
+    assert digests[overlay.PANEL_SESSIONS].split(" ")[0] == active[0].split(" ")[0], \
+        (scale, digests[overlay.PANEL_SESSIONS], active)
+
+    guru_h, guru_texts = show(overlay.UI_GURU)
+    no_overlap("guru-%s" % scale)
+    for want in ("Live sessions", "Token distribution", "AGENTIC GRAPH"):
+        assert want in guru_texts, (scale, want, guru_texts)
+    assert any(t.startswith("GOAL ") for t in guru_texts), guru_texts
+    assert ov.canvas.find_withtag("report_now"), scale
+    # The whole point of the two modes.
+    assert basic_h < guru_h, (scale, basic_h, guru_h)
+    assert guru_h - basic_h >= int(100 * scale), (scale, basic_h, guru_h)
+    print("heights at %sx: basic %s, basic+settings %s, panels %s, guru %s"
+          % (scale, basic_h, open_h, all_h, guru_h))
+
+set_scale(1.0)
+
+# ------------------------------------------------------------- the gear menu
+show(overlay.UI_BASIC)
+gear = ov.canvas.bbox("gear_btn")
+assert gear, "no gear button drawn"
+assert gear[2] <= ov.canvas.bbox("close_btn")[0] + 2, gear
+click(gear)
+assert ov._menu_open, "the gear did not open the menu"
+menu_texts = [t for t, _a, _b in spans()]
+for want in ("Basic mode", "Guru mode", "Settings...", "Report now",
+             "Full throttle on", "Open latest report", "Close overlay"):
+    assert want in menu_texts, (want, menu_texts)
+assert ov.canvas.bbox("menu_bg"), "no menu background drawn"
+# The gear again closes it, changing nothing else.
+click(gear)
+assert not ov._menu_open, "the gear did not close the menu"
+assert "Basic mode" not in [t for t, _a, _b in spans()]
+
+# Guru from the menu: the card grows, the mode is written, the menu closes.
+click(gear)
+click(ov.canvas.bbox("menu_guru"))
+assert ov._ui_mode == overlay.UI_GURU, ov._ui_mode
+assert not ov._menu_open, "the menu stayed open after a pick"
+stored = json.loads((cfg.state_dir / "overlay.json").read_text(encoding="utf-8"))
+assert stored.get("ui_mode") == "guru", stored
+assert "AGENTIC GRAPH" in [t for t, _a, _b in spans()]
+
+# A tap outside an open menu closes it and does nothing else.
+click(gear)
+assert ov._menu_open, "the gear did not reopen the menu"
+ov.canvas.event_generate("<ButtonPress-1>", x=int(ov.width // 2),
+                         y=int(int(ov.canvas["height"]) - 8))
+ov.root.update()
+assert not ov._menu_open, "a tap outside did not close the menu"
+assert ov._ui_mode == overlay.UI_GURU, ov._ui_mode
+
+# Back to BASIC from the menu, then the strip and one panel head, each of
+# which records its own key without clobbering anything already in the file.
+click(gear)
+click(ov.canvas.bbox("menu_basic"))
+assert ov._ui_mode == overlay.UI_BASIC, ov._ui_mode
+click(ov.canvas.bbox("settings_strip"))
+assert ov._settings_open, "the strip did not open the panels"
+click(ov.canvas.bbox("panel_graph"))
+assert ov._panel_open[overlay.PANEL_GRAPH], "the head did not unfold the panel"
+assert "AGENTIC GRAPH" in [t for t, _a, _b in spans()]
+stored = json.loads((cfg.state_dir / "overlay.json").read_text(encoding="utf-8"))
+assert stored.get("ui_mode") == "basic", stored
+assert stored.get("settings_open") is True, stored
+assert stored.get("panel_graph_open") is True, stored
+assert stored.get("panel_budget_open") is None, stored
+# The keys the other panes own are still exactly as they were.
+assert stored.get("collapsed") is False and stored.get("keep") == 1, stored
+print("menu, strip and panel folds OK")
+
+# The collapsed one-line bar is unchanged in both modes.
+for mode in (overlay.UI_BASIC, overlay.UI_GURU):
+    ov._collapsed = False
+    show(mode)
+    check_collapsed("collapsed-%s" % mode)
+    assert not ov.canvas.find_withtag("gear_btn"), mode
+ov._collapsed = False
+show(overlay.UI_GURU)
 
 ids = ov.canvas.find_withtag("close_btn")
 assert ids, "no close button drawn"
