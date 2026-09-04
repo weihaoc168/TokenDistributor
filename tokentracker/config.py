@@ -108,6 +108,19 @@ class Config:
     local_model_path: str = ""
     local_ft_bin: Path | None = None
     local_max_concurrency: int = 1
+    # How many local sessions LOCAL-ONLY mode runs. One, and one in practice:
+    # the engine holds ~31.5GB of the card's 32GB, so a second concurrent
+    # decode has nowhere to live (tokentracker/control.py).
+    local_concurrency: int = 1
+    # Leave the local lane running after the cloud comes back. Off by default,
+    # which is what makes the lane drain at the reset: the task in flight
+    # finishes, nothing new starts, and the engine gives the card back.
+    local_keep_running: bool = False
+    # Stop the FreeToken daemon once the lane is idle, freeing the VRAM for the
+    # editor and for the real-RHI rungs the cloud tier runs.
+    local_autostop: bool = True
+    # The repo local backlog briefs work in; falls back to `report_repo`.
+    local_backlog_repo: str = ""
     local_when_active: bool = False
     local_autostart: bool = True
     local_start_retry_seconds: int = 120
@@ -193,6 +206,18 @@ class Config:
         ledger's milestone table.
         """
         return self.state_dir / "snapshot.json"
+
+    @property
+    def local_backlog_file(self) -> Path:
+        """The briefs the local lane works through when the cloud is out.
+
+        An append-only list of {id, title, prompt, repo, branch, acceptance,
+        staged_by, staged_at, status}: staged by the executive model on the
+        pre-exhaustion forecast, or parsed out of HANDOFF.md section 3 by the
+        loop itself when that model's bucket is already spent
+        (tokentracker/local_lane.py).
+        """
+        return self.state_dir / "local_backlog.json"
 
     @property
     def limited_file(self) -> Path:

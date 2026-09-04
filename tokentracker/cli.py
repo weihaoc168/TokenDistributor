@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .config import Config, load_config
 from .control import (
+    LOCAL_ONLY,
     STOPPED,
     gate_decision,
     maybe_resume,
@@ -345,6 +346,38 @@ def _distribution(cfg: Config, own_dirs: set[str], now) -> dict:
     }
 
 
+def ensure_local_worker(cfg: Config, dispatcher: Dispatcher, now=None):
+    """Queue the next local backlog brief. The line to log, or None.
+
+    Called from both gate points in `_tick`, and only in LOCAL-ONLY mode: that
+    is what makes the lane DRAIN when the cloud comes back. The row already
+    running is left alone (apply() reaps it normally), nothing new is queued,
+    and `Dispatcher.apply` stops the engine once the lane is empty.
+    """
+    from .local_lane import ensure_worker
+
+    return ensure_worker(cfg, dispatcher, now)
+
+
+def stage_local_backlog(cfg: Config, dispatcher: Dispatcher, buckets, now=None):
+    """Stage the local backlog off the pre-exhaustion forecast. Line, or None."""
+    from .local_lane import maybe_stage
+
+    return maybe_stage(cfg, dispatcher, buckets, now)
+
+
+def _local_state(cfg: Config, dispatcher: Dispatcher) -> dict:
+    """What the panel and the reports draw for the local lane. Never raises."""
+    from .local_lane import counts, current_title
+
+    body = {"enabled": cfg.local_enabled, "model": cfg.local_model,
+            "engine_healthy": dispatcher.local_engine_healthy}
+    try:
+        return {**body, "brief": current_title(cfg), "backlog": counts(cfg)}
+    except Exception:
+        return body
+
+
 def _snapshot_state(cfg: Config, allocation, now) -> dict:
     """What the panel draws for the screenshot policy. Never raises."""
     from .snapshot import age, enabled, read_state, status_line
@@ -421,14 +454,19 @@ def _tick(
         # costs no budget either way, so it may still run.
         activity = detect_activity(cfg, own_dirs, now)
         decision.local_concurrency = decide_local(decision, activity, cfg, now)
-        decision = gate_decision(decision, control, read_record(cfg)["reason"])
+        record = read_record(cfg)
+        if record["mode"] == LOCAL_ONLY:
+            queued = ensure_local_worker(cfg, dispatcher, now)
+            if queued is not None:
+                notes.append(queued)
+        decision = gate_decision(decision, record["mode"], record["reason"], cfg)
         actions = notes + dispatcher.apply(decision, now)
         report_line = maybe_report(cfg, dispatcher, before=fork_state,
                                    control=control, stop=read_stop(cfg), now=now)
         if report_line is not None:
             actions.append(report_line)
         _write_state(cfg, {"at": now.isoformat(), "decision": decision.to_dict(),
-                           "dispatch": control,
+                           "dispatch": control, "mode": record["mode"],
                            "error": str(fetch_exc) if fetch_exc else reason})
         return decision, actions, fetch_exc, None, False
 
@@ -476,6 +514,16 @@ def _tick(
     if snapshot_line is not None:
         notes.append(snapshot_line)
 
+    # The other half of the same forecast: the gallery has to be refreshed
+    # before the budget runs out, and the local lane has to have something to
+    # DO once it has. Same buckets, same lead time - one queues a screenshot
+    # pass on the workers' model, the other queues a briefing pass on the
+    # executive's (or, when that bucket is already spent, parses HANDOFF.md
+    # section 3 here).
+    stage_line = stage_local_backlog(cfg, dispatcher, allocation.buckets, now)
+    if stage_line is not None:
+        notes.append(stage_line)
+
     rates = compute_burn_rates(cfg, history, own_dirs, now)
     activity = detect_activity(cfg, own_dirs, now)
     class_rates = learned_class_rates(cfg, load_calibration(cfg))
@@ -504,10 +552,19 @@ def _tick(
             dispatcher.set_status(THROTTLE_TASK_ID, "killed")
 
     decision.local_concurrency = decide_local(decision, activity, cfg, now)
-    # A standing STOP is the last word: it zeroes both launch budgets, so apply()
-    # reaps and adopts as usual but starts nothing new. The reason rides along so
-    # the decision line names the bucket that parked it rather than the operator.
-    decision = gate_decision(decision, control, read_record(cfg)["reason"])
+    # A standing STOP is the last word, and which word it is depends on WHO
+    # stopped it. The operator's STOP (and a snapshot pass) zeroes both launch
+    # budgets. A budget bucket writes LOCAL-ONLY instead: cloud to zero, the
+    # local lane to one, and the next backlog brief queued onto it here so this
+    # same tick's apply() can start it. The reason rides along either way, so
+    # the decision line names the bucket rather than the operator.
+    record = read_record(cfg)
+    mode = record["mode"]
+    if mode == LOCAL_ONLY:
+        queued = ensure_local_worker(cfg, dispatcher, now)
+        if queued is not None:
+            notes.append(queued)
+    decision = gate_decision(decision, mode, record["reason"], cfg)
     actions = notes + dispatcher.apply(decision, now)
     if goal_line is not None:
         actions.insert(0, goal_line)
@@ -528,9 +585,12 @@ def _tick(
         # Name the reason whenever the stop record stands. The mode is only
         # forced while dispatch is actually parked: if the operator pressed
         # START back over the goal, the state must not claim to be stopped.
+        # It is forced to the switch's OWN mode, so a weekly-goal stop that
+        # handed the shift to the local lane reads "local-only" here and not
+        # "stopped" - the panel and this line have to agree.
         decision_payload["stop_reason"] = stop.get("reason")
         if control == STOPPED:
-            decision_payload["mode"] = STOPPED
+            decision_payload["mode"] = mode
 
     _write_state(cfg, {
         "at": now.isoformat(),
@@ -545,16 +605,15 @@ def _tick(
         },
         "decision": decision_payload,
         "queue": dispatcher.queue_stats().__dict__,
-        "local": {
-            "enabled": cfg.local_enabled,
-            "model": cfg.local_model,
-            "engine_healthy": dispatcher.local_engine_healthy,
-        },
+        "local": _local_state(cfg, dispatcher),
         "distribution": _distribution(cfg, own_dirs, now),
         "usage_stale": bool(fetch_exc) or not do_fetch,
         "fetch_error": str(fetch_exc) if fetch_exc else None,
         "throttle": throttle,
         "dispatch": control,
+        # The switch's own word, beside the cloud switch it refines: the panel
+        # draws LOCAL-ONLY off this rather than re-deriving it every frame.
+        "mode": mode,
         "weekly_goal": goal,
         "goal_stop": stop,
         # The graph the loop actually ran this tick, beside the ceiling it came
@@ -804,9 +863,13 @@ def cmd_status(cfg: Config) -> int:
     print(f"queue: {stats.running} running ({stats.running_local} local), "
           f"{stats.pending_heavy} heavy pending, "
           f"{stats.pending_light} light pending")
-    if cfg.local_enabled:
-        engine = "up" if dispatcher.local_engine_up() else "down"
-        print(f"local lane: {cfg.local_model} via {cfg.local_base_url} - engine {engine}")
+    # The local lane in full: the daemon, the card, the brief in flight and the
+    # backlog behind it. This is the line to read when the panel says
+    # LOCAL-ONLY and the question is whether anything is actually happening.
+    from .local_lane import status_lines as local_status_lines
+
+    for line in local_status_lines(cfg, dispatcher):
+        print(line)
     for t in dispatcher.tasks():
         extra = f" tokens={t.session_tokens}" if t.session_tokens else ""
         extra += f" err={t.error}" if t.error else ""
@@ -849,7 +912,9 @@ def cmd_dispatch(cfg: Config, action: str | None, reason: str | None) -> int:
 
     if action is None:
         record = read_record(cfg)
-        print(f"dispatch: {record['dispatch']}")
+        print(f"dispatch: {record['dispatch']}"
+              + (f" (mode {record['mode']})"
+                 if record["mode"] != record["dispatch"] else ""))
         if record["reason"]:
             until = record["until"]
             when = (f", until {fmt_dispatch(cfg, until)}" if until else "")
@@ -1223,6 +1288,70 @@ def cmd_set_status(cfg: Config, task_id: str, status: str) -> int:
     return 0
 
 
+def cmd_backlog(cfg: Config, args: argparse.Namespace) -> int:
+    """The local lane's briefs: list, add from a file, mark done, clear.
+
+    `add --file` is how the executive's staging pass writes its work: it
+    composes a JSON file of briefs and hands it to this command rather than
+    editing state/local_backlog.json, so every brief goes through the same
+    normalization (an id, a repo, a branch, an acceptance line) and the file
+    stays append-only.
+    """
+    from .local_lane import (
+        DONE,
+        add_briefs,
+        briefs,
+        clear_backlog,
+        counts,
+        get_brief,
+        set_status,
+    )
+
+    action = getattr(args, "action", None) or "list"
+    if action == "list":
+        rows = briefs(cfg)
+        if not rows:
+            print("local backlog: empty (the loop stages it on the "
+                  "pre-exhaustion forecast; see tracker.py alloc)")
+            return 0
+        for brief in rows:
+            print(f"  {str(brief.get('id')):<22} {str(brief.get('status')):<8} "
+                  f"{str(brief.get('staged_by')):<20} {brief.get('title')}")
+        tally = counts(cfg)
+        print(f"{len(rows)} brief(s): " + ", ".join(
+            f"{n} {name}" for name, n in tally.items() if n))
+        return 0
+    if action == "add":
+        path = Path(getattr(args, "file", "") or "")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"error: cannot read briefs from {path} ({exc})")
+            return 1
+        added = add_briefs(cfg, payload,
+                           staged_by=getattr(args, "staged_by", "") or "cloud")
+        if not added:
+            print("no briefs added: every record was a duplicate or carried "
+                  "no prompt")
+            return 1
+        for brief in added:
+            print(f"added {brief['id']}: {brief['title']}")
+        return 0
+    if action == "done":
+        ident = getattr(args, "id", None)
+        if get_brief(cfg, ident) is None:
+            print(f"error: no brief with id {ident}")
+            return 1
+        set_status(cfg, ident, DONE, getattr(args, "result", None))
+        print(f"brief {ident} -> done")
+        return 0
+    if action == "clear":
+        print(f"local backlog cleared ({clear_backlog(cfg)} brief(s) dropped)")
+        return 0
+    print(f"error: unknown backlog action '{action}'")
+    return 1
+
+
 def cmd_history(cfg: Config, hours: float) -> int:
     from .usage import UsageHistory
 
@@ -1321,6 +1450,23 @@ def main(argv: list[str] | None = None) -> int:
     can_p = sub.add_parser("cancel", help="mark a pending task failed")
     can_p.add_argument("id")
 
+    back_p = sub.add_parser(
+        "backlog", help="the local lane's briefs (state/local_backlog.json)")
+    back_p.add_argument("action", nargs="?",
+                        choices=("list", "add", "done", "clear"),
+                        default="list",
+                        help="omit to list; 'add --file briefs.json' to "
+                             "stage; 'done <id>'; 'clear'")
+    back_p.add_argument("id", nargs="?", default=None,
+                        help="the brief id, for 'done'")
+    back_p.add_argument("--file", default=None,
+                        help="JSON file of briefs: a list, or "
+                             '{"briefs": [...]}, each with a prompt')
+    back_p.add_argument("--result", default=None,
+                        help="what the brief reported, stored with 'done'")
+    back_p.add_argument("--staged-by", dest="staged_by", default=None,
+                        help="who wrote these briefs (default: cloud)")
+
     hist_p = sub.add_parser("history", help="recent utilization snapshots")
     hist_p.add_argument("--hours", type=float, default=12.0)
 
@@ -1360,6 +1506,14 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_set_status(cfg, args.id, "pending")
         if args.cmd == "cancel":
             return cmd_set_status(cfg, args.id, "failed")
+        if args.cmd == "backlog":
+            if args.action == "add" and not args.file:
+                print("error: use 'backlog add --file briefs.json'")
+                return 1
+            if args.action == "done" and not args.id:
+                print("error: use 'backlog done <id>'")
+                return 1
+            return cmd_backlog(cfg, args)
         if args.cmd == "history":
             return cmd_history(cfg, args.hours)
         if args.cmd == "overlay":

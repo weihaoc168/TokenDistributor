@@ -5,9 +5,11 @@ stay decoupled: the overlay writes it on click, the loop reads it once per poll.
 Stopping is a launch gate only - workers already running are left alone and are
 still reaped/adopted normally.
 
-`state/control.json` carries three things:
+`state/control.json` carries four things:
 
-    dispatch    "running" | "stopped"
+    dispatch    "running" | "stopped" - the CLOUD switch, and the only field
+                the older readers ever knew about
+    mode        "running" | "local-only" | "stopped" - what the loop may do
     reason      who parked it: "operator", "fable_bucket", "weekly_goal",
                 "five_hour", "snapshot" - or "auto_resume:<reason>" on the
                 record a resume writes
@@ -22,9 +24,21 @@ does. That is the whole point: the operator sets the goal, the buckets stop the
 loop when they are spent, and nobody has to press START at 07:00 because a
 window rolled over at 06:59.
 
+LOCAL-ONLY is the correction of 2026-09-03. A bucket stop used to park
+*everything*, which threw away the one lane that costs no Claude budget at all:
+the FreeToken engine on the 5090. So a stop whose reason is a budget bucket
+(`fable_bucket`, `weekly_goal`, `five_hour`) now writes mode `local-only`
+instead of `stopped` whenever the local lane is configured - cloud launches drop
+to zero for every tier and the director fork is not re-armed (both read
+`dispatch`, which is still "stopped"), while the local lane keeps one task
+running off the backlog. The operator's own STOP, and `snapshot`, still mean
+stopped: everything off.
+
 A stop with no reason at all (hand-written, or left by a version of this file
 that predates the field) reads as `operator`: the reading that never resumes
-behind the user's back is the only safe default.
+behind the user's back is the only safe default. A file with no `mode` (written
+before that field existed) has its mode derived from `dispatch` + `reason` the
+same way `write_control` would have derived it.
 """
 
 from __future__ import annotations
@@ -40,7 +54,11 @@ from .models import Decision, parse_iso, utcnow
 
 RUNNING = "running"
 STOPPED = "stopped"
-CONTROL_MODES = (RUNNING, STOPPED)
+# Cloud off, local lane on. `dispatch` stays "stopped" underneath it, which is
+# what keeps every older reader (the fork's arming gate, the panel's mode word)
+# refusing to spend cloud budget without knowing this word.
+LOCAL_ONLY = "local-only"
+CONTROL_MODES = (RUNNING, STOPPED, LOCAL_ONLY)
 
 # Why dispatch is stopped.
 OPERATOR = "operator"
@@ -51,11 +69,17 @@ SNAPSHOT = "snapshot"
 REASONS = (OPERATOR, FABLE_BUCKET, WEEKLY_GOAL, FIVE_HOUR, SNAPSHOT)
 # The reasons that lift by themselves. `operator` is deliberately not one.
 AUTO_REASONS = (FABLE_BUCKET, WEEKLY_GOAL, FIVE_HOUR, SNAPSHOT)
+# The reasons that hand the work to the local lane rather than parking it: a
+# budget bucket ran out, which is the exact case the FreeToken engine exists
+# for. `snapshot` is not one (the pass it holds the lane for is a real-RHI
+# render, which the local engine's own VRAM makes impossible) and neither is
+# `operator` (a person said stop, and meant it).
+LOCAL_REASONS = (FABLE_BUCKET, WEEKLY_GOAL, FIVE_HOUR)
 # The reason written on the record a resume leaves behind, so the log and the
 # next reader can see which stop it lifted.
 RESUME_PREFIX = "auto_resume:"
 # The control file's contract: exactly these keys.
-CONTROL_KEYS = ("dispatch", "reason", "until", "changed_at")
+CONTROL_KEYS = ("dispatch", "mode", "reason", "until", "changed_at")
 
 # How far under its own threshold a bucket has to fall before a reading counts
 # as "the window rolled" rather than as one percent of measurement noise.
@@ -109,6 +133,30 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def local_lane_ready(cfg: Any) -> bool:
+    """Whether there is a local lane to hand the work to at all.
+
+    Only `local_enabled`: the engine may be down (the launcher starts it) and
+    the backlog may be empty (the loop stages one), but with the lane switched
+    off in config.json a bucket stop has nowhere to go and must stay a stop.
+    """
+    return bool(getattr(cfg, "local_enabled", False))
+
+
+def mode_for(cfg: Any, dispatch: str, reason: Any) -> str:
+    """running | local-only | stopped for a switch written with this reason.
+
+    The single place the LOCAL-ONLY decision is made, so the file, the gate and
+    the panel can never disagree about it.
+    """
+    if dispatch != STOPPED:
+        return RUNNING
+    who = reason.strip() if isinstance(reason, str) and reason.strip() else OPERATOR
+    if who in LOCAL_REASONS and local_lane_ready(cfg):
+        return LOCAL_ONLY
+    return STOPPED
+
+
 # -------------------------------------------------------------- read / write
 
 def read_control(cfg: Config) -> str:
@@ -120,20 +168,40 @@ def read_control(cfg: Config) -> str:
     return read_record(cfg)["dispatch"]
 
 
+def read_mode(cfg: Config) -> str:
+    """running | local-only | stopped - what the loop may launch right now."""
+    return read_record(cfg)["mode"]
+
+
 def read_record(cfg: Config) -> dict[str, Any]:
-    """{dispatch, reason, until, changed_at} - the whole switch. Never raises.
+    """{dispatch, mode, reason, until, changed_at} - the switch. Never raises.
 
     `until` and `changed_at` come back as datetimes (None when absent or
     unparseable), and a stop carrying no readable reason reads as `operator`.
+
+    `mode` is taken from the file when it holds one of CONTROL_MODES and is
+    derived from `dispatch` + `reason` otherwise, so a control.json written
+    before the field existed - or by hand - still says LOCAL-ONLY on a bucket
+    stop rather than parking the local lane with the cloud.
     """
     data = _load(cfg.control_file) or {}
-    mode = STOPPED if data.get("dispatch") == STOPPED else RUNNING
+    dispatch = STOPPED if data.get("dispatch") == STOPPED else RUNNING
     raw = data.get("reason")
     reason = raw.strip() if isinstance(raw, str) and raw.strip() else None
-    if mode == STOPPED and reason is None:
+    if dispatch == STOPPED and reason is None:
         reason = OPERATOR
+    stored = data.get("mode")
+    if isinstance(stored, str) and stored in CONTROL_MODES:
+        # A stored mode is still checked against `dispatch`: the two are
+        # written together, and a hand-edited "local-only" on a running switch
+        # would otherwise zero the cloud lane with nothing having stopped it.
+        mode = RUNNING if dispatch == RUNNING else (
+            stored if stored != RUNNING else STOPPED)
+    else:
+        mode = mode_for(cfg, dispatch, reason)
     return {
-        "dispatch": mode,
+        "dispatch": dispatch,
+        "mode": mode,
         "reason": reason,
         "until": parse_iso(data.get("until")),
         "changed_at": parse_iso(data.get("changed_at")),
@@ -174,7 +242,11 @@ def write_control(cfg: Config, mode: str, reason: str | None = None,
         reason = reason.strip() if isinstance(reason, str) and reason.strip() \
             else None
         until_txt = None
-    body = json.dumps({"dispatch": mode, "reason": reason, "until": until_txt,
+    # Stored beside `dispatch`, never instead of it: a bucket stop is a stop as
+    # far as every cloud launch is concerned, and `local-only` only says who is
+    # allowed to keep working underneath it.
+    body = json.dumps({"dispatch": mode, "mode": mode_for(cfg, mode, reason),
+                       "reason": reason, "until": until_txt,
                        "changed_at": utcnow().isoformat()})
     path = cfg.control_file
     tmp = path.parent / f"{path.name}.tmp"
@@ -199,13 +271,52 @@ def write_control(cfg: Config, mode: str, reason: str | None = None,
     return mode
 
 
-def gate_decision(decision: Decision, mode: str,
-                  reason: str | None = None) -> Decision:
+def local_concurrency(cfg: Any) -> int:
+    """`local_concurrency` from config.json; 1 when it is missing or junk.
+
+    One by default and one in practice: the engine holds ~31.5GB of a 32GB
+    card, so a second concurrent local session has nowhere to decode.
+    """
+    raw = getattr(cfg, "local_concurrency", 1)
+    try:
+        if isinstance(raw, bool):
+            raise TypeError
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    return max(0, value)
+
+
+def keep_local_running(cfg: Any) -> bool:
+    """`local_keep_running`: leave the local lane up after the cloud resumes.
+
+    Off by default, which is what makes the lane DRAIN at the reset: the task
+    in flight finishes, nothing new starts, and the engine gives the card back.
+    """
+    return bool(getattr(cfg, "local_keep_running", False))
+
+
+def gate_decision(decision: Decision, mode: str, reason: str | None = None,
+                  cfg: Any = None) -> Decision:
     """Decision the dispatcher may act on, given the switch.
 
-    Stopped drops every launch budget (cloud and local) to zero, which is what
-    keeps `Dispatcher.apply` from starting anything new; apply still reaps and
-    finalizes adopted work first, so nothing running is disturbed.
+    Three outcomes, one per mode:
+
+      running     the decision as made. The local lane is whatever
+                  `scheduler.decide_local` set - except that
+                  `local_keep_running` floors it, which is the opt-out from
+                  the drain below.
+      local-only  cloud launches drop to zero for every tier (so the fork is
+                  not re-armed either, its gate reading `dispatch`) and the
+                  local lane gets `local_concurrency`, default 1. This is the
+                  bucket stop as the operator meant it: the week's Claude
+                  budget is spent, so the 27B on the 5090 takes over.
+      stopped     both budgets zero - the operator's STOP, and a snapshot
+                  pass, mean everything off.
+
+    Nothing running is disturbed in any of them: `Dispatcher.apply` reaps and
+    finalizes adopted work before it reads either budget, so a lane drains by
+    launching nothing rather than by being killed.
 
     `reason` names who parked it, and the sentence carries it: this line is
     what `status` prints as "last decision" and what state.json stores, and
@@ -213,10 +324,21 @@ def gate_decision(decision: Decision, mode: str,
     bucket 97%" while itself saying "by operator". No reason given still reads
     as the operator's, the same default `read_record` applies.
     """
-    if mode != STOPPED:
-        return decision
     who = reason.strip() if isinstance(reason, str) and reason.strip() \
         else OPERATOR
+    if mode == LOCAL_ONLY:
+        return Decision(
+            LOCAL_ONLY, 0, False,
+            f"Cloud dispatch stopped {GATE_LABEL.get(who, f'({who})')} "
+            f"(would be {decision.mode}); the local lane takes over.",
+            local_concurrency=local_concurrency(cfg),
+        )
+    if mode != STOPPED:
+        if keep_local_running(cfg) and decision.local_concurrency <= 0:
+            # The opt-out from the drain: the lane keeps a task running beside
+            # the cloud rather than giving the card back at the reset.
+            decision.local_concurrency = local_concurrency(cfg)
+        return decision
     return Decision(
         STOPPED, 0, False,
         f"Dispatch stopped {GATE_LABEL.get(who, f'({who})')} "
@@ -404,6 +526,12 @@ def stopped_text(cfg: Config, record: dict[str, Any] | None = None,
         until = record.get("until")
         if _owns_goal_stop(cfg, stop) and reason != WEEKLY_GOAL:
             reason, until = WEEKLY_GOAL, None
+        if record.get("mode") == LOCAL_ONLY:
+            # A different sentence, not a decorated STOPPED one: nothing is
+            # parked here, the work moved to the other engine.
+            from .local_lane import band_text
+
+            return band_text(cfg, str(reason), until, short=short)
         tail = ""
         if isinstance(until, datetime):
             from .clock import fmt_local

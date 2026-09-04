@@ -22,7 +22,10 @@ Three things the day page carries that a window page cannot:
     fork_runs   one row per run of the director fork today, in start order,
                 from the append-only state/handover.log, the current
                 state/handover.json record, and - for a fork that ran before
-                the log existed - the fork transcript's own first and last turn
+                the log existed - the fork transcript's OWN first and last
+                turn, which is not where that file begins: a forked transcript
+                opens with a verbatim copy of the parent's history, so its own
+                run starts at the brief inside it (`fork_own_run`)
     windows     the append-only list above, one card per generation
     day totals  the whole day recomputed, not a sum of the slices (a sum would
                 double-count nothing but would also inherit every window's
@@ -30,9 +33,13 @@ Three things the day page carries that a window page cannot:
 
 The day boundary is the operator's, not UTC's: `clock` resolves local midnight
 (America/Chicago here, through zoneinfo or the fixed offset) and the file is
-named for that local date. Every timestamp INSIDE the file stays ISO UTC, like
-every other file this project writes; the page renders them in the zone the
-`timezone` block names.
+named for that local date. Every TIMESTAMP inside the file stays ISO UTC, like
+every other file this project writes. Beside each one the fork rows and the
+window cards also carry the same instant as a STRING already rendered through
+`clock` - `started_local`, `finished_local`, `span_local`, `generated_local` -
+so the page prints the operator's clock whatever opens it, and so a reader of
+the JSON is never left comparing a Central afternoon against a UTC evening
+with nothing on the row saying which is which.
 
 Nothing here raises for a reason a reader could have anticipated: a missing
 handover log, a torn day summary, a repo git cannot answer for, a transcript
@@ -65,10 +72,18 @@ DAY_SUMMARY_SUFFIX = "-day-summary.json"
 # when, and only when, DATA carries this block.
 DAY_KEYS = ("day", "date", "fork_runs", "windows")
 WINDOW_KEYS = ("seq", "reason", "window", "generated_at", "totals_by_model",
-               "cost_total", "tier_blocks", "commits")
+               "cost_total", "tier_blocks", "commits", "span_local",
+               "generated_local")
 # One row per run of the fork. `status` is the handover record's own word, plus
 # one this file adds for a run only the transcript remembers.
-RUN_KEYS = ("run", "task_id", "model", "started_at", "finished_at", "minutes",
+#
+# The three `*_local` keys are the SAME instants as `started_at` /
+# `finished_at`, rendered once, here, on the operator's clock. The stored
+# stamps stay ISO UTC like every other timestamp this project writes; the
+# strings beside them are what the table prints, so a reader is never handed a
+# UTC wall clock next to a local one and left to spot the difference.
+RUN_KEYS = ("run", "task_id", "model", "started_at", "finished_at",
+            "started_local", "finished_local", "span_local", "minutes",
             "tokens", "total_tokens", "cost_usd", "fork_session_id", "commits",
             "status", "source")
 # The three counters `dispatch._finalize_record` sums into the handover
@@ -77,10 +92,25 @@ RUN_KEYS = ("run", "task_id", "model", "started_at", "finished_at", "minutes",
 # because the two are different quantities and one column cannot hold both.
 BILLED_KEYS = ("input_tokens", "output_tokens", "cache_creation_input_tokens")
 STATUS_UNRECORDED = "unrecorded"
+# The status of a run no handover record ever described: the transcript is the
+# only thing that remembers it, and the row says so rather than saying nothing.
+# "unrecorded" stays the word for a FIELD nobody wrote (a model the transcript
+# could not name), which is a different claim from "this whole run is only
+# remembered by its transcript".
+STATUS_TRANSCRIPT = "transcript"
 SOURCE_LOG = "handover.log"
 SOURCE_RECORD = "handover.json"
 SOURCE_TRANSCRIPT = "transcript"
 SHORT_ID = 8
+# What a run's model reads when two models split its own turns evenly. The same
+# word `ledger.MIXED_TIER` uses for a model that landed in both tiers, for the
+# same reason: naming one of the two would be a claim the file cannot support.
+MODEL_MIXED = "mixed"
+# How a stamp is rendered for the page: month-day and the wall clock, which is
+# what the template's own `stamp()` prints, so a stored string and a fallback
+# render identically.
+LOCAL_FORMAT = "%m-%d %H:%M"
+LOCAL_ARROW = "→"
 # A day is a whole day of forks at most; the cap is there so a corrupted log
 # cannot turn one page into a memory problem.
 RUN_MAX = 200
@@ -255,6 +285,11 @@ def window_entry(cfg: Config, seq: int, reason: str, start: datetime,
     page draws a window card from this entry alone.
     """
     stats = segment_stats(cfg, start, end, graph)
+    at = now or utcnow()
+    # Stored once, in both clocks, for the same reason a run row carries both:
+    # the card is drawn from this entry alone, and an entry that only held UTC
+    # would be drawn as UTC forever - it is never rewritten.
+    shown = local_span(start, end, cfg)
     return {
         "seq": int(seq),
         "reason": str(reason or ledger.REASON_MANUAL),
@@ -263,7 +298,9 @@ def window_entry(cfg: Config, seq: int, reason: str, start: datetime,
             "end": end.isoformat(),
             "hours": round(max(0.0, (end - start).total_seconds()) / 3600, 2),
         },
-        "generated_at": (now or utcnow()).isoformat(),
+        "generated_at": at.isoformat(),
+        "span_local": shown["span"],
+        "generated_local": local_stamp(at, cfg, with_label=True),
         "totals_by_model": stats["totals_by_model"],
         "cost_total": stats["cost_total"],
         "tier_blocks": stats["tier_blocks"],
@@ -281,6 +318,49 @@ def _number(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def local_stamp(value: Any, cfg: Config, fmt: str = LOCAL_FORMAT,
+                with_label: bool = False) -> str:
+    """One stored ISO UTC stamp on the operator's clock; "" when it is not one.
+
+    The whole conversion for the day page happens here and in `local_span`,
+    through `clock`, for the reason `clock`'s own docstring gives: the file
+    stores UTC and the page shows the zone the operator reads. A row that
+    printed `started_at` straight would show a Central afternoon as an evening
+    and nothing on the page would say which of the two it meant.
+
+    `with_label` is for a time that stands on its own on the page; a time in a
+    column the table has already labelled does not repeat the zone.
+    """
+    from .clock import fmt_local
+
+    return fmt_local(value, fmt, cfg, with_label=with_label, fallback="")
+
+
+def local_span(began: Any, ended: Any, cfg: Config,
+               fmt: str = LOCAL_FORMAT) -> dict[str, str]:
+    """{start, end, span} for one pair of stored stamps, on the local clock.
+
+    `span` carries the zone label, because it is the string that stands alone
+    on the page: a bare wall clock beside a UTC timestamp is ambiguous exactly
+    where it matters. A missing end (a fork still running) renders as an open
+    span rather than as an empty cell.
+    """
+    from .clock import label
+
+    lo = local_stamp(began, cfg, fmt)
+    hi = local_stamp(ended, cfg, fmt)
+    zone = label(cfg)
+    if lo and hi:
+        span = f"{lo} {LOCAL_ARROW} {hi} {zone}"
+    elif lo:
+        span = f"{lo} {LOCAL_ARROW} … {zone}"
+    elif hi:
+        span = f"… {LOCAL_ARROW} {hi} {zone}"
+    else:
+        span = ""
+    return {"start": lo, "end": hi, "span": span}
 
 
 def _blank_run() -> dict:
@@ -372,6 +452,172 @@ def transcript_bounds(path: Path, start: datetime, end: datetime,
     return first, last
 
 
+def fork_brief_opening(cfg: Config) -> str:
+    """The opening of the fork brief - the needle that marks a fork's own start.
+
+    The same first line `ledger._fork_probe` builds its raw-line needle from,
+    unescaped, because this one is matched against a user message that has
+    already been parsed out of the JSONL. The 20-character floor is that
+    function's too: a one-word brief would match half the transcripts on disk.
+    """
+    text = str(getattr(cfg, "throttle_prompt", "") or "").strip()
+    first = text.splitlines()[0].strip() if text else ""
+    return first[:ledger.FORK_PROBE_CHARS] if len(first) >= 20 else ""
+
+
+def _user_text(entry: Any) -> str:
+    """The prose of one user JSONL entry; "" when it carries none.
+
+    Tool results are skipped for the same reason `ledger.first_user_text` skips
+    them: they are the transcript quoting a file back at itself, and a brief
+    that happens to be quoted in one is not the fork being told it.
+    """
+    message = entry.get("message") if isinstance(entry, dict) else None
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = [str(block.get("text") or "") for block in content
+             if isinstance(block, dict) and block.get("type") != "tool_result"]
+    return " ".join(part for part in parts if part)
+
+
+def _entry_ids(entry: Any) -> set[str]:
+    """Every identifier one JSONL entry can be recognised by across files.
+
+    A `--fork-session` copy repeats the parent's `uuid` and `message.id`
+    verbatim, so either one identifies an inherited entry; a user entry
+    normally has only the uuid.
+    """
+    if not isinstance(entry, dict):
+        return set()
+    found = {_text(entry.get("uuid"))}
+    message = entry.get("message")
+    if isinstance(message, dict):
+        found.add(_text(message.get("id")))
+    return {value for value in found if value}
+
+
+def parent_entry_ids(cfg: Config) -> set[str]:
+    """Every uuid and message id the configured parent transcripts hold.
+
+    The second way to find where a fork's own history begins, used when the
+    brief cannot be matched (an older brief, a hand-edited config): the copy a
+    fork opens with is verbatim, so the first entry the parent does not have is
+    the first the fork wrote for itself.
+    """
+    ids: set[str] = set()
+    for sid in getattr(cfg, "main_session_ids", None) or []:
+        path = ledger.find_transcript(cfg, str(sid))
+        if path is None:
+            continue
+        for entry in ledger._iter_entries(path):
+            ids |= _entry_ids(entry)
+    return ids
+
+
+def _top_model(counts: dict[str, int]) -> str:
+    """The most common model in a run's own turns; MODEL_MIXED on a tie.
+
+    A tie is a real state - a fork that fell back mid-run, or one relaunched on
+    a second model - and naming either half of it would be a claim the
+    transcript does not make. "" when nothing named a model at all.
+    """
+    if not counts:
+        return ""
+    top = max(counts.values())
+    winners = [model for model, hits in counts.items() if hits == top]
+    return winners[0] if len(winners) == 1 else MODEL_MIXED
+
+
+def fork_own_run(cfg: Config, path: Path, start: datetime, end: datetime,
+                 parent_ids: set[str] | None = None,
+                 ) -> tuple[datetime | None, datetime | None, str]:
+    """(own start, own end, model) for ONE fork transcript inside the window.
+
+    A `--resume --fork-session` transcript opens with a VERBATIM copy of the
+    parent's history - same ids, same timestamps - so its first entry is the
+    parent's first message of the day and not the fork's own start. Reading it
+    as the start is what put every transcript-discovered run of 2026-09-03 at
+    05:18 with a twelve-hour span. The fork's own history begins at the first
+    thing the fork was TOLD: the user entry carrying the brief, or - when the
+    brief cannot be matched - the first user entry the parent transcript does
+    not also hold.
+
+    The own end returned is the last ASSISTANT stamp among those turns, not the
+    last entry of any kind: a tool result or a hook line landing after the
+    final turn is the harness talking, not the fork working.
+
+    The model is the most common `message.model` across those own turns, turns
+    deduplicated by `message.id` first, so a long turn split over several JSONL
+    entries counts once. `<synthetic>` is not a model that ran (it is the
+    harness's own placeholder) and is not counted.
+    """
+    brief = fork_brief_opening(cfg)
+    parent = parent_entry_ids(cfg) if parent_ids is None else parent_ids
+    briefed: datetime | None = None
+    unknown: datetime | None = None
+    turns: list[tuple[datetime, str, str]] = []
+    for entry in ledger._iter_entries(path):
+        stamp = parse_iso(entry.get("timestamp"))
+        if stamp is None or stamp < start or stamp > end:
+            continue
+        kind = entry.get("type")
+        if kind == "user":
+            if briefed is None and brief and brief in _user_text(entry):
+                briefed = stamp
+            if unknown is None and not (_entry_ids(entry) & parent):
+                unknown = stamp
+            continue
+        if kind != "assistant":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        mid = _text(message.get("id")) or f"noid::{_text(entry.get('uuid'))}"
+        turns.append((stamp, mid, _text(message.get("model"))))
+    began = briefed if briefed is not None else unknown
+    if began is None:
+        return None, None, ""
+    counts: dict[str, int] = {}
+    counted: set[str] = set()
+    ended: datetime | None = None
+    for stamp, mid, model in turns:
+        if stamp < began:
+            continue
+        if ended is None or stamp > ended:
+            ended = stamp
+        if mid in counted:
+            continue
+        counted.add(mid)
+        # `<synthetic>` and friends: the harness's placeholder for a turn no
+        # model produced, which is not an answer to "what did this run on".
+        if model and not model.startswith("<"):
+            counts[model] = counts.get(model, 0) + 1
+    return began, ended or began, _top_model(counts)
+
+
+def parent_seen(cfg: Config, start: datetime, end: datetime, prices: Any,
+                fallback: Any) -> set[str]:
+    """The dedup set the parent sessions have already filled, for the forks.
+
+    Exactly `build_summary`'s and `segment_stats`' rule, main session first:
+    the turns a fork inherited are the parent's, and the shared `seen` set
+    `ledger.parse_transcript` reads and writes is what keeps them out of the
+    fork's own figures. Built here rather than re-derived, so there is one
+    implementation of "whose turn was this" in the project and not two.
+    """
+    seen: set[str] = set()
+    for sid in getattr(cfg, "main_session_ids", None) or []:
+        path = ledger.find_transcript(cfg, str(sid))
+        if path is not None:
+            ledger.parse_transcript(path, start, end, seen, prices, fallback)
+    return seen
+
+
 def _spent(cfg: Config, path: Path | None, start: datetime, end: datetime,
            prices: Any, fallback: Any, seen: set[str] | None = None,
            ) -> tuple[int | None, int | None, float | None]:
@@ -419,7 +665,9 @@ def fork_runs(cfg: Config, start: datetime, end: datetime) -> list[dict]:
         2. state/handover.json - the newest record, in case the log lost its
            append (a torn line, a log that was rotated by hand)
         3. the fork transcripts the ledger discovers for the day, for a run
-           that predates the log entirely: its first and last turn are the span
+           that predates the log entirely: its OWN first and last turn are the
+           span and its own turns name its model - never the parent history the
+           transcript opens with, which is `fork_own_run`'s whole subject
 
     The log is filtered to the day as it is folded (`_touches_day`), not after:
     RUN_MAX caps how many runs the DAY may hold, and a cap applied to the whole
@@ -461,19 +709,30 @@ def fork_runs(cfg: Config, start: datetime, end: datetime) -> list[dict]:
             known.add(sid)
         runs.append({**row, "_began": began, "_ended": ended, "_sid": sid})
 
-    # A fork the log never learned about: the transcript is the record.
+    # A fork the log never learned about: the transcript is the record. Its own
+    # turns, never the parent history it opens with - see `fork_own_run`.
+    parent_ids = parent_entry_ids(cfg)
     for session in ledger.discover_sessions(cfg, start, end):
         if session.get("role") != ledger.FORK_SOURCE:
             continue
         sid = str(session.get("sid") or "")
         if not sid or sid in known or len(runs) >= RUN_MAX:
             continue
-        first, last = transcript_bounds(session["path"], start, end)
+        first, last, model = fork_own_run(cfg, session["path"], start, end,
+                                          parent_ids)
+        if first is None:
+            # Neither the brief nor the parent could place the fork's own
+            # start: the whole transcript is the best the file can say.
+            first, last = transcript_bounds(session["path"], start, end)
+            model = ""
         if first is None:
             continue
         known.add(sid)
-        runs.append({**_blank_run(), "model": str(session.get("model") or ""),
-                     "status": STATUS_UNRECORDED, "source": SOURCE_TRANSCRIPT,
+        # A recorded model still wins: `fork_models` reads what the dispatcher
+        # stamped at launch, which is a statement, where this one is a count.
+        runs.append({**_blank_run(),
+                     "model": str(session.get("model") or "") or model,
+                     "status": STATUS_TRANSCRIPT, "source": SOURCE_TRANSCRIPT,
                      "started_at": first.isoformat(),
                      "finished_at": (last or first).isoformat(),
                      "fork_session_id": sid, "_began": first,
@@ -483,6 +742,12 @@ def fork_runs(cfg: Config, start: datetime, end: datetime) -> list[dict]:
     commits = commit_rows(cfg, start, end)
     taken: set[str] = set()
     out: list[dict] = []
+    # One dedup set for the whole pass, the parent sessions read into it first,
+    # exactly as `build_summary` folds them: a fork's transcript opens with a
+    # verbatim copy of the parent's turns and those are the parent's tokens.
+    # Two runs never share a transcript span, so nothing here dedups a run
+    # against another run.
+    seen = parent_seen(cfg, start, end, prices, fallback)
     for index, row in enumerate(runs):
         began = row["_began"] or start
         ended = row["_ended"] or end
@@ -494,12 +759,10 @@ def fork_runs(cfg: Config, start: datetime, end: datetime) -> list[dict]:
         # when the record already carried a total: a column that read
         # transcript output for one row and a ~50x larger all-in total for the
         # next is worse than a second parse.
-        # `seen` is fresh per row on purpose: two runs never share a transcript
-        # span, so there is nothing for a shared set to dedup.
         billed = row["tokens"]
         usd = row["cost_usd"]
         tokens, parsed_billed, parsed_usd = _spent(cfg, path, began, ended,
-                                                   prices, fallback)
+                                                   prices, fallback, seen)
         billed = billed if billed is not None else parsed_billed
         usd = usd if usd is not None else parsed_usd
         mine: list[dict] = []
@@ -510,12 +773,21 @@ def fork_runs(cfg: Config, start: datetime, end: datetime) -> list[dict]:
             if began <= at <= ended:
                 taken.add(commit["commit"])
                 mine.append(commit)
+        # Stored UTC, shown local: the two `*_at` keys keep the ISO stamps every
+        # other file in this project speaks, and the three `*_local` strings
+        # beside them are the same instants on the operator's clock, converted
+        # once here rather than in whatever reads the file next.
+        shown = local_span(row["started_at"] or None, row["finished_at"] or None,
+                           cfg)
         out.append({
             "run": index + 1,
             "task_id": row["task_id"] or "?",
             "model": row["model"] or "unrecorded",
             "started_at": row["started_at"] or None,
             "finished_at": row["finished_at"] or None,
+            "started_local": shown["start"],
+            "finished_local": shown["end"],
+            "span_local": shown["span"],
             "minutes": round(max(0.0, (ended - began).total_seconds()) / 60.0, 1),
             "tokens": int(tokens) if isinstance(tokens, (int, float)) else None,
             "total_tokens": (int(billed) if isinstance(billed, (int, float))
@@ -570,7 +842,13 @@ def build_day_summary(cfg: Config, day_start: datetime, day_end: datetime,
         "Today's forked sessions come from the append-only "
         "state/handover.log, the current state/handover.json record, and - for "
         "a run older than the log - the fork transcript's own first and last "
-        "turn. Their two token columns are two different quantities and are "
+        "turn, found by the fork brief inside it rather than by the file's "
+        "first line (a forked transcript opens with a verbatim copy of the "
+        "parent's history, so its first line is the parent's). Such a run is "
+        "marked 'transcript', and its model is the one its own assistant turns "
+        "name. Times are shown on the operator's clock; every timestamp stored "
+        "in this file is ISO UTC. Their two token columns are two different "
+        "quantities and are "
         "never added together: output tokens are always counted from the run's "
         "own transcript over its own span, while billed tokens are the input + "
         "output + cache-write sum the handover record carries (the same three "

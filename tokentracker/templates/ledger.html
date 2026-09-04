@@ -2403,6 +2403,14 @@ const DATA = __DATA__;
      "what did today's forks cost", and a reader should not have to add up a
      column to answer it. */
 
+  /* A time the writer already rendered on the operator's clock, or this page's
+     own conversion of the stored ISO UTC stamp beside it. Both paths print the
+     same "MM-DD HH:MM", so a mixed table reads as one column. */
+  function localOr(local, iso) {
+    if (typeof local === "string" && local.trim()) return local.trim();
+    return iso ? stamp(iso) : "—";
+  }
+
   function statusPill(status) {
     var s = String(status || "").toLowerCase();
     var cls = "pill pill--sm";
@@ -2468,8 +2476,12 @@ const DATA = __DATA__;
       tr.appendChild(el("td", "n", String(run === null ? i + 1 : run)));
       tr.appendChild(el("td", "id", txt(r.task_id)));
       tr.appendChild(el("td", "id", shortModel(r.model)));
-      tr.appendChild(el("td", "id", r.started_at ? stamp(r.started_at) : "—"));
-      tr.appendChild(el("td", "id", r.finished_at ? stamp(r.finished_at) : "—"));
+      /* The row's own local strings when it has them: day_ledger converts
+         through `clock` once, at write time, so a stored figure and the page
+         cannot disagree about which clock they are on. `stamp()` stays the
+         fallback for a row written before those keys existed. */
+      tr.appendChild(el("td", "id", localOr(r.started_local, r.started_at)));
+      tr.appendChild(el("td", "id", localOr(r.finished_local, r.finished_at)));
       var m = num(r.minutes);
       if (m !== null) mins += m;
       tr.appendChild(el("td", "n", m === null ? "—" : m.toFixed(1)));
@@ -2559,9 +2571,11 @@ const DATA = __DATA__;
     var head = el("div", "win-head");
     head.appendChild(el("span", "win-seq",
       "WINDOW " + seq + " OF " + WINDOWS.length));
-    head.appendChild(el("span", "win-span",
-      (win.start ? stamp(win.start) : "n/a") + " → " +
-      (win.end ? stamp(win.end) : "n/a") + " " + TZ_LABEL));
+    var span = (typeof entry.span_local === "string" && entry.span_local.trim())
+      ? entry.span_local.trim()
+      : ((win.start ? stamp(win.start) : "n/a") + " → " +
+         (win.end ? stamp(win.end) : "n/a") + " " + TZ_LABEL);
+    head.appendChild(el("span", "win-span", span));
     if (last) {
       var pill = el("span", "pill pill--sm pill--ok");
       pill.appendChild(el("span", "dot"));
@@ -2576,7 +2590,11 @@ const DATA = __DATA__;
     var hours = num(win.hours);
     if (hours !== null) meta.appendChild(el("span", null, hours.toFixed(2) + " h"));
     meta.appendChild(el("span", null,
-      "generated " + (entry.generated_at ? stamp(entry.generated_at) : "n/a")));
+      "generated " + (
+        (typeof entry.generated_local === "string" && entry.generated_local.trim())
+          ? entry.generated_local.trim()
+          : (entry.generated_at ? stamp(entry.generated_at) + " " + TZ_LABEL
+                                : "n/a"))));
     card.appendChild(meta);
 
     var cols = el("div", "win-cols");

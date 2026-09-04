@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 TASK_STATUSES = ("pending", "running", "done", "failed", "killed")
-MODES = ("pace", "coast", "yield", "surge", "blocked", "stopped")
+# "local-only" is a working mode, not a parked one: the cloud lane is at zero
+# because a budget bucket is spent, and the local engine has the shift.
+MODES = ("pace", "coast", "yield", "surge", "blocked", "stopped", "local-only")
 WEEK_HOURS = 168.0
 
 
@@ -103,6 +105,12 @@ class TaskSpec:
     max_minutes: int = 90
     status: str = "pending"
     lane: str | None = None
+    # The lane this row may run on at all: "local" for a backlog brief (its
+    # prompt is written for the local engine's rules and its containment
+    # header), "cloud" for a row that must not be handed to a 27B model, None
+    # for anything either lane can take. Set when the row is built; `lane` is
+    # what it actually launched on.
+    lane_pref: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     pid: int | None = None

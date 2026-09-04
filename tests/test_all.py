@@ -43,6 +43,12 @@ def make_cfg(snapshot: dict | None = None) -> Config:
         # every multi-tick test that happens to run after 23:00 local queue an
         # end-of-day screenshot pass and change what it launches.
         snapshot=({"enabled": False} if snapshot is None else snapshot),
+        # Hermetic: the local backlog's fallback staging reads
+        # <repo>/dev_JSON/HANDOFF.md, and the shipped default for that repo is
+        # the real StarGTA checkout. Pointed at the temp root here so a tick
+        # test never parses the operator's actual hand-off; the tests that
+        # exercise the parser write their own fixture under this root.
+        local_backlog_repo=str(tmp),
     )
     for d in (cfg.state_dir, cfg.logs_dir, cfg.projects_dir):
         d.mkdir(parents=True, exist_ok=True)
@@ -1334,11 +1340,20 @@ def test_allocator_writes_the_fable_hard_stop():
 
 
 def test_tick_stops_on_the_fable_bucket_and_resumes_at_its_reset():
-    # End to end: the poll that crosses 97% parks dispatch, and the poll after
-    # the Fable window resets starts it again with nobody at the keyboard.
-    from tokentracker import cli, control
+    # End to end: the poll that crosses 97% takes the CLOUD lane away, and the
+    # poll after the Fable window resets gives it back with nobody at the
+    # keyboard. With a local lane configured (this cfg has one) the bucket stop
+    # is LOCAL-ONLY, not stopped: the queued row moves to the 5090 rather than
+    # waiting out the week. That is the correction of 2026-09-03 - the old
+    # behaviour stopped everything and left the card idle.
+    from tokentracker import cli, control, local_lane
     cfg = _gate_cfg()
     d, launched = _gate_dispatcher(cfg)
+    # What the 5090 picks up is a BRIEF, never the queued cloud row: "pod"
+    # carries no containment header, so it stays pending (see
+    # test_local_only_never_hands_an_uncontained_row_to_the_local_engine).
+    local_lane.add_briefs(cfg, [{"title": "Licence row",
+                                 "prompt": "Edit docs/LICENSES.md."}])
     history = usage.UsageHistory(cfg)
     reset = utcnow() + timedelta(hours=6)
 
@@ -1354,25 +1369,38 @@ def test_tick_stops_on_the_fable_bucket_and_resumes_at_its_reset():
     try:
         decision, actions, _e, _s, _r = cli._tick(cfg, d, history)
         assert any("fable bucket" in a for a in actions), actions
-        assert decision.mode == "stopped", decision
-        assert launched == [], launched
+        assert decision.mode == control.LOCAL_ONLY, decision
+        assert decision.target_concurrency == 0, decision
+        assert decision.local_concurrency == 1, decision
+        # The cloud lane is shut and the work moved: the backlog brief launches
+        # on the local engine, not on Claude - and the cloud row waits.
+        assert [lane for _id, lane in launched] == ["local"], launched
+        assert launched[0][0].startswith(local_lane.WORKER_PREFIX), launched
+        assert d.get("pod").status == "pending", d.get("pod")
         record = control.read_record(cfg)
+        assert record["dispatch"] == control.STOPPED, record
+        assert record["mode"] == control.LOCAL_ONLY, record
         assert record["reason"] == control.FABLE_BUCKET, record
         assert record["until"] == reset, record
         # The wiring, not just the gate: the decision this tick stored says
-        # which bucket parked it, so `status`'s "last decision" line agrees
-        # with the STOPPED band above it instead of blaming the operator.
+        # which bucket took the cloud away, so `status`'s "last decision" line
+        # agrees with the band above it instead of blaming the operator.
         assert "on the fable bucket" in decision.reason, decision.reason
+        assert "local lane takes over" in decision.reason, decision.reason
 
         # The window rolls: 0% Fable, a reset a week out, and the stored until
-        # now in the past. The same tick resumes and launches.
+        # now in the past. The same tick resumes and launches on the cloud
+        # again - and the local lane drains, launching nothing new.
+        launched.clear()
         control.write_control(cfg, control.STOPPED, reason=control.FABLE_BUCKET,
                               until=utcnow() - timedelta(seconds=1))
         usage.fetch_usage = lambda _cfg: fable_snap(
             0.0, utcnow() + timedelta(hours=168))
-        _decision, actions2, _e, _s, _r = cli._tick(cfg, d, history)
+        decision2, actions2, _e, _s, _r = cli._tick(cfg, d, history)
         assert any("dispatch resumed: fable" in a for a in actions2), actions2
         assert control.read_control(cfg) == control.RUNNING
+        assert control.read_mode(cfg) == control.RUNNING
+        assert decision2.local_concurrency == 0, decision2
         assert launched == [("pod", "cloud")], launched
     finally:
         usage.fetch_usage = real_fetch
@@ -1871,23 +1899,32 @@ def test_goal_stop_replaces_an_unreadable_record():
 def test_tick_stops_dispatch_at_weekly_goal():
     # The wiring inside cli._tick: the goal check runs before anything launches,
     # gates that same tick, and the state names the stop reason.
-    from tokentracker import cli, control, goal
+    from tokentracker import cli, control, goal, local_lane
     cfg = _gate_cfg()
     goal.write_goal(cfg, 0.90)
     d, launched = _gate_dispatcher(cfg)
+    local_lane.add_briefs(cfg, [{"title": "Licence row",
+                                 "prompt": "Edit docs/LICENSES.md."}])
     history = usage.UsageHistory(cfg)
     real_fetch = usage.fetch_usage
     usage.fetch_usage = lambda _cfg: snap(0.95, left_h=100.0)
     try:
         decision, actions, _exc, _snap, _rolled = cli._tick(cfg, d, history)
-        assert decision.mode == "stopped", decision
-        assert launched == [], launched
+        # The weekly goal is a budget bucket like the others, and this cfg has
+        # a local lane: the cloud stops, and the 5090 picks up a BRIEF - never
+        # the queued cloud row, which carries no containment header.
+        assert decision.mode == control.LOCAL_ONLY, decision
+        assert [lane for _id, lane in launched] == ["local"], launched
+        assert launched[0][0].startswith(local_lane.WORKER_PREFIX), launched
+        assert d.get("pod").status == "pending", d.get("pod")
         assert control.read_control(cfg) == control.STOPPED
+        assert control.read_mode(cfg) == control.LOCAL_ONLY
         stop = json.loads(cfg.stop_file.read_text(encoding="utf-8"))
         assert list(stop) == ["reason", "goal", "weekly", "at"], stop
         assert any("weekly goal" in a for a in actions), actions
         state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
-        assert state["decision"]["mode"] == "stopped", state
+        assert state["decision"]["mode"] == control.LOCAL_ONLY, state
+        assert state["mode"] == control.LOCAL_ONLY, state
         assert state["decision"]["stop_reason"] == goal.STOP_REASON, state
         assert abs(state["weekly_goal"] - 0.90) < 1e-9, state
         assert state["goal_stop"] == stop, state
@@ -1902,16 +1939,19 @@ def test_tick_stops_dispatch_at_weekly_goal():
         # and the weekly window's own reset as its `until`.
         record = control.read_record(cfg)
         assert record["reason"] == control.WEEKLY_GOAL, record
+        launched.clear()
         usage.fetch_usage = lambda _cfg: snap(0.05, left_h=160.0)
         decision, actions3, _e, _s, _r = cli._tick(cfg, d, history)
         assert not cfg.stop_file.exists()
         assert any("dispatch resumed: weekly" in a for a in actions3), actions3
         assert control.read_control(cfg) == control.RUNNING
         assert control.read_record(cfg)["reason"] == "auto_resume:weekly_goal"
-        assert decision.mode != "stopped", decision
+        assert decision.mode not in ("stopped", control.LOCAL_ONLY), decision
         # And the same tick re-arms the work: the fork's cooldown still applies
-        # but a queued row launches at once.
+        # but a queued row launches at once - on the cloud, because the local
+        # lane drains rather than keeping the card.
         assert launched == [("pod", "cloud")], launched
+        assert decision.local_concurrency == 0, decision
         state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
         assert state["goal_stop"] is None, state
     finally:
@@ -4165,7 +4205,10 @@ def test_day_ledger_fork_runs_from_the_handover_log():
     ]), encoding="utf-8")
     runs = day_ledger.fork_runs(cfg, start, end)
     assert len(runs) == 4, [r["fork_session_id"] for r in runs]
-    assert runs[3]["status"] == day_ledger.STATUS_UNRECORDED, runs[3]
+    # "transcript", not "unrecorded": the run IS recorded, by the only file
+    # that saw it. And its model is the one its own assistant turn names.
+    assert runs[3]["status"] == day_ledger.STATUS_TRANSCRIPT, runs[3]
+    assert runs[3]["model"] == "claude-opus-5", runs[3]
     assert runs[3]["source"] == day_ledger.SOURCE_TRANSCRIPT, runs[3]
     assert runs[3]["fork_session_id"] == fork_id[:8], runs[3]
     # Nothing recorded its tokens, so they are priced off the transcript - and
@@ -4180,6 +4223,108 @@ def test_day_ledger_fork_runs_from_the_handover_log():
         encoding="utf-8")
     assert ">Today's forked sessions</h2>" in html, "the fork table's heading"
     assert '"claude-fable-5-1"' in html and '"aaaaaaaa"' in html, "its rows"
+
+
+def test_day_ledger_fork_run_reads_its_own_turns_not_the_parents_copy():
+    """A transcript-discovered run is its OWN turns, on the operator's clock.
+
+    The bug this pins was visible on reports/2026-09-03: eight forks, every one
+    of them "unrecorded", every one starting at 05:18 with a twelve-hour span,
+    and every time on the page in UTC. All three are one shape of mistake -
+    reading a `--fork-session` transcript as if the file began where the fork
+    did. It does not: it opens with a VERBATIM copy of the parent's history, so
+    its first entry is the parent's first message of the day, its first models
+    are the parent's models, and the span built from them is the parent's day.
+
+    The fixture is that file: two entries copied from the parent, then the
+    brief, then four turns of the fork's own on a different model.
+    """
+    from tokentracker import clock, day_ledger, handover
+    cfg = _ledger_cfg()
+    start, end, _date = day_ledger.day_bounds(cfg)
+    proj = cfg.projects_dir / "proj"
+
+    # The parent: two entries early in the day, on the parent's own model.
+    parent_first = _day_at(cfg, 0.05)
+    parent = [
+        json.dumps({"type": "user", "uuid": "p-u1",
+                    "timestamp": parent_first.isoformat(),
+                    "message": {"role": "user", "content": "carry on"}}),
+        _entry("p-m1", "claude-fable-5-1", _day_at(cfg, 0.06).isoformat(),
+               ["Read"], _usage(out=900, inp=90), uuid="p-u2"),
+    ]
+    (proj / f"{MAIN_ID}.jsonl").write_text("\n".join(parent), encoding="utf-8")
+
+    # The fork: that copy, verbatim, then the brief and four turns of its own.
+    fork_id = "22222222-3333-4444-5555-666666666666"
+    briefed = _day_at(cfg, 0.50)
+    own = [json.dumps({"type": "user", "uuid": "f-brief",
+                       "timestamp": briefed.isoformat(),
+                       "message": {"role": "user",
+                                   "content": cfg.throttle_prompt}})]
+    turn_at = [_day_at(cfg, 0.52 + 0.02 * i) for i in range(4)]
+    for i, at in enumerate(turn_at):
+        own.append(_entry(f"f-m{i}", "claude-opus-5", at.isoformat(), ["Edit"],
+                          _usage(out=100, inp=10), uuid=f"f-u{i}"))
+    (proj / f"{fork_id}.jsonl").write_text("\n".join(parent + own),
+                                           encoding="utf-8")
+
+    runs = day_ledger.fork_runs(cfg, start, end)
+    assert len(runs) == 1, [r["fork_session_id"] for r in runs]
+    row = runs[0]
+    assert row["source"] == day_ledger.SOURCE_TRANSCRIPT, row
+    assert row["status"] == day_ledger.STATUS_TRANSCRIPT, row
+    # The model its own turns ran on, not the parent's and not "unrecorded".
+    assert row["model"] == "claude-opus-5", row
+    # The span opens at the brief - the first thing the fork was told - and not
+    # at the parent's first message, which is where the file opens.
+    assert row["started_at"] == briefed.isoformat(), row
+    assert row["started_at"] != parent_first.isoformat(), row
+    # And it ends on the last ASSISTANT turn of the run's own.
+    assert row["finished_at"] == turn_at[-1].isoformat(), row
+    assert row["minutes"] == round(
+        (turn_at[-1] - briefed).total_seconds() / 60.0, 1), row
+    # Four own turns at 100 output each. The parent's 900 stay the parent's:
+    # the dedup set `ledger.parse_transcript` reads and writes is filled from
+    # the main session first, exactly as build_summary fills it.
+    assert row["tokens"] == 400, row
+    assert row["total_tokens"] == 4 * (100 + 10), row
+
+    # Every time the table prints is Central, and says so.
+    assert clock.label(cfg) == "CT", clock.label(cfg)
+    assert row["started_local"] == clock.fmt_local(briefed, "%m-%d %H:%M", cfg)
+    assert row["finished_local"] == clock.fmt_local(turn_at[-1], "%m-%d %H:%M",
+                                                    cfg)
+    assert row["span_local"] == (f"{row['started_local']} "
+                                 f"{day_ledger.LOCAL_ARROW} "
+                                 f"{row['finished_local']} CT"), row
+    # Not the stored UTC wall clock relabelled: Central is never UTC+0.
+    assert row["started_local"][-5:] != briefed.strftime("%H:%M"), row
+    assert row["started_at"].endswith("+00:00"), "the file still stores UTC"
+
+    # A handover record for the SAME session id, and the log path wins outright:
+    # one row, its recorded span, model, status and bill. The transcript still
+    # supplies the output tokens, because nothing else counts them.
+    logged_start, logged_end = _day_at(cfg, 0.45), _day_at(cfg, 0.75)
+    handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                            model="claude-fable-5-1", parent_session=MAIN_ID,
+                            started_at=logged_start.isoformat())
+    handover.finish_handover(cfg, status="done",
+                             finished_at=logged_end.isoformat(),
+                             tokens=9999, cost_usd=1.25,
+                             fork_session_id=fork_id)
+    runs = day_ledger.fork_runs(cfg, start, end)
+    assert len(runs) == 1, [(r["source"], r["fork_session_id"]) for r in runs]
+    row = runs[0]
+    assert row["source"] == day_ledger.SOURCE_LOG, row
+    assert row["status"] == handover.STATUS_DONE, row
+    assert row["model"] == "claude-fable-5-1", row
+    assert row["started_at"] == logged_start.isoformat(), row
+    assert row["finished_at"] == logged_end.isoformat(), row
+    assert row["total_tokens"] == 9999 and row["cost_usd"] == 1.25, row
+    assert row["tokens"] == 400, row
+    assert row["started_local"] == clock.fmt_local(logged_start, "%m-%d %H:%M",
+                                                   cfg), row
 
 
 def test_day_ledger_fork_run_tokens_are_one_quantity_from_either_source():
@@ -7758,6 +7903,758 @@ def test_extraction_windows_exclude_the_neighbouring_days():
     # And the commit reader agrees about the same two commits.
     assert len(ledger.author_commits(repo, start, end)) == 1
     assert len(ledger.author_commits(repo, utcnow() - timedelta(hours=12), end)) == 2
+
+
+# ------------------------------------------- the local lane (LOCAL-ONLY mode)
+#
+# The operator's correction of 2026-09-03: "The current auto tunner stop all
+# tasks when weekly limit is reached, but originally in such condition
+# FreeToken should be activated and take over the works". Everything below is
+# that sentence, asserted.
+
+PREAMBLE = "You are the local Qwen backup agent. No GPU work."
+
+HANDOFF_FIXTURE = """# Hand-off - run 1
+
+## 3. What is owed, in the order it should be picked up
+1. **The PIE checklist.** Walk the streets and drive among traffic.
+2. **An old item nobody wants.** Superseded by the run below.
+
+# Hand-off (run 9)
+
+## 1. What ran
+Nothing worth repeating.
+
+## 3. What is owed next, in order
+1. **GATE (TD task).** Ladders on both trees, per-lane explicit-path commits.
+   The evidence must be archived per lane.
+2. **Open look item**: the beta frames read as evening at 13:30.
+3. **`docs/LICENSES.md` needs the City Sample row.** A documentation edit,
+   nothing else.
+4. **Spaceflight streaming-source control.** Re-issue it with a brief; both
+   numbers must be measured, not chosen.
+5. **The operator's PIE session** for Beta-0 part B.
+6. **Known Issue #25** still needs a packaged build to settle.
+
+## 4. Traps
+Not a list of owed work.
+"""
+
+
+def _lane_cfg() -> Config:
+    """A local-lane cfg: engine configured, preamble set, backlog in the temp root."""
+    cfg = _local_cfg()
+    cfg.local_prompt_preamble = PREAMBLE
+    cfg.local_concurrency = 1
+    return cfg
+
+
+def _write_handoff(cfg: Config, text: str = HANDOFF_FIXTURE) -> None:
+    from tokentracker import local_lane
+    path = local_lane.handoff_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_bucket_stop_becomes_local_only_and_operator_stop_stays_stopped():
+    # The mode transition, at the one place it is decided. A budget bucket
+    # hands the shift over; a person pressing STOP does not.
+    from tokentracker import control
+    cfg = _lane_cfg()
+    until = NOW + timedelta(hours=6)
+    for reason in (control.FABLE_BUCKET, control.WEEKLY_GOAL, control.FIVE_HOUR):
+        control.write_control(cfg, control.STOPPED, reason=reason, until=until)
+        record = control.read_record(cfg)
+        # `dispatch` still reads stopped, which is what keeps every cloud
+        # launch and the fork's arming gate off without knowing the new word.
+        assert record["dispatch"] == control.STOPPED, reason
+        assert record["mode"] == control.LOCAL_ONLY, reason
+        assert control.read_mode(cfg) == control.LOCAL_ONLY, reason
+        payload = json.loads(cfg.control_file.read_text(encoding="utf-8"))
+        assert list(payload) == list(control.CONTROL_KEYS), payload
+        assert payload["mode"] == control.LOCAL_ONLY, payload
+
+    for reason in (control.OPERATOR, control.SNAPSHOT):
+        control.write_control(cfg, control.STOPPED, reason=reason, until=until)
+        assert control.read_mode(cfg) == control.STOPPED, reason
+
+    # Running is running, whoever started it.
+    control.write_control(cfg, control.RUNNING, reason="auto_resume:fable_bucket")
+    assert control.read_mode(cfg) == control.RUNNING
+
+    # And with no local lane configured a bucket stop is still a full stop:
+    # there is nowhere else for the work to go.
+    off = make_cfg()
+    control.write_control(off, control.STOPPED, reason=control.FABLE_BUCKET,
+                          until=until)
+    assert control.read_mode(off) == control.STOPPED
+
+
+def test_local_only_is_derived_for_a_control_file_that_predates_the_field():
+    # A control.json written before `mode` existed, or by hand, still says
+    # LOCAL-ONLY on a bucket stop - and a hand-written "local-only" on a
+    # RUNNING switch is refused, or it would zero the cloud lane for nobody.
+    from tokentracker import control
+    cfg = _lane_cfg()
+    cfg.control_file.write_text(json.dumps(
+        {"dispatch": "stopped", "reason": control.WEEKLY_GOAL}), encoding="utf-8")
+    assert control.read_mode(cfg) == control.LOCAL_ONLY
+    cfg.control_file.write_text(json.dumps(
+        {"dispatch": "stopped", "reason": control.OPERATOR}), encoding="utf-8")
+    assert control.read_mode(cfg) == control.STOPPED
+    cfg.control_file.write_text(json.dumps(
+        {"dispatch": "running", "mode": "local-only"}), encoding="utf-8")
+    assert control.read_mode(cfg) == control.RUNNING
+    for junk in ("{not json", "[]", "", '{"dispatch": "stopped", "mode": 7}'):
+        cfg.control_file.write_text(junk, encoding="utf-8")
+        assert control.read_record(cfg)["mode"] in control.CONTROL_MODES, junk
+
+
+def test_gate_decision_hands_the_shift_to_the_local_lane():
+    # Cloud zero for every tier, local one, and a sentence that names the
+    # bucket - the panel's band and this line are read together.
+    from tokentracker import control
+    cfg = _lane_cfg()
+    d = Decision("surge", 4, True, "throttle", local_concurrency=0)
+    gated = control.gate_decision(d, control.LOCAL_ONLY, control.FABLE_BUCKET, cfg)
+    assert gated.mode == control.LOCAL_ONLY, gated
+    assert gated.target_concurrency == 0 and not gated.allow_heavy, gated
+    assert gated.local_concurrency == 1, gated
+    assert "on the fable bucket" in gated.reason, gated.reason
+    assert "local lane takes over" in gated.reason, gated.reason
+    assert d.target_concurrency == 4, "gate must not mutate the input decision"
+
+    cfg.local_concurrency = 2
+    assert control.gate_decision(d, control.LOCAL_ONLY, None, cfg).local_concurrency == 2
+    for junk in (None, "two", -3, True):
+        cfg.local_concurrency = junk
+        got = control.gate_decision(d, control.LOCAL_ONLY, None, cfg)
+        assert got.local_concurrency >= 0, junk
+    # An operator STOP is still everything off, local included.
+    stopped = control.gate_decision(d, control.STOPPED, control.OPERATOR, cfg)
+    assert stopped.target_concurrency == 0 and stopped.local_concurrency == 0
+
+
+def test_local_lane_drains_when_running_unless_kept_running():
+    # The reset gives the cloud back, and the local lane launches nothing new:
+    # the task in flight finishes and the engine gives the card back. Turning
+    # `local_keep_running` on is the opt-out.
+    from tokentracker import control
+    cfg = _lane_cfg()
+    paced = Decision("pace", 3, True, "behind", local_concurrency=0)
+    assert control.gate_decision(paced, control.RUNNING, None, cfg) is paced
+    assert paced.local_concurrency == 0, paced
+    cfg.local_keep_running = True
+    kept = control.gate_decision(paced, control.RUNNING, None, cfg)
+    assert kept.local_concurrency == 1, kept
+    # And the drain reaches the dispatcher: no local budget, nothing local
+    # running, so the daemon is stopped and the VRAM released.
+    cfg.local_keep_running = False
+    d = dispatch.Dispatcher(cfg)
+    d.local_engine_healthy = True
+    cfg.local_ft_bin = cfg.root / "ft.exe"
+    cfg.local_ft_bin.write_text("", encoding="utf-8")
+    stops: list[list] = []
+    real_popen = dispatch.subprocess.Popen
+    dispatch.subprocess.Popen = lambda cmd, **kw: stops.append(cmd)
+    try:
+        actions = d.apply(Decision("pace", 0, False, "t", local_concurrency=0),
+                          utcnow())
+    finally:
+        dispatch.subprocess.Popen = real_popen
+    assert any("VRAM released" in a for a in actions), actions
+    assert stops and stops[0][1:3] == ["daemon", "stop"], stops
+    assert d.local_engine_healthy is False
+    # Once it is down there is nothing left to stop, so no second attempt.
+    assert d.apply(Decision("pace", 0, False, "t"), utcnow()) == []
+
+
+def test_gpu_guard_reads_the_command_line_for_nullrhi():
+    # UnrealEditor-Cmd.exe is both kinds of process: -NullRHI renders nothing
+    # and can share the card with a loaded model; without it the run owns the
+    # RHI and the 31.5GB engine must not start beside it.
+    headless = ['"C:/UE/UnrealEditor-Cmd.exe" StarGTA.uproject -NullRHI '
+                '-ExecCmds="Automation RunTests SG"']
+    real = ['"C:/UE/UnrealEditor-Cmd.exe" StarGTA.uproject Small_City_LVL '
+            '-game -ExecCmds="SG.Shots 2"']
+    assert dispatch.blocks_gpu("unrealeditor-cmd.exe", headless) is False
+    assert dispatch.blocks_gpu("unrealeditor-cmd.exe", real) is True
+    assert dispatch.blocks_gpu("unrealeditor-cmd.exe", headless + real) is True
+    # No command line readable at all: assume it owns the card. A poll of
+    # delay is cheap; starting the engine beside a real RHI is not.
+    assert dispatch.blocks_gpu("unrealeditor-cmd.exe", []) is True
+    # The editor and the game block on sight, -NullRHI or not.
+    assert dispatch.blocks_gpu("unrealeditor.exe", headless) is True
+    assert dispatch.blocks_gpu("rainbowsix.exe", headless) is True
+
+    cfg = _lane_cfg()
+    cfg.local_gpu_guard_procs = ["UnrealEditor.exe", "UnrealEditor-Cmd.exe",
+                                 "RainbowSix.exe"]
+    d = dispatch.Dispatcher(cfg)
+    listing = ['"unrealeditor-cmd.exe","4242","Console","1","2,000,000 K"']
+    real_sub = dispatch.subprocess
+    real_lines = dispatch.command_lines
+    dispatch.subprocess = types.SimpleNamespace(
+        run=lambda *a, **k: types.SimpleNamespace(stdout="\n".join(listing)),
+        TimeoutExpired=real_sub.TimeoutExpired)
+    try:
+        dispatch.command_lines = lambda name: headless
+        assert d.gpu_guard_proc() is None, "a headless ladder run must not block"
+        dispatch.command_lines = lambda name: real
+        assert d.gpu_guard_proc() == "unrealeditor-cmd.exe"
+        # The editor itself is never asked about its command line.
+        listing.append('"unrealeditor.exe","77","Console","1","9,000,000 K"')
+        dispatch.command_lines = lambda name: headless
+        assert d.gpu_guard_proc() == "unrealeditor.exe"
+    finally:
+        dispatch.subprocess = real_sub
+        dispatch.command_lines = real_lines
+
+
+def test_real_rhi_rows_wait_while_the_local_engine_holds_the_card():
+    # The other direction of the same rule: a shots pass cannot start while the
+    # engine has 31.5GB of the 32. It waits - pending, offered again next poll
+    # - because the local lane drains on its own.
+    cfg = _lane_cfg()
+    from tokentracker import snapshot
+    assert dispatch.needs_real_rhi(TaskSpec(
+        id=snapshot.PREFIX + "20260903T2300", prompt="p", cwd="."))
+    for prompt in ("Run Tools/verify.sh shots", "run beta-shots in D:/UE",
+                   "if beta-warm.ok exists"):
+        assert dispatch.needs_real_rhi(
+            TaskSpec(id="x", prompt=prompt, cwd=".")), prompt
+    for prompt in ("Tools/verify.sh build", "verify.sh auto then smoke",
+                   "verify.sh beta on the beta tree", "soak and free-play"):
+        assert not dispatch.needs_real_rhi(
+            TaskSpec(id="x", prompt=prompt, cwd=".")), prompt
+
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "snapshot-20260903T2300", "prompt": "Run Tools/verify.sh shots",
+         "cwd": str(cfg.root), "priority": 200, "status": "pending"},
+        {"id": "ladder", "prompt": "Run Tools/verify.sh build then auto",
+         "cwd": str(cfg.root), "priority": 10, "status": "pending"},
+    ]}), encoding="utf-8")
+    d = dispatch.Dispatcher(cfg)
+    launched: list[tuple[str, str]] = []
+
+    def fake_launch(task, now, lane="cloud"):
+        task.status = "running"
+        task.lane = lane
+        launched.append((task.id, lane))
+        return f"task {task.id}: launched {lane}"
+
+    d.launch = fake_launch
+    d.local_engine_healthy = True
+    actions = d.apply(Decision("pace", 3, True, "t"), utcnow())
+    assert launched == [("ladder", "cloud")], launched
+    assert d.get("snapshot-20260903T2300").status == "pending"
+    assert any("deferred" in a and "GPU" in a for a in actions), actions
+    # The lane drains: the shots pass goes out on the next poll.
+    launched.clear()
+    d.local_engine_healthy = False
+    d.apply(Decision("pace", 3, True, "t"), utcnow())
+    assert launched == [("snapshot-20260903T2300", "cloud")], launched
+    # And the local lane never takes a real-RHI row either.
+    d.get("snapshot-20260903T2300").status = "pending"
+    launched.clear()
+    d.local_engine_up = lambda: True
+    d.apply(Decision("blocked", 0, False, "t", local_concurrency=1), utcnow())
+    assert launched == [], launched
+
+
+def test_local_prompt_is_preamble_then_containment_then_brief():
+    # The composition, in order, and the containment header's own rules: the
+    # branch cut from main, the three headless rungs, the trailer, the file the
+    # cloud tier reads back.
+    from tokentracker import clock, local_lane
+    cfg = _lane_cfg()
+    brief = local_lane.normalize(
+        cfg, {"title": "Wire the licence row", "prompt": "Edit docs/LICENSES.md."},
+        0, "executive", NOW)
+    text = local_lane.compose_prompt(cfg, brief, NOW)
+    assert text.startswith(PREAMBLE + "\n\n"), text[:120]
+    assert text.endswith("Edit docs/LICENSES.md."), text[-120:]
+    header = local_lane.containment_header(cfg, brief, NOW)
+    assert header in text
+    day = clock.fmt_local(NOW, "%Y-%m-%d", cfg, fallback="")
+    assert f"branch local/{day}" in header, header
+    assert brief["branch"] == f"local/{day}", brief
+    assert f"git checkout -B local/{day} from main" in header, header
+    assert "never push to main" in header
+    assert "only Tools/verify.sh build, auto, smoke" in header
+    assert "never run shots, beta-warm, beta-shots or open the editor" in header
+    assert "Co-Authored-By: Qwen-test (local) <noreply@local>" in header
+    assert "dev_JSON/LOCAL_RESULTS.md" in header
+    assert local_lane.DEFAULT_ACCEPTANCE in header
+
+    # The row carries the whole composition, and the dispatcher does not
+    # prepend the preamble a second time on the way out.
+    task = local_lane.build_worker(cfg, brief, NOW)
+    assert task.lane_pref == "local" and task.model == "Qwen-test"
+    d = dispatch.Dispatcher(cfg)
+    assert d._task_prompt(task, "local") == text
+    assert d._task_prompt(task, "local").count(PREAMBLE) == 1
+
+
+def test_local_backlog_add_list_done_and_clear():
+    import argparse
+    from tokentracker import cli, local_lane
+    cfg = _lane_cfg()
+    payload = cfg.root / "briefs.json"
+    payload.write_text(json.dumps({"briefs": [
+        {"title": "One", "prompt": "Do the first thing.", "repo": str(cfg.root)},
+        {"title": "Two", "prompt": "Do the second thing."},
+        {"title": "No work", "prompt": "   "},
+    ]}), encoding="utf-8")
+
+    def run(**kw) -> str:
+        args = argparse.Namespace(action="list", id=None, file=None,
+                                  result=None, staged_by=None)
+        for key, value in kw.items():
+            setattr(args, key, value)
+        return _capture(lambda: cli.cmd_backlog(cfg, args))
+
+    out = run()
+    assert "empty" in out, out
+    out = run(action="add", file=str(payload), staged_by="executive")
+    assert out.count("added ") == 2, out
+    rows = local_lane.briefs(cfg)
+    assert [r["title"] for r in rows] == ["One", "Two"], rows
+    for row in rows:
+        assert list(row) == list(local_lane.BRIEF_KEYS), row
+        assert row["status"] == "pending" and row["staged_by"] == "executive"
+        assert row["acceptance"] == local_lane.DEFAULT_ACCEPTANCE
+    assert rows[0]["repo"] == str(cfg.root) and rows[1]["repo"] == local_lane.repo_of(cfg)
+
+    # Append-only: adding the same file again duplicates nothing.
+    run(action="add", file=str(payload))
+    assert len(local_lane.briefs(cfg)) == 2
+
+    out = run()
+    assert "2 brief(s): 2 pending" in out, out
+    assert local_lane.next_pending(cfg)["title"] == "One"
+    out = run(action="done", id=rows[0]["id"], result="landed on local/2026-09-04")
+    assert "-> done" in out, out
+    done = local_lane.get_brief(cfg, rows[0]["id"])
+    assert done["status"] == "done" and "landed on" in done["result"], done
+    assert done["finished_at"], done
+    assert local_lane.next_pending(cfg)["title"] == "Two"
+    assert local_lane.counts(cfg) == {"pending": 1, "running": 0, "done": 1,
+                                      "failed": 0}
+    assert run(action="done", id="nope").strip().startswith("error:")
+    out = run(action="clear")
+    assert "1 brief(s) dropped" not in out and "2 brief(s) dropped" in out, out
+    assert local_lane.briefs(cfg) == []
+    # Hostile files degrade to "no backlog" rather than taking the poll down.
+    for junk in ("{not json", '"x"', "17"):
+        local_lane.backlog_file(cfg).write_text(junk, encoding="utf-8")
+        assert local_lane.briefs(cfg) == [], junk
+        assert local_lane.next_pending(cfg) is None, junk
+
+
+def test_fallback_staging_reads_handoff_section_three():
+    # The executive's bucket is spent, so nobody can write the briefs: the loop
+    # parses the hand-off itself. The NEWEST section 3 only, and only the items
+    # that name no GPU, PIE, editor, shots or frames.
+    from tokentracker import local_lane
+    cfg = _lane_cfg()
+    _write_handoff(cfg)
+    items = local_lane.handoff_items(HANDOFF_FIXTURE)
+    assert len(items) == 6, items
+    assert items[0].startswith("**GATE (TD task).**"), items[0]
+    assert "Superseded" not in " ".join(items), "the older section 3 must lose"
+    assert local_lane.local_safe(items[0]) is True
+    assert local_lane.local_safe(items[1]) is False, "frames"
+    assert local_lane.local_safe(items[2]) is True
+    assert local_lane.local_safe(items[4]) is False, "PIE"
+    assert local_lane.local_safe(items[5]) is False, "packaged build"
+
+    briefs = local_lane.fallback_briefs(cfg, HANDOFF_FIXTURE, NOW)
+    titles = [b["title"] for b in briefs]
+    assert titles == ["GATE (TD task)",
+                      "docs/LICENSES.md needs the City Sample row",
+                      "Spaceflight streaming-source control"], titles
+    for brief in briefs:
+        assert brief["repo"] == str(cfg.root)
+        assert brief["acceptance"] == local_lane.DEFAULT_ACCEPTANCE
+        assert "DEFERRED.md" in brief["prompt"], brief
+
+    # And the staging trigger picks that path when the Fable bucket is spent.
+    buckets = {"fable": {"name": "fable", "utilization": 0.99, "stop": 0.97,
+                         "hours_to_reset": 40.0, "rate": 0.01}}
+    assert local_lane.executive_available(cfg, buckets) is False
+    d = dispatch.Dispatcher(cfg)
+    line = local_lane.maybe_stage(cfg, d, buckets, utcnow())
+    assert line and "staged 3 brief(s)" in line, line
+    assert len(local_lane.briefs(cfg)) == 3
+    assert d.tasks() == [], "the fallback queues no cloud task"
+    # Once, not once per poll: the forecast is true for the whole lead window.
+    assert local_lane.maybe_stage(cfg, d, buckets, utcnow()) is None
+
+
+def test_pre_exhaustion_trigger_stages_on_the_executive_model():
+    # The good path: while there is still cloud budget, the Fable agent is
+    # asked to write the briefs for the Qwen agent - the operator's own rule.
+    from tokentracker import local_lane
+    cfg = _lane_cfg()
+    cfg.graph = {"executive": {"model": "claude-fable-5-1",
+                               "fallback": "claude-fable-5", "count": 1},
+                 "advisory": {"model": "claude-fable-5", "count": 1},
+                 "workers": {"model": "claude-opus-5", "count": 2}}
+    d = dispatch.Dispatcher(cfg)
+    # Weekly is 20 minutes from its stop at the rate it is burning, inside the
+    # 45-minute lead the screenshot policy uses.
+    buckets = {"weekly": {"name": "weekly", "utilization": 0.895, "stop": 0.90,
+                          "hours_to_reset": 30.0, "rate": 0.015}}
+    line = local_lane.maybe_stage(cfg, d, buckets, utcnow())
+    assert line and "staging queued" in line, line
+    task = d.tasks()[0]
+    assert task.id.startswith(local_lane.STAGE_PREFIX), task
+    assert task.model == "claude-fable-5-1", task
+    assert task.lane_pref == "cloud", "a 27B must not write its own briefs"
+    assert task.priority == local_lane.STAGE_PRIORITY
+    for phrase in ("HANDOFF.md section 3", "PROGRESS_REPORT.json",
+                   "tracker.py backlog add --file", "CPU-only",
+                   "Tools/verify.sh build", "ONE pod directory",
+                   "shots, beta-warm, beta-shots"):
+        assert phrase in task.prompt, phrase
+    assert "3-6 self-contained briefs" in task.prompt
+    # Not twice while it is pending, and not while briefs are still waiting.
+    assert local_lane.maybe_stage(cfg, d, buckets, utcnow()) is None
+    # No forecast, no staging.
+    quiet = {"weekly": {"name": "weekly", "utilization": 0.10, "stop": 0.90,
+                        "hours_to_reset": 100.0, "rate": 0.001}}
+    cfg2 = _lane_cfg()
+    assert local_lane.maybe_stage(cfg2, dispatch.Dispatcher(cfg2), quiet,
+                                  utcnow()) is None
+
+
+def test_local_only_tick_runs_a_backlog_brief_and_prices_it_at_zero():
+    # End to end: the Fable bucket crosses its hard stop, the switch goes
+    # LOCAL-ONLY, the next brief is queued on the local lane and launched, and
+    # when it finishes the brief is closed and the run costs nothing.
+    from tokentracker import cli, control, local_lane
+    cfg = _lane_cfg()
+    _write_handoff(cfg)
+    d = dispatch.Dispatcher(cfg)
+    launched: list[tuple[str, str]] = []
+
+    def fake_launch(task, now, lane="cloud"):
+        task.status = "running"
+        task.lane = lane
+        task.started_at = now.isoformat()
+        task.model_used = cfg.local_model
+        launched.append((task.id, lane))
+        return f"task {task.id}: launched {lane}"
+
+    d.launch = fake_launch
+    d.local_engine_up = lambda: True
+    history = usage.UsageHistory(cfg)
+    reset = utcnow() + timedelta(hours=6)
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: UsageSnapshot(
+        fetched_at=utcnow(),
+        five_hour=WindowUsage(0.1, utcnow() + timedelta(hours=2)),
+        seven_day=WindowUsage(0.2, utcnow() + timedelta(hours=100)),
+        extra={"fable_weekly": WindowUsage(0.99, reset)})
+    try:
+        decision, actions, _e, _s, _r = cli._tick(cfg, d, history)
+    finally:
+        usage.fetch_usage = real_fetch
+    assert decision.mode == control.LOCAL_ONLY, decision
+    assert any("staged 3 brief(s)" in a for a in actions), actions
+    assert any("local backlog: queued local-" in a for a in actions), actions
+    assert len(launched) == 1 and launched[0][1] == "local", launched
+    task_id = launched[0][0]
+    assert task_id.startswith(local_lane.WORKER_PREFIX), task_id
+
+    brief = local_lane.get_brief(cfg, local_lane.brief_of_task(task_id))
+    assert brief["status"] == "running", brief
+    task = d.get(task_id)
+    assert task.prompt.startswith(PREAMBLE), task.prompt[:80]
+    assert "never push to main" in task.prompt
+
+    # The run ends. The brief is closed with what it reported, the row is
+    # priced at zero whatever the local endpoint echoed, and the model is
+    # named - the ledger bills a free shift at nothing.
+    (cfg.logs_dir / f"{task_id}.out.json").write_text(json.dumps({
+        "is_error": False, "total_cost_usd": 4.25,
+        "result": "wrote dev_JSON/LOCAL_RESULTS.md; build/auto/smoke green",
+        "usage": {"input_tokens": 900, "output_tokens": 120}}), encoding="utf-8")
+    line = d._finalize_record(task, 0, utcnow())
+    assert task.status == "done" and task.cost_usd == 0.0, task
+    assert task.model_used == cfg.local_model, task
+    assert "local backlog:" in line and "done" in line, line
+    closed = local_lane.get_brief(cfg, local_lane.brief_of_task(task_id))
+    assert closed["status"] == "done", closed
+    assert "LOCAL_RESULTS" in closed["result"], closed
+    # And the local model is priced at $0 rather than left unpriced.
+    from tokentracker import pricing
+    row = pricing.read_pricing(cfg).get("Qwen3.8-27B-NVFP4")
+    if row is not None:
+        assert float(row.get("output", 1)) == 0.0, row
+
+
+def test_local_only_band_and_status_lines():
+    # What the panel's band and `tracker.py status` say while the 5090 works.
+    from tokentracker import clock, control, local_lane
+    cfg = _lane_cfg()
+    until = utcnow() + timedelta(hours=30)
+    control.write_control(cfg, control.STOPPED, reason=control.FABLE_BUCKET,
+                          until=until)
+    when = clock.fmt_local(until, "%a %H:%M", cfg, with_label=True)
+    band = control.stopped_text(cfg)
+    assert band == (f"LOCAL-ONLY: fable bucket 97% - Qwen on the 5090 - "
+                    f"resumes cloud {when}"), band
+    assert control.stopped_text(cfg, short=True) == "LOCAL-ONLY fable 97%"
+
+    # With a brief in flight the band names it.
+    local_lane.add_briefs(cfg, [{"title": "Wire the licence row",
+                                 "prompt": "Edit docs/LICENSES.md."}])
+    brief = local_lane.next_pending(cfg)
+    local_lane.set_status(cfg, brief["id"], local_lane.RUNNING)
+    assert control.stopped_text(cfg).endswith(" - Wire the licence row")
+
+    lines = local_lane.status_lines(cfg, engine_up=False)
+    assert lines[0].startswith("local lane: Qwen-test via "), lines
+    assert "daemon down" in lines[0], lines
+    assert "on 'Wire the licence row'" in lines[1], lines
+    assert "0 pending, 1 running, 0 done, 0 failed" in lines[1], lines
+    # A weekly-goal stop reads on its own threshold, and an operator stop is
+    # still the old red sentence.
+    control.write_control(cfg, control.STOPPED, reason=control.WEEKLY_GOAL,
+                          until=until)
+    assert control.stopped_text(cfg).startswith("LOCAL-ONLY: weekly bucket 90%")
+    control.write_control(cfg, control.STOPPED, reason=control.OPERATOR)
+    assert control.stopped_text(cfg) == "STOPPED by operator"
+    # The lane switched off says nothing at all.
+    assert local_lane.status_lines(make_cfg()) == []
+
+
+def test_local_only_never_hands_an_uncontained_row_to_the_local_engine():
+    # LOCAL-ONLY is a week-long regime, not the one-poll `blocked` lane it grew
+    # out of, so the 27B may only be given rows that were BUILT for it. A row
+    # queued before any of this existed carries lane_pref null ("either lane may
+    # take it"), a cloud-written prompt and a priority above the worker's: it
+    # would sort ahead of the brief and reach the local engine with the preamble
+    # prepended and none of the containment header.
+    from tokentracker import control, local_lane
+    cfg = _lane_cfg()
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "gate-wave2-2249", "cwd": str(cfg.root), "priority": 150,
+         "prompt": "Run Tools/verify.sh soak and push the fix to main",
+         "weight": "heavy", "status": "pending"},
+    ]}), encoding="utf-8")
+    local_lane.add_briefs(cfg, [{"title": "Licence row",
+                                 "prompt": "Edit docs/LICENSES.md."}])
+    d = dispatch.Dispatcher(cfg)
+    launched: list[tuple[str, str]] = []
+
+    def fake_launch(task, now, lane="cloud"):
+        task.status = "running"
+        task.lane = lane
+        launched.append((task.id, lane))
+        return f"task {task.id}: launched {lane}"
+
+    d.launch = fake_launch
+    d.local_engine_up = lambda: True
+    assert local_lane.ensure_worker(cfg, d, NOW) is not None
+    gated = control.gate_decision(Decision("surge", 4, True, "t"),
+                                  control.LOCAL_ONLY, control.FABLE_BUCKET, cfg)
+    d.apply(gated, utcnow())
+    assert len(launched) == 1, launched
+    worker_id, lane = launched[0]
+    assert lane == "local" and worker_id.startswith(local_lane.WORKER_PREFIX)
+    assert d.get("gate-wave2-2249").status == "pending", \
+        "no containment header, no local lane"
+    assert dispatch.built_for_local(d.get(worker_id)) is True
+    assert dispatch.built_for_local(d.get("gate-wave2-2249")) is False
+
+    # The legacy `blocked` lane keeps the wider rule it was written with: it
+    # lasts one poll and predates the backlog entirely.
+    launched.clear()
+    d.get(worker_id).status = "done"
+    d.apply(Decision("blocked", 0, False, "t", local_concurrency=1), utcnow())
+    assert launched == [("gate-wave2-2249", "local")], launched
+
+
+def test_unknown_local_engine_state_is_probed_not_read_as_a_free_card():
+    # `local_engine_healthy is None` means "never probed in this process", which
+    # is exactly what a tracker restart looks like while the ft daemon - a
+    # persistent supervisor - still holds ~31.5GB of the 32GB card. Reading it
+    # as "down" broke the guard in both directions at once.
+    cfg = _lane_cfg()
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "snapshot-20260904T1832", "prompt": "Run Tools/verify.sh shots",
+         "cwd": str(cfg.root), "priority": 200, "status": "pending"},
+    ]}), encoding="utf-8")
+    d = dispatch.Dispatcher(cfg)
+    assert d.local_engine_healthy is None, "a fresh dispatcher has never probed"
+    probes: list[int] = []
+    launched: list[str] = []
+
+    def probe_up() -> bool:
+        probes.append(1)
+        d.local_engine_healthy = True
+        return True
+
+    def fake_launch(task, now, lane="cloud"):
+        task.status = "running"
+        task.lane = lane
+        launched.append(task.id)
+        return f"task {task.id}: launched {lane}"
+
+    d.local_engine_up = probe_up
+    d.launch = fake_launch
+    actions = d.apply(Decision("pace", 3, True, "t"), utcnow())
+    assert probes, "an unknown flag must be probed before a shots pass goes out"
+    assert launched == [], launched
+    assert d.get("snapshot-20260904T1832").status == "pending"
+    assert any("deferred" in a and "GPU" in a for a in actions), actions
+
+    # The other direction: the drain must still stop a daemon this process
+    # never started, or the 31.5GB stays pinned for the rest of the week.
+    cfg.local_ft_bin = cfg.root / "ft.exe"
+    cfg.local_ft_bin.write_text("", encoding="utf-8")
+    d2 = dispatch.Dispatcher(cfg)
+    d2.local_engine_up = lambda: setattr(d2, "local_engine_healthy", True) or True
+    stops: list[list] = []
+    real_popen = dispatch.subprocess.Popen
+    dispatch.subprocess.Popen = lambda cmd, **kw: stops.append(cmd)
+    try:
+        line = d2._stop_local_engine()
+    finally:
+        dispatch.subprocess.Popen = real_popen
+    assert line and "VRAM released" in line, line
+    assert stops and stops[0][1:3] == ["daemon", "stop"], stops
+
+    # An explicit down still short-circuits: no network call on an idle poll.
+    d3 = dispatch.Dispatcher(cfg)
+    d3.local_engine_healthy = False
+    calls: list[int] = []
+    d3.local_engine_up = lambda: calls.append(1) or False
+    assert d3._stop_local_engine() is None
+    assert d3.local_holds_gpu() is False
+    assert calls == [], "an explicit down needs no probe"
+
+
+def test_a_killed_or_orphaned_local_worker_closes_its_brief():
+    # Every exit closes its brief. The two kill paths and the restart
+    # orphan-marking never reach `_finalize_record`, so a brief left at
+    # `running` was never retried, blocked `maybe_stage` for the whole shift
+    # (it refuses while anything is pending or running) and kept the panel's
+    # band naming work nobody was doing.
+    from tokentracker import local_lane
+    cfg = _lane_cfg()
+    cfg.local_minutes_multiplier = 1.0
+    local_lane.add_briefs(cfg, [
+        {"title": "One", "prompt": "Do the first thing."},
+        {"title": "Two", "prompt": "Do the second thing."},
+        {"title": "Three", "prompt": "Do the third thing."}])
+    b1, b2, b3 = local_lane.briefs(cfg)
+    old = (utcnow() - timedelta(hours=9)).isoformat()
+
+    class FakePopen:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    class FakeIO:
+        def close(self):
+            pass
+
+    def running_row(brief) -> object:
+        d.add(local_lane.build_worker(cfg, brief, NOW))
+        local_lane.set_status(cfg, brief["id"], local_lane.RUNNING)
+        task = d.get(local_lane.worker_task_id(brief))
+        task.status, task.lane, task.started_at = "running", "local", old
+        return task
+
+    d = dispatch.Dispatcher(cfg)
+    d._kill_tree = lambda pid: None
+
+    # 1. reap's max_minutes kill.
+    task = running_row(b1)
+    d._procs[task.id] = dispatch._Proc(FakePopen(), FakeIO(), FakeIO())
+    actions = d.reap(utcnow())
+    assert task.status == "killed", task
+    closed = local_lane.get_brief(cfg, b1["id"])
+    assert closed["status"] == "failed", closed
+    assert "max_minutes" in closed["result"], closed
+    assert any("local backlog:" in a for a in actions), actions
+
+    # 2. the adopted session's kill, on a row a prior loop launched.
+    task2 = running_row(b2)
+    d._adopted[task2.id] = 4243
+    real_alive = dispatch.pid_alive
+    dispatch.pid_alive = lambda pid: True
+    try:
+        actions = d.reap(utcnow())
+    finally:
+        dispatch.pid_alive = real_alive
+    assert task2.status == "killed", task2
+    assert local_lane.get_brief(cfg, b2["id"])["status"] == "failed"
+    assert any("adopted session killed" in a and "local backlog" in a
+               for a in actions), actions
+
+    # 3. the restart orphan-marking, before any decision is made.
+    row = local_lane.build_worker(cfg, b3, NOW)
+    local_lane.set_status(cfg, b3["id"], local_lane.RUNNING)
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {**row.to_dict(), "status": "running", "lane": "local", "pid": 4244}]}),
+        encoding="utf-8")
+    dispatch.pid_alive = lambda pid: False
+    try:
+        restarted = dispatch.Dispatcher(cfg, supervise=True)
+    finally:
+        dispatch.pid_alive = real_alive
+    assert restarted.get(row.id).status == "failed"
+    orphaned = local_lane.get_brief(cfg, b3["id"])
+    assert orphaned["status"] == "failed", orphaned
+    assert "orphaned" in orphaned["result"], orphaned
+    # Nothing is left claiming the lane, so the next shift can be staged.
+    assert local_lane.counts(cfg)["running"] == 0, local_lane.briefs(cfg)
+
+
+def test_a_brief_cannot_choose_its_own_branch_or_working_directory():
+    # Briefs are model-authored JSON handed straight to `backlog add --file`,
+    # so `branch` and `repo` are untrusted input. A staged `"branch": "main"`
+    # used to render as "Work on branch main ... never push to main" - a
+    # contradiction given to a 27B model holding a checkout and a commit
+    # trailer - and `repo` became the row's cwd, i.e. any directory on disk.
+    from tokentracker import clock, local_lane
+    cfg = _lane_cfg()
+    day = clock.fmt_local(NOW, "%Y-%m-%d", cfg, fallback="")
+    hostile = {"title": "Land it on main", "prompt": "Edit docs/LICENSES.md.",
+               "branch": "main", "repo": "C:/Windows/System32"}
+    brief = local_lane.normalize(cfg, hostile, 0, "executive", NOW)
+    assert brief["branch"] == f"local/{day}", brief
+    assert brief["repo"] == local_lane.repo_of(cfg), brief
+    header = local_lane.containment_header(cfg, brief, NOW)
+    assert f"git checkout -B local/{day} from main" in header, header
+    assert "branch main in" not in header, header
+
+    # Re-checked at render time too, so a hand-edited backlog file that never
+    # passed through `normalize` cannot get past it either.
+    raw = {**hostile, "id": "lb-x", "status": "pending"}
+    assert f"branch local/{day} in" in local_lane.containment_header(cfg, raw, NOW)
+    assert local_lane.build_worker(cfg, raw, NOW).cwd == local_lane.repo_of(cfg)
+
+    # What a brief MAY choose: a pod directory inside the repo, which is what
+    # the staging prompt asks the executive for, and a well-formed local/<date>.
+    pod = str(cfg.root / "Source" / "Pods" / "Gate")
+    scoped = local_lane.normalize(cfg, {"prompt": "p", "repo": pod}, 0, "x", NOW)
+    assert scoped["repo"] == pod, scoped
+    kept = local_lane.normalize(
+        cfg, {"prompt": "p", "branch": "local/2026-01-02"}, 0, "x", NOW)
+    assert kept["branch"] == "local/2026-01-02", kept
+    for junk in ("local/main", "local/2026-1-2", "../../main", "", 7, None):
+        got = local_lane.normalize(cfg, {"prompt": "p", "branch": junk}, 0, "x", NOW)
+        assert got["branch"] == f"local/{day}", (junk, got)
 
 
 def main() -> int:

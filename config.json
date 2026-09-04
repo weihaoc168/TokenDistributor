@@ -157,6 +157,10 @@
     "329cb798-b055-4f92-ba8d-96174a22413d"
   ],
   "local_enabled": true,
+  "local_concurrency": 1,
+  "local_keep_running": false,
+  "local_autostop": true,
+  "local_backlog_repo": "C:/Users/chenw/StarGTA",
   "local_model": "Qwen3.8-27B-NVFP4",
   "local_model_path": "D:\\FreeToken Desktop\\Qwen3.8-27B-NVFP4",
   "local_ft_bin": "C:\\Users\\chenw\\AppData\\Local\\FreeToken\\venv\\Scripts\\ft.exe",

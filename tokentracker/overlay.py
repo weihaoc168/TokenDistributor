@@ -12,6 +12,7 @@ from .allocator import allocate
 from .config import Config, reload_config
 from .control import RUNNING as CONTROL_RUNNING
 from .control import OPERATOR as CONTROL_OPERATOR
+from .control import LOCAL_ONLY as CONTROL_LOCAL_ONLY
 from .control import STOPPED as CONTROL_STOPPED
 from .control import read_record, stopped_text, write_control
 from .goal import GOAL_FALLBACK, GOAL_STEP, read_goal, read_stop, write_goal
@@ -1800,9 +1801,12 @@ class Overlay:
         if self._control == CONTROL_STOPPED:
             # The operator switch wins over the last written decision, so a
             # stopped overlay never claims to be pacing - and it still says so
-            # when the loop is offline and there is no decision at all.
-            mode = "stopped"
-            mode_label = "STOPPED"
+            # when the loop is offline and there is no decision at all. A
+            # bucket stop that handed the shift to the local lane says LOCAL
+            # rather than STOPPED: something IS running, on the 5090.
+            local_only = self._record.get("mode") == CONTROL_LOCAL_ONLY
+            mode = "local-only" if local_only else "stopped"
+            mode_label = "LOCAL" if local_only else "STOPPED"
 
         main_ids = set(self.cfg.main_session_ids)
         alive = {s["sid"]: s for s in sessions}

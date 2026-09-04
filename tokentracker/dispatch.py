@@ -8,9 +8,10 @@ import subprocess
 import urllib.error
 import urllib.request
 from datetime import datetime
-from typing import IO
+from typing import IO, Any
 
 from .config import Config
+from .control import LOCAL_ONLY
 from .graph import (
     EXECUTIVE,
     WORKERS,
@@ -89,6 +90,128 @@ def pid_alive(pid: int | None) -> bool:
         return k32.WaitForSingleObject(handle, 0) == _WAIT_TIMEOUT
     finally:
         k32.CloseHandle(handle)
+# ------------------------------------------------------------- the GPU guard
+#
+# One 32GB card, and the FreeToken engine takes ~31.5GB of it. So "who owns the
+# GPU" is a yes/no question with no room to negotiate, and it is asked in two
+# directions: before the local engine is started (`gpu_guard_proc`), and before
+# a real-RHI cloud run is launched (`needs_real_rhi` + `local_holds_gpu`).
+#
+# The image that is both: UnrealEditor-Cmd.exe. `Tools/verify.sh shots` runs it
+# with a real RHI and it owns the card; `verify.sh build`, `smoke`, `auto`,
+# `soak`, `free` and `beta` run it with -NullRHI, where it renders nothing and
+# can coexist with a loaded model. Blocking on the image name alone kept the
+# local lane down through every headless ladder run.
+NULLRHI_FLAG = "-nullrhi"
+# Images whose command line decides. Everything else in local_gpu_guard_procs
+# blocks on sight.
+COMMANDLINE_GUARDED = ("unrealeditor-cmd.exe",)
+# What a task's prompt has to name for it to need the real RHI, so it must wait
+# for the local lane to be idle. `beta` on its own is headless and is not here.
+REAL_RHI_MARKERS = ("shots", "beta-warm")
+
+
+def blocks_gpu(name: str, cmdlines: Any = ()) -> bool:
+    """Whether a running process named `name` locks the card away from the engine.
+
+    `cmdlines` is that image's command lines. For a command-line-guarded image
+    it blocks only when at least one instance lacks `-NullRHI`; with no command
+    line readable at all the answer is "it blocks", because refusing to start
+    the local engine costs a poll and starting it next to a real-RHI editor
+    costs the machine.
+    """
+    image = str(name or "").strip().lower()
+    if image not in COMMANDLINE_GUARDED:
+        return True
+    lines = [str(line).lower() for line in (cmdlines or []) if str(line).strip()]
+    if not lines:
+        return True
+    return any(NULLRHI_FLAG not in line for line in lines)
+
+
+def command_lines(name: str) -> list[str]:
+    """Every command line of the running processes with this image name.
+
+    wmic first because it is one process and no profile load; PowerShell's
+    CIM query second because Windows 11 ships without wmic. Both are best
+    effort: an empty list reads as "assume it owns the card".
+    """
+    image = str(name or "").strip()
+    if not image:
+        return []
+    attempts = (
+        ["wmic", "process", "where", f"name='{image}'", "get",
+         "CommandLine", "/format:list"],
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         f"Get-CimInstance Win32_Process -Filter \"name='{image}'\" "
+         "| Select-Object -ExpandProperty CommandLine"],
+    )
+    for cmd in attempts:
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=20, check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        lines = [ln.split("=", 1)[1].strip() if ln.lower().startswith("commandline=")
+                 else ln.strip()
+                 for ln in (out or "").splitlines() if ln.strip()]
+        lines = [ln for ln in lines if ln and not ln.lower().startswith("commandline")]
+        if lines:
+            return lines
+    return []
+
+
+def needs_real_rhi(task: Any) -> bool:
+    """Whether this row opens a real RHI, so the local engine must be idle first.
+
+    The screenshot pass by id, and anything whose prompt names `shots`,
+    `beta-warm` or `beta-shots` (the last is caught by "shots"). Everything
+    else - the headless ladder, code edits, log triage - can run beside a
+    loaded model.
+
+    A row built FOR the local lane is exempt from the prompt scan, and has to
+    be: its containment header names those very rungs in order to forbid them
+    ("never run shots, beta-warm, beta-shots"), and a substring match would
+    read the prohibition as a request.
+    """
+    if str(getattr(task, "lane_pref", "") or "") == "local":
+        return False
+    ident = str(getattr(task, "id", "") or "")
+    if ident.startswith("snapshot-"):
+        return True
+    prompt = str(getattr(task, "prompt", "") or "").lower()
+    return any(marker in prompt for marker in REAL_RHI_MARKERS)
+
+
+def lane_allows(task: Any, lane: str) -> bool:
+    """Whether `task` may launch on `lane`, per its own `lane_pref`."""
+    pref = getattr(task, "lane_pref", None)
+    return not pref or str(pref) == lane
+
+
+def built_for_local(task: Any) -> bool:
+    """Whether this row was BUILT for the local lane, not merely allowed on it.
+
+    The difference is the containment header. `lane_pref=None` means "either
+    lane may take it" (models.py), which is what every row queued by the loop
+    carries, and such a row's prompt was written for a cloud session: it can
+    name `main`, ask for a push, or call a ladder rung the local shift is not
+    allowed to run. Handing one to the 27B prepends `local_prompt_preamble` and
+    nothing else - no branch rule, no "never push to main", no restriction to
+    build/auto/smoke - and `needs_real_rhi` is only a substring scan, so it is
+    no filter for that.
+
+    While LOCAL-ONLY is a rare one-tick state that only appears on a `blocked`
+    poll that was survivable. As the standing regime for a whole week it is
+    not, so in that mode `apply` launches locally only what
+    `local_lane.build_worker` produced, which is exactly the rows carrying
+    `lane_pref="local"`.
+    """
+    return str(getattr(task, "lane_pref", "") or "") == "local"
+
+
 LOCAL_MODEL_ENV_KEYS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
@@ -176,6 +299,10 @@ class Dispatcher:
                 # longer exists, forever if the fork is never re-armed.
                 task.finished_at = now.isoformat()
                 self._note_fork_finish(task, now)
+                # A local worker row orphaned by the restart carries a backlog
+                # brief that would otherwise stay `running` for the rest of the
+                # shift, blocking both the retry and the next staging pass.
+                self._close_local_brief(task, now)
                 changed = True
         if changed:
             self.save()
@@ -299,6 +426,15 @@ class Dispatcher:
             task.fork_session_id = session_id
         cost = result.get("total_cost_usd")
         task.cost_usd = float(cost) if isinstance(cost, (int, float)) else None
+        if task.lane == "local":
+            # A local run costs nothing, whatever the endpoint reports: the
+            # FreeToken server answers the same Anthropic shape as the cloud
+            # and can echo a list price for a model that was never billed. The
+            # ledger reads `cost_usd` per run and `pricing` per model (the
+            # local model is carried at $0 there), so both have to say zero or
+            # the day page bills a free shift at Opus rates.
+            task.cost_usd = 0.0
+            task.model_used = task.model_used or self.cfg.local_model or None
         task.finished_at = now.isoformat()
 
         ok = (exit_code == 0 or (exit_code is None and bool(result)))
@@ -338,8 +474,17 @@ class Dispatcher:
                 record_task_outcome(self.cfg, task.weight, tokens, minutes)
             except ImportError:
                 pass
+        # A local worker row carries one backlog brief; closing the row closes
+        # the brief, with whatever the run said as its result summary.
+        note = ""
+        if task.lane == "local":
+            from .local_lane import finish_task
+
+            closed = finish_task(self.cfg, task, result.get("result"), now)
+            note = f"; {closed}" if closed else ""
         lane = " local" if task.lane == "local" else ""
-        return f"task {task.id}: {task.status}{lane} ({tokens} tokens, {minutes:.1f} min)"
+        return (f"task {task.id}: {task.status}{lane} "
+                f"({tokens} tokens, {minutes:.1f} min){note}")
 
     def _failure_text(self, task: TaskSpec, out_text: str = "") -> str:
         """Everything this exit said, for the limit classifier to read.
@@ -428,6 +573,27 @@ class Dispatcher:
         return (f"task {task.id}: {primary} limited ({reason}); requeued on "
                 f"{tier} fallback {fallback}")
 
+    def _close_local_brief(self, task: TaskSpec, now: datetime) -> str | None:
+        """Close the backlog brief a local worker row was carrying. Never raises.
+
+        `_finalize_record` closes it for an ordinary exit, but three paths never
+        reach that method: reap's max_minutes kill, the adopted session's kill,
+        and the restart orphan-marking. Each stamps the row killed/failed
+        directly, and the brief was left at `running` forever.
+
+        Forever is literal. `next_pending` only ever returns `pending`, so the
+        brief is never retried; `local_lane.maybe_stage` refuses to stage while
+        any brief is pending OR running, so no new backlog is ever written; and
+        the panel's band keeps naming a brief nothing is working on. One killed
+        local row and the 5090 idles for the rest of the shift. So every exit
+        closes its brief, with whatever the row failed with as the summary.
+        """
+        if task.lane != "local":
+            return None
+        from .local_lane import finish_task
+
+        return finish_task(self.cfg, task, task.error, now)
+
     def _note_fork_finish(self, task: TaskSpec, now: datetime,
                           tokens: int | None = None,
                           cost_usd: float | None = None,
@@ -483,7 +649,9 @@ class Dispatcher:
                 task.finished_at = now.isoformat()
                 del self._procs[task_id]
                 self._note_fork_finish(task, now)
-                actions.append(f"task {task.id}: killed after {limit_minutes:g} min limit")
+                closed = self._close_local_brief(task, now)
+                actions.append(f"task {task.id}: killed after {limit_minutes:g} min limit"
+                               + (f"; {closed}" if closed else ""))
         for task_id, pid in list(self._adopted.items()):
             task = self.get(task_id)
             if task is None or task.status != "running":
@@ -508,8 +676,11 @@ class Dispatcher:
                 task.error = f"exceeded max_minutes={limit_minutes:g}"
                 task.finished_at = now.isoformat()
                 self._note_fork_finish(task, now)
+                closed = self._close_local_brief(task, now)
                 actions.append(
-                    f"task {task.id}: adopted session killed after {limit_minutes:g} min limit")
+                    f"task {task.id}: adopted session killed after "
+                    f"{limit_minutes:g} min limit"
+                    + (f"; {closed}" if closed else ""))
         if actions:
             self.save()
         return actions
@@ -642,6 +813,11 @@ class Dispatcher:
         return fallback
 
     def _task_prompt(self, task: TaskSpec, lane: str) -> str:
+        # The preamble is prepended here for an ordinary row, and NOT prepended
+        # again for a local backlog brief, whose prompt was already composed as
+        # preamble + containment header + brief when the row was built
+        # (local_lane.compose_prompt). Checking for it rather than tracking a
+        # flag keeps the rule in one place and makes the prepend idempotent.
         prompt = task.prompt
         if "{graph}" in prompt:
             # Expanded at launch, not when the row was queued: the agentic
@@ -650,15 +826,29 @@ class Dispatcher:
             # and an advisory count the allocator just stepped.
             from .graph import allocated_line
             prompt = prompt.replace("{graph}", allocated_line(self.cfg))
-        if lane == "local" and self.cfg.local_prompt_preamble:
-            return f"{self.cfg.local_prompt_preamble}\n\n{prompt}"
+        preamble = self.cfg.local_prompt_preamble
+        if lane == "local" and preamble and not prompt.startswith(preamble):
+            return f"{preamble}\n\n{prompt}"
         return prompt
 
     def gpu_guard_proc(self) -> str | None:
-        """Name of a running GPU-exclusive process, or None.
+        """Name of a running process that owns the GPU, or None.
 
-        The FreeToken engine pins ~31.5GB of the 32GB card, so it must never
-        be started while something like the UE editor needs the GPU.
+        The FreeToken engine pins ~31.5GB of the 32GB card, so it must never be
+        started while something else needs the GPU - and the whole 32GB is why
+        this is a hard guard rather than a preference: there is no second
+        allocation to share.
+
+        The refinement of 2026-09-03: `UnrealEditor-Cmd.exe` is BOTH kinds of
+        process. Launched by `Tools/verify.sh shots` it opens a real RHI and
+        owns the card; launched by `verify.sh build/smoke/auto/soak/free/beta`
+        it carries `-NullRHI`, renders nothing and wants no VRAM at all. The
+        headless rungs are most of what the tracker runs, and blocking the
+        local engine on them meant the local lane could almost never start. So
+        for that image the COMMAND LINE decides (see `blocks_gpu`), while
+        `UnrealEditor.exe` and `RainbowSix.exe` still block on sight: one is
+        the editor and the other is a game, and neither has a headless mode
+        worth reasoning about.
         """
         names = [n.lower() for n in self.cfg.local_gpu_guard_procs]
         if not names:
@@ -671,9 +861,33 @@ class Dispatcher:
         except (OSError, subprocess.TimeoutExpired):
             return None
         for name in names:
-            if f'"{name}"' in listing:
+            if f'"{name}"' not in listing:
+                continue
+            if blocks_gpu(name, command_lines(name)):
                 return name
         return None
+
+    def local_holds_gpu(self) -> bool:
+        """True while the local engine has the card, so no real-RHI run may start.
+
+        Either a local session is running (the engine is certainly loaded) or
+        the health probe finds the daemon up. Both mean ~31.5GB is gone and a
+        `verify.sh shots` pass would fail on device memory - which is why
+        `apply` defers those rows instead of launching them.
+
+        `local_engine_healthy is None` means UNKNOWN, not down, and it must not
+        be read as a free card. The ft daemon is a persistent supervisor: it
+        outlives this process, and the operator starts it by hand too, so a
+        tracker restart while the model is loaded begins with the flag at None
+        and the card at ~0.5GB free. Probed once here (the result is cached on
+        the flag for the rest of the process, and `apply` only asks when a
+        real-RHI row is actually waiting, so this costs no poll otherwise).
+        """
+        if any(t.status == "running" and t.lane == "local" for t in self._tasks):
+            return True
+        if self.local_engine_healthy is None:
+            self.local_engine_up()
+        return bool(self.local_engine_healthy)
 
     def local_engine_up(self) -> bool:
         try:
@@ -718,6 +932,49 @@ class Dispatcher:
             return f"local engine starting ({model})"
         except OSError as exc:
             return f"local engine start failed ({exc})"
+
+    def _stop_local_engine(self) -> str | None:
+        """Unload the model and give the 31.5GB back. The line to log, or None.
+
+        Called from `apply` when the lane has drained - no local budget this
+        tick and nothing local still running - which is what the cloud coming
+        back at the bucket reset looks like from here. Without it the engine
+        would sit on the whole card for the rest of the week and the first
+        real-RHI rung after the reset would fail on device memory.
+
+        `local_keep_running` opts out (the operator wants the lane up beside
+        the cloud), and so does `local_autostop`.
+
+        The cheap refusals come first so the usual idle poll costs nothing: no
+        autostop, the opt-out, no ft binary to stop it with. Only then is an
+        UNKNOWN flag (None - a tracker restart, with the daemon still holding
+        the card from the last shift) probed, once. Reading None as "already
+        down" is what left the 31.5GB pinned for the rest of the week.
+        """
+        if not getattr(self.cfg, "local_autostop", True):
+            return None
+        if getattr(self.cfg, "local_keep_running", False):
+            return None
+        ft = self.cfg.local_ft_bin
+        if ft is None or not ft.exists():
+            return None
+        if self.local_engine_healthy is None:
+            self.local_engine_up()
+        if not self.local_engine_healthy:
+            # Explicitly down: nothing to stop, and this must not cost a
+            # network call on every idle poll.
+            return None
+        try:
+            subprocess.Popen(
+                [str(ft), "daemon", "stop", "--url", self.cfg.local_daemon_url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            return f"local engine stop failed ({exc})"
+        self.local_engine_healthy = False
+        self._local_start_ts = None
+        return "local engine stopped (lane drained; VRAM released)"
 
     def _launch_batch(
         self, candidates: list[TaskSpec], running: int, target: int,
@@ -767,11 +1024,25 @@ class Dispatcher:
         pending = [t for t in self._tasks if t.status == "pending"]
 
         if running_cloud < decision.target_concurrency:
+            eligible = [t for t in pending
+                        if (decision.allow_heavy or t.weight != "heavy")
+                        and lane_allows(t, "cloud")]
+            # A real-RHI row cannot start while the local engine holds the
+            # card: 31.5GB of 32 is gone and `verify.sh shots` would die on
+            # device memory. It waits - stays pending, is offered again next
+            # poll - rather than failing, because the lane drains on its own.
+            # Asked only when such a row is actually waiting, because
+            # `local_holds_gpu` may have to probe the daemon to answer.
+            real_rhi = [t for t in eligible if needs_real_rhi(t)]
+            deferred = real_rhi if real_rhi and self.local_holds_gpu() else []
             cloud_candidates = sorted(
-                (t for t in pending
-                 if decision.allow_heavy or t.weight != "heavy"),
+                (t for t in eligible if t not in deferred),
                 key=lambda t: (-t.priority, t.id),
             )
+            for task in deferred:
+                actions.append(
+                    f"task {task.id}: deferred, the local engine holds the GPU "
+                    f"(real-RHI run; waiting for the local lane to drain)")
             self._launch_batch(cloud_candidates, running_cloud,
                                decision.target_concurrency, now, actions, "cloud")
             pending = [t for t in self._tasks if t.status == "pending"]
@@ -780,8 +1051,21 @@ class Dispatcher:
         if local_target > 0 and running_local < local_target:
             # Forked main-session tasks (full throttle) carry cloud-sized
             # context and exist to spend cloud budget; they never run locally.
+            # Nor does a real-RHI row: the engine on the card is exactly why it
+            # cannot render, and its own preamble forbids it.
+            #
+            # And in LOCAL-ONLY - the week-long regime a bucket stop opens - the
+            # lane takes ONLY the rows built for it (`built_for_local`). An
+            # ordinary `lane_pref=None` row would otherwise outrank the brief on
+            # priority and go to the 27B carrying a cloud prompt with none of
+            # the containment header. The legacy `blocked` lane keeps the older,
+            # wider rule: it lasts one poll, and it predates the backlog.
+            takes = (built_for_local if decision.mode == LOCAL_ONLY
+                     else (lambda t: lane_allows(t, "local")))
             local_candidates = sorted(
-                (t for t in pending if not t.resume_session),
+                (t for t in pending
+                 if not t.resume_session and takes(t)
+                 and not needs_real_rhi(t)),
                 key=lambda t: (-t.priority, t.id),
             )
             if local_candidates:
@@ -790,4 +1074,10 @@ class Dispatcher:
                                        local_target, now, actions, "local")
                 else:
                     actions.append(self._start_local_engine(now))
+        elif local_target <= 0 and running_local == 0:
+            # The lane has drained: no budget this tick and nothing left in
+            # flight. Give the card back.
+            stopped = self._stop_local_engine()
+            if stopped:
+                actions.append(stopped)
         return actions
