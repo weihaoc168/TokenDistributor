@@ -387,6 +387,85 @@
   }
   .kicker { color: var(--ink); }
 
+  /* ------------------------------------------------------------ day mode
+     Both pages render from this file. The rules below dress the two sections
+     that only exist when DATA carries a `day` block: today's fork runs, and
+     the append-only list of the day's generations. */
+
+  .jump {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    align-self: stretch;
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    padding: 10px 0 8px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+  }
+  .jump a { color: var(--fable); text-decoration: none; }
+  .jump a:hover { text-decoration: underline; }
+
+  .windows { display: flex; flex-direction: column; gap: 22px; }
+  .win-card {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+    border-left: 2px solid var(--rule);
+    padding: 2px 0 2px 18px;
+    scroll-margin-top: 56px;
+  }
+  /* The newest one is the one a reader came for; it is last, because the list
+     is the day in the order it happened, and marked, because "last" alone is
+     not a signal on a page that scrolls. */
+  .win-card.is-latest {
+    border-left-color: var(--fable);
+    background: var(--surface);
+    padding: 14px 14px 14px 18px;
+  }
+  .win-head { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; }
+  .win-seq {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .win-card.is-latest .win-seq { color: var(--fable); }
+  .win-span { font-family: var(--font-mono); font-size: 13px; color: var(--ink); }
+  .win-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px 16px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+  .win-cols {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 16px 28px;
+    align-items: start;
+  }
+  .win-col { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .win-col h4 {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0;
+  }
+  .win-empty { font-size: 13px; color: var(--muted); }
+  tr.is-total td { border-top: 1px solid var(--ink); border-bottom: none; font-weight: 600; }
+
   @media (max-width: 820px) {
     .cols2 { grid-template-columns: minmax(0, 1fr); gap: 36px; }
     .tier-grid { grid-template-columns: minmax(0, 1fr); gap: 28px; }
@@ -401,6 +480,10 @@
 </style>
 
 <main class="page">
+
+  <div class="jump" id="jump-latest" hidden>
+    <a href="#window-latest" id="jump-latest-link">jump to the latest window &darr;</a>
+  </div>
 
   <section class="band" aria-labelledby="title">
     <div class="head-stack">
@@ -434,6 +517,13 @@
       <h3>Evidence</h3>
       <ul class="list" id="v-evidence" style="padding-top:10px"></ul>
     </div>
+  </section>
+
+  <section class="band" id="fork-band" aria-labelledby="fork-h" hidden>
+    <h2 id="fork-h">Today's forked sessions</h2>
+    <p class="sub">Every run of the acting-director fork the dispatcher launched today, in start order. The rows come from the append-only <span class="mono">state/handover.log</span> (one line per start and per finish), the current <span class="mono">state/handover.json</span> record, and &mdash; for a run older than that log &mdash; the fork transcript's own first and last turn. The two token columns are two different quantities and are never added together: <span class="mono">Output tok</span> is what the run wrote, always counted from its own transcript over its own span, while <span class="mono">Billed tok</span> is the input + output + cache-write sum the handover record carries &mdash; the same three counters off the transcript when no record did. Dollars a handover record did not carry are priced from the transcript the same way; a commit is attributed to the run whose span contains its author date, and a commit made between runs belongs to none of them.</p>
+    <div class="scroll-x" id="fork-table"></div>
+    <p class="caption" id="fork-note"></p>
   </section>
 
   <section class="band" aria-labelledby="did-h">
@@ -578,6 +668,12 @@
         <ul class="list checklist" id="recs"></ul>
       </div>
     </div>
+  </section>
+
+  <section class="band" id="windows-band" aria-labelledby="windows-h" hidden>
+    <h2 id="windows-h">Windows</h2>
+    <p class="sub">One card per generation of this page today, in the order they happened, the newest last and highlighted. Each card covers only its own slice &mdash; from the previous generation, or from local midnight for the first &mdash; so the cards tile the day with no gap and no overlap. The list is append-only: a card is what the tracker wrote at that moment and is never edited afterwards, which is why the day figures above are a fresh parse of the whole day rather than a sum of these.</p>
+    <div class="windows" id="windows-list"></div>
   </section>
 
   <section class="band" aria-labelledby="foot-h">
@@ -932,10 +1028,32 @@ const DATA = __DATA__;
   var wStart = pick(W, ["start", "from", "begin"]);
   var wEnd = pick(W, ["end", "to", "finish"]);
   var wHours = pickNum(W, ["hours", "duration_hours", "h"]);
-  byId("eyebrow").textContent =
-    "TOKEN LEDGER \u00B7 " + (wStart ? stamp(wStart) : "n/a") + " \u2192 " + (wEnd ? stamp(wEnd) : "n/a") +
-    " " + TZ_LABEL + " \u00B7 " + (wHours === null ? "n/a" : (Math.round(wHours * 100) / 100)) + " h" +
-    (D.generated_at ? " \u00B7 GENERATED " + stamp(D.generated_at) + " " + TZ_LABEL : "");
+
+  /* The mode flag. `day` present means this file is the day page: the window
+     figures above cover [local midnight, now] and two more sections exist.
+     Absent, everything below behaves exactly as it did for one window. */
+  var DAY = (D.day && typeof D.day === "object") ? D.day : null;
+  var WINDOWS = Array.isArray(D.windows)
+    ? D.windows.filter(function (w) { return w && typeof w === "object"; })
+    : [];
+
+  if (DAY) {
+    byId("eyebrow").textContent =
+      "DAY LEDGER " + txt(DAY.date) + " " + TZ_LABEL +
+      " \u00B7 " + WINDOWS.length + " WINDOW" + (WINDOWS.length === 1 ? "" : "S") +
+      " \u00B7 LATEST " + hourLabel(DAY.latest_at || D.generated_at);
+    var subhead = byId("subhead");
+    if (subhead) {
+      subhead.textContent = "The whole day so far, recomputed on every " +
+        "generation, with each generation appended below. Did the " +
+        "technical-director tier only direct, or did it also do the building?";
+    }
+  } else {
+    byId("eyebrow").textContent =
+      "TOKEN LEDGER \u00B7 " + (wStart ? stamp(wStart) : "n/a") + " \u2192 " + (wEnd ? stamp(wEnd) : "n/a") +
+      " " + TZ_LABEL + " \u00B7 " + (wHours === null ? "n/a" : (Math.round(wHours * 100) / 100)) + " h" +
+      (D.generated_at ? " \u00B7 GENERATED " + stamp(D.generated_at) + " " + TZ_LABEL : "");
+  }
   // The two hourly captions name the zone rather than saying "local", which
   // is only useful to the person who already knows which one it is.
   ["cost-hourly-caption", "hourly-caption"].forEach(function (id) {
@@ -2279,6 +2397,276 @@ const DATA = __DATA__;
     });
   }
 
+  /* ------------------------------------------------- the day: fork runs
+     Only drawn on the day page. One row per run of the acting-director fork,
+     in start order, with a total row: the question the day page opens with is
+     "what did today's forks cost", and a reader should not have to add up a
+     column to answer it. */
+
+  function statusPill(status) {
+    var s = String(status || "").toLowerCase();
+    var cls = "pill pill--sm";
+    if (s === "done") cls += " pill--ok";
+    else if (s === "failed") cls += " pill--crit";
+    else cls += " pill--warn";
+    var span = el("span", cls);
+    span.appendChild(el("span", "dot"));
+    span.appendChild(document.createTextNode(String(status || "n/a").toUpperCase()));
+    return span;
+  }
+
+  function commitCell(commits, cap) {
+    var rows = Array.isArray(commits)
+      ? commits.filter(function (c) { return c && typeof c === "object"; }) : [];
+    var td = el("td", "what");
+    if (!rows.length) { td.textContent = "—"; return td; }
+    rows.slice(0, cap).forEach(function (c) {
+      var line = el("div");
+      line.appendChild(el("span", "frag", txt(c.commit)));
+      line.appendChild(document.createTextNode(" " + txt(c.subject)));
+      td.appendChild(line);
+    });
+    if (rows.length > cap) {
+      td.appendChild(el("div", "caption", "+" + (rows.length - cap) + " more"));
+    }
+    return td;
+  }
+
+  function drawForkRuns() {
+    if (!DAY) return;
+    var band = byId("fork-band"), host = byId("fork-table");
+    if (!band || !host) return;
+    band.hidden = false;
+    var runs = Array.isArray(D.fork_runs)
+      ? D.fork_runs.filter(function (r) { return r && typeof r === "object"; })
+      : [];
+    if (!runs.length) {
+      host.appendChild(el("p", "caption",
+        "No forked director session ran today — or none left a record in " +
+        "state/handover.log, state/handover.json or a transcript on this box."));
+      return;
+    }
+    var tbl = el("table");
+    var thead = el("thead"), hr = el("tr");
+    /* Two token columns, because they are two quantities: output is what the
+       run wrote (always counted off its transcript), billed is input + output
+       + cache writes (the handover record's own figure). One column holding
+       whichever of the two a row happened to have would put a ~50x gap
+       between identical runs, and its total would be a sum of both. */
+    [["#", "n"], ["Task", null], ["Model", null], ["Started", null],
+     ["Finished", null], ["Min", "n"], ["Output tok", "n"], ["Billed tok", "n"],
+     ["USD", "n"], ["Fork session", null], ["Commits", null], ["Status", null]]
+      .forEach(function (c) { hr.appendChild(el("th", c[1], c[0])); });
+    thead.appendChild(hr); tbl.appendChild(thead);
+
+    var tb = el("tbody");
+    var mins = 0, toks = 0, billed = 0, usd = 0, priced = 0, commits = 0,
+        unpriced = 0;
+    runs.forEach(function (r, i) {
+      var tr = el("tr");
+      var run = num(r.run);
+      tr.appendChild(el("td", "n", String(run === null ? i + 1 : run)));
+      tr.appendChild(el("td", "id", txt(r.task_id)));
+      tr.appendChild(el("td", "id", shortModel(r.model)));
+      tr.appendChild(el("td", "id", r.started_at ? stamp(r.started_at) : "—"));
+      tr.appendChild(el("td", "id", r.finished_at ? stamp(r.finished_at) : "—"));
+      var m = num(r.minutes);
+      if (m !== null) mins += m;
+      tr.appendChild(el("td", "n", m === null ? "—" : m.toFixed(1)));
+      var t = num(r.tokens);
+      if (t !== null) toks += t;
+      tr.appendChild(el("td", "n", t === null ? "—" : fmtInt(t)));
+      var b = num(r.total_tokens);
+      if (b !== null) billed += b;
+      tr.appendChild(el("td", "n", b === null ? "—" : fmtInt(b)));
+      var u = num(r.cost_usd);
+      if (u === null) { unpriced += 1; } else { usd += u; priced += 1; }
+      tr.appendChild(el("td", "n", u === null ? UNPRICED : fmtUsd(u)));
+      tr.appendChild(el("td", "id", r.fork_session_id ? txt(r.fork_session_id) : "—"));
+      var mine = Array.isArray(r.commits) ? r.commits : [];
+      commits += mine.length;
+      tr.appendChild(commitCell(mine, 3));
+      var td = el("td");
+      td.appendChild(statusPill(r.status));
+      tr.appendChild(td);
+      tb.appendChild(tr);
+    });
+
+    var total = el("tr", "is-total");
+    total.appendChild(el("td", "n", String(runs.length)));
+    total.appendChild(el("td", null, "total"));
+    total.appendChild(el("td", null, ""));
+    total.appendChild(el("td", null, ""));
+    total.appendChild(el("td", null, ""));
+    total.appendChild(el("td", "n", mins.toFixed(1)));
+    total.appendChild(el("td", "n", fmtInt(toks)));
+    total.appendChild(el("td", "n", fmtInt(billed)));
+    total.appendChild(el("td", "n", fmtUsd(usd)));
+    total.appendChild(el("td", null, ""));
+    total.appendChild(el("td", null, commits + " commit" + (commits === 1 ? "" : "s")));
+    total.appendChild(el("td", null, ""));
+    tb.appendChild(total);
+    tbl.appendChild(tb);
+    host.appendChild(tbl);
+
+    var note = byId("fork-note");
+    if (note) {
+      note.textContent = runs.length + " run(s) today, " + mins.toFixed(0) +
+        " minutes of fork time, " + fmtInt(toks) + " output tokens of " +
+        fmtInt(billed) + " billed, " + fmtUsd(usd) + " over " + priced +
+        " priced run(s)" + (unpriced ? ", " + unpriced + " unpriced" : "") +
+        ". Times " + TZ_LABEL + ".";
+    }
+  }
+
+  /* --------------------------------------------------- the day: windows */
+
+  function windowModelLines(entry) {
+    var raw = (entry.totals_by_model && typeof entry.totals_by_model === "object")
+      ? entry.totals_by_model : {};
+    return Object.keys(raw).map(function (model) {
+      var row = (raw[model] && typeof raw[model] === "object") ? raw[model] : {};
+      return {
+        model: model,
+        output: pickNum(row, ["output_tokens", "output"]),
+        usd: num(row.cost_usd)
+      };
+    }).sort(function (a, b) { return (b.output || 0) - (a.output || 0); });
+  }
+
+  function windowBullets(entry) {
+    var blocks = (entry.tier_blocks && typeof entry.tier_blocks === "object")
+      ? entry.tier_blocks : {};
+    var out = [];
+    ["executive", "advisory", "workers"].forEach(function (tier) {
+      var block = (blocks[tier] && typeof blocks[tier] === "object")
+        ? blocks[tier] : {};
+      var bullets = Array.isArray(block.bullets) ? block.bullets : [];
+      bullets.slice(0, 4).forEach(function (b) {
+        out.push({ tier: tier, text: String(b) });
+      });
+    });
+    return out;
+  }
+
+  function windowCard(entry, index, last) {
+    var seq = num(entry.seq);
+    if (seq === null) seq = index + 1;
+    var card = el("div", "win-card" + (last ? " is-latest" : ""));
+    card.id = last ? "window-latest" : "window-" + seq;
+
+    var win = (entry.window && typeof entry.window === "object") ? entry.window : {};
+    var head = el("div", "win-head");
+    head.appendChild(el("span", "win-seq",
+      "WINDOW " + seq + " OF " + WINDOWS.length));
+    head.appendChild(el("span", "win-span",
+      (win.start ? stamp(win.start) : "n/a") + " → " +
+      (win.end ? stamp(win.end) : "n/a") + " " + TZ_LABEL));
+    if (last) {
+      var pill = el("span", "pill pill--sm pill--ok");
+      pill.appendChild(el("span", "dot"));
+      pill.appendChild(document.createTextNode("LATEST"));
+      head.appendChild(pill);
+    }
+    card.appendChild(head);
+
+    var meta = el("div", "win-meta");
+    meta.appendChild(el("span", null, "trigger: " + txt(entry.reason)));
+    meta.appendChild(el("span", null, "cost " + fmtUsd(entry.cost_total)));
+    var hours = num(win.hours);
+    if (hours !== null) meta.appendChild(el("span", null, hours.toFixed(2) + " h"));
+    meta.appendChild(el("span", null,
+      "generated " + (entry.generated_at ? stamp(entry.generated_at) : "n/a")));
+    card.appendChild(meta);
+
+    var cols = el("div", "win-cols");
+
+    var models = windowModelLines(entry);
+    var mc = el("div", "win-col");
+    mc.appendChild(el("h4", null, "Output by model"));
+    if (!models.length) {
+      mc.appendChild(el("p", "win-empty", "no turns in this window"));
+    } else {
+      var ml = el("ul", "bullets");
+      models.forEach(function (m) {
+        var li = el("li");
+        var key = el("span", "row-key");
+        var sw = el("span", "swatch");
+        sw.style.background = modelColor(m.model);
+        key.appendChild(sw);
+        key.appendChild(el("span", "frag", shortModel(m.model)));
+        li.appendChild(key);
+        li.appendChild(el("span", "body",
+          fmtInt(m.output) + " out · " + fmtUsd(m.usd)));
+        ml.appendChild(li);
+      });
+      mc.appendChild(ml);
+    }
+    cols.appendChild(mc);
+
+    var bullets = windowBullets(entry);
+    var bc = el("div", "win-col");
+    bc.appendChild(el("h4", null, "What each tier did"));
+    if (!bullets.length) {
+      bc.appendChild(el("p", "win-empty", "nothing recorded in this window"));
+    } else {
+      var bl = el("ul", "bullets");
+      bullets.forEach(function (b) {
+        var li = el("li");
+        li.appendChild(el("span", "marker", b.tier.slice(0, 1).toUpperCase()));
+        li.appendChild(bulletBody(b.text));
+        bl.appendChild(li);
+      });
+      bc.appendChild(bl);
+    }
+    cols.appendChild(bc);
+
+    var commits = Array.isArray(entry.commits) ? entry.commits : [];
+    var cc = el("div", "win-col");
+    cc.appendChild(el("h4", null,
+      "Commits (" + commits.length + ")"));
+    if (!commits.length) {
+      cc.appendChild(el("p", "win-empty", "no commit in this window"));
+    } else {
+      var cl = el("ul", "bullets");
+      commits.forEach(function (c) {
+        if (!c || typeof c !== "object") return;
+        var li = el("li");
+        li.appendChild(el("span", "frag", txt(c.commit)));
+        li.appendChild(el("span", "body", txt(c.subject)));
+        cl.appendChild(li);
+      });
+      cc.appendChild(cl);
+    }
+    cols.appendChild(cc);
+
+    card.appendChild(cols);
+    return card;
+  }
+
+  function drawWindows() {
+    if (!DAY) return;
+    var band = byId("windows-band"), host = byId("windows-list");
+    if (!band || !host) return;
+    band.hidden = false;
+    if (!WINDOWS.length) {
+      host.appendChild(el("p", "win-empty",
+        "No generation has been appended to this day yet."));
+      return;
+    }
+    WINDOWS.forEach(function (entry, i) {
+      host.appendChild(windowCard(entry, i, i === WINDOWS.length - 1));
+    });
+    var jump = byId("jump-latest");
+    var link = byId("jump-latest-link");
+    if (link) {
+      link.textContent = "jump to the latest window (" + WINDOWS.length +
+        " of " + WINDOWS.length + ", " + hourLabel(DAY.latest_at) + " " +
+        TZ_LABEL + ") ↓";
+    }
+    if (jump) jump.hidden = false;
+  }
+
   /* ------------------------------------------------------ lists & footer */
 
   function fillList(hostId, arr, numbered) {
@@ -2299,6 +2687,7 @@ const DATA = __DATA__;
     });
   }
 
+  try { drawForkRuns(); } catch (e) { console.error("fork runs", e); }
   try { drawTierBlocks(); } catch (e) { console.error("tier blocks", e); }
   try { drawRoles(); } catch (e) { console.error("roles", e); }
   try { drawGraphInForce(); } catch (e) { console.error("graph in force", e); }
@@ -2307,6 +2696,7 @@ const DATA = __DATA__;
   try { drawTiers(); } catch (e) { console.error("tier chart", e); try { drawTotals(); } catch (e2) {} }
   try { drawLedger(); } catch (e) { console.error("ledger", e); }
   try { drawHourly(); } catch (e) { console.error("hourly chart", e); }
+  try { drawWindows(); } catch (e) { console.error("windows", e); }
   try {
     fillList("root-causes", D.root_causes, true);
     fillList("recs", D.recommendations, false);

@@ -3023,14 +3023,31 @@ def stop_key_for(cfg: Config, control: str, stop: dict | None) -> str | None:
 
 def generate(cfg: Config, reason: str = REASON_MANUAL, *,
              since: datetime | None = None, hours: float | None = None,
-             stop_key: str | None = None, now: datetime | None = None) -> Path:
-    """Build and render one report; returns the page written."""
+             stop_key: str | None = None, now: datetime | None = None,
+             day: bool = True) -> Path:
+    """Build and render one report; returns the timestamped window page.
+
+    Two pages, not one. The timestamped window page and its summary.json are
+    written exactly as before, the archive of this slice. Then - unless `day`
+    is off, which is `report --window-only` - the DAY page is regenerated over
+    [local midnight, now] and this generation is appended to its window list,
+    and `reports/latest.html` ends up a copy of the day page rather than of
+    this slice. See day_ledger for why the day totals are a fresh parse and not
+    a sum of the slices.
+
+    The report state is written BEFORE the day page: a stop must be recorded as
+    reported even if the day page then fails, or the next poll reports it again.
+    """
     now = now or utcnow()
     start, end = window_for(cfg, since=since, hours=hours, now=now)
     summary = build_summary(cfg, start, end, reason=reason)
     page = render(cfg, summary, now)
     write_report_state(cfg, path=page, reason=reason,
                        window=summary["window"], stop_key=stop_key)
+    if day:
+        from .day_ledger import generate_day
+
+        generate_day(cfg, reason=reason, now=now)
     return page
 
 
@@ -3105,9 +3122,23 @@ def report_on_exit(cfg: Config) -> str | None:
         return None
 
 
+def day_report(cfg: Config, now: datetime | None = None) -> Path | None:
+    """Today's day page, or None. Never raises - the overlay calls it."""
+    try:
+        from .day_ledger import latest_day_page
+
+        return latest_day_page(cfg, now)
+    except Exception:  # noqa: BLE001 - a button must never raise
+        return None
+
+
 def open_report(cfg: Config) -> Path | None:
-    """Hand reports/latest.html to the shell; None when there is none yet."""
-    path = latest_report(cfg)
+    """Hand the day page to the shell, falling back to reports/latest.html.
+
+    The day page by name rather than through `latest.html`, so VIEW REPORT
+    opens TODAY even when the last generation of the copy was yesterday's.
+    """
+    path = day_report(cfg) or latest_report(cfg)
     if path is None:
         return None
     opener = getattr(os, "startfile", None)

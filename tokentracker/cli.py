@@ -700,6 +700,7 @@ def _run_loop(cfg: Config, once: bool, no_supervise: bool = False) -> int:
 def cmd_status(cfg: Config) -> int:
     from .allocator import status_line
     from .clock import describe, fmt_local
+    from .day_ledger import day_status_line
     from .graph import active_graph, active_label
     from .ledger import report_status_line, tiers_status_line
     from .scheduler import pacing
@@ -722,6 +723,7 @@ def cmd_status(cfg: Config) -> int:
         if fork_line is not None:
             print(fork_line)
         print(report_status_line(cfg))
+        print(day_status_line(cfg))
         print(tiers_status_line(cfg))
         print(snapshot_line(cfg))
         print(status_line(cfg))
@@ -772,6 +774,9 @@ def cmd_status(cfg: Config) -> int:
     # The work-distribution report the overlay's VIEW REPORT button opens; the
     # monitor session reads its freshness and trigger from here.
     print(report_status_line(cfg))
+    # And the day it belongs to: how many generations today's page has had,
+    # when the newest was, and what the day has cost so far.
+    print(day_status_line(cfg, now=now))
     # The same split the panel's ladder bars draw: where the window's input and
     # output tokens went, per tier of the agentic graph.
     print(tiers_status_line(cfg))
@@ -984,11 +989,18 @@ def cmd_alloc(cfg: Config) -> int:
 
 
 def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
-    """Generate the work-distribution report now, and optionally open it."""
+    """Generate the work-distribution report now, and optionally open it.
+
+    The day page is the default: the window page is still written and archived,
+    and then today's day page is regenerated with this generation appended to
+    its window list, which is what `latest.html` becomes a copy of.
+    `--window-only` is the old behaviour, `latest.html` and all.
+    """
     from .clock import fmt_local, stamp
-    from .ledger import generate, latest_report, open_report
+    from .ledger import day_report, generate, latest_report, open_report
 
     since = None
+    hours = getattr(args, "hours", None)
     if getattr(args, "since", None):
         since = parse_iso(args.since)
         if since is None:
@@ -997,10 +1009,19 @@ def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
         # `--since` is given as ISO UTC and echoed back on the operator's clock,
         # so a window typed in one zone is not read as the other.
         print(f"window starts {fmt_local(since, '%a %H:%M', cfg, with_label=True)}")
+    # `--day` asks for it outright; with neither `--hours` nor `--since` it is
+    # what the command means anyway. `--window-only` is the way back to one
+    # slice, and an explicit `--day` beside it wins.
+    day = bool(getattr(args, "day", False)) or not (
+        bool(getattr(args, "window_only", False)) or since is not None
+        or hours is not None)
     try:
-        page = generate(cfg, "manual", since=since,
-                        hours=getattr(args, "hours", None))
+        page = generate(cfg, "manual", since=since, hours=hours, day=day)
         print(f"wrote {page} at {stamp(None, '%a %H:%M:%S', cfg)}")
+        if day:
+            today = day_report(cfg)
+            if today is not None:
+                print(f"day: {today}")
         print(f"latest: {cfg.reports_dir / 'latest.html'}")
     except (OSError, ValueError, KeyError) as exc:
         print(f"error: report generation failed ({exc})")
@@ -1258,6 +1279,14 @@ def main(argv: list[str] | None = None) -> int:
                        help="window length in hours, ending now")
     rep_p.add_argument("--open", action="store_true",
                        help="open reports/latest.html when it is written")
+    rep_p.add_argument("--day", action="store_true",
+                       help="regenerate today's day page and append this "
+                            "generation to it (the default when neither "
+                            "--hours nor --since is given)")
+    rep_p.add_argument("--window-only", action="store_true",
+                       help="write only the one-window page, and leave "
+                            "reports/latest.html a copy of it (the old "
+                            "behaviour)")
 
     graph_p = sub.add_parser(
         "graph", help="show or set the agentic graph (executive/advisory/workers)")

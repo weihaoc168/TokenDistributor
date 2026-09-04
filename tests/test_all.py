@@ -3961,8 +3961,13 @@ def test_ledger_writes_timestamped_page_and_latest_copy():
     summary_path = cfg.reports_dir / f"{stamp}-summary.json"
     assert summary_path.exists(), list(cfg.reports_dir.iterdir())
     latest = cfg.reports_dir / ledger.LATEST_NAME
-    assert latest.read_bytes() == page.read_bytes(), "latest.html is a copy"
     assert ledger.latest_report(cfg) == latest
+    # latest.html is the DAY page now, not a copy of this one window; the
+    # timestamped archive above is unchanged. `--window-only` is the way back,
+    # and it has a test of its own.
+    from tokentracker import day_ledger
+    assert latest.read_bytes() == day_ledger.latest_day_page(cfg).read_bytes()
+    assert latest.read_bytes() != page.read_bytes()
 
     html = page.read_text(encoding="utf-8")
     assert ledger.TITLE_PLACEHOLDER not in html and "__DATA__" not in html
@@ -3982,6 +3987,380 @@ def test_ledger_writes_timestamped_page_and_latest_copy():
     assert page2 != page and page2.exists()
     window = json.loads(cfg.report_file.read_text(encoding="utf-8"))["window"]
     assert window["start"] == state["generated_at"], (window, state)
+
+
+# ---------------------------------------------------------- the day ledger
+#
+# One page per local day, recomputed on every generation, with the generation
+# itself appended to its `windows` list. The two properties worth a test are
+# the ones a reader depends on: the day figures are a fresh parse of the whole
+# day (not a sum of the slices), and an earlier window is never rewritten.
+
+def _day_at(cfg, fraction: float):
+    """A UTC stamp `fraction` of the way through today, on the local clock.
+
+    Fixtures are placed relative to the day rather than to `now` so a suite
+    that happens to run just after local midnight still writes them inside the
+    day it is asserting about.
+    """
+    from tokentracker import day_ledger
+
+    start, end, _date = day_ledger.day_bounds(cfg)
+    return start + (end - start) * fraction
+
+
+def test_day_ledger_appends_each_generation_and_never_rewrites_a_window():
+    from tokentracker import day_ledger, ledger
+    cfg = _ledger_cfg()
+    page = ledger.generate(cfg, "manual", hours=1.0)
+    date = day_ledger.day_date(cfg)
+    day_page = day_ledger.day_page_path(cfg, date)
+    day_json = day_ledger.day_summary_path(cfg, date)
+    assert day_page.exists() and day_json.exists(), list(cfg.reports_dir.iterdir())
+
+    first = json.loads(day_json.read_text(encoding="utf-8"))
+    assert set(day_ledger.DAY_KEYS) <= set(first), sorted(first)
+    assert first["date"] == date and first["day"]["windows"] == 1, first["day"]
+    windows = first["windows"]
+    assert len(windows) == 1 and windows[0]["seq"] == 1, windows
+    assert set(windows[0]) == set(day_ledger.WINDOW_KEYS), sorted(windows[0])
+    # The first window of the day opens at local midnight, not at the report
+    # window the CLI asked for.
+    day_start = day_ledger.day_bounds(cfg)[0]
+    assert windows[0]["window"]["start"] == day_start.isoformat(), windows[0]
+    # latest.html is the day page, and the one-window archive is still its own
+    # file beside it.
+    latest = cfg.reports_dir / ledger.LATEST_NAME
+    assert latest.read_bytes() == day_page.read_bytes()
+    assert page.exists() and page.read_bytes() != day_page.read_bytes()
+    stored = json.dumps(windows[0], indent=2)
+
+    later = utcnow() + timedelta(seconds=61)
+    ledger.generate(cfg, "fork milestone: new commit", now=later)
+    second = json.loads(day_json.read_text(encoding="utf-8"))
+    kept = second["windows"]
+    assert len(kept) == 2, kept
+    # Byte for byte the entry that was written the first time: appended, never
+    # rewritten, whatever a second parse of the same turns would now say.
+    assert json.dumps(kept[0], indent=2) == stored
+    assert list(kept[0]) == list(windows[0]), "key order preserved too"
+    assert kept[1]["seq"] == 2, kept[1]
+    assert kept[1]["reason"].startswith("fork milestone"), kept[1]
+    # The windows tile the day: this one starts where the previous one ended.
+    assert kept[1]["window"]["start"] == kept[0]["window"]["end"], kept
+    assert kept[1]["window"]["end"] == later.isoformat(), kept[1]
+    assert second["day"]["windows"] == 2 and second["day"]["latest_seq"] == 2
+    assert second["day"]["latest_at"] == kept[1]["generated_at"], second["day"]
+
+    # And the figures ABOVE the cards are still the whole day, not the newest
+    # slice. This second window is 61 empty seconds - the fixture's four turns
+    # are five minutes old, so the slice holds nothing - while the day above it
+    # still holds all four. Narrowing build_day_summary to the last window's
+    # span (the mutation that survives every other assertion in this file)
+    # fails right here.
+    assert kept[1]["totals_by_model"] == {}, kept[1]
+    assert second["window"]["start"] == day_ledger.day_bounds(cfg)[0].isoformat()
+    day_totals = second["totals_by_model"]
+    assert day_totals["claude-opus-5"]["output_tokens"] == 300, day_totals
+    assert day_totals["claude-sonnet-5"]["output_tokens"] == 50, day_totals
+
+    html = day_page.read_text(encoding="utf-8")
+    assert ledger.TITLE_PLACEHOLDER not in html and "__DATA__" not in html
+    assert f"<title>Day Ledger {date}</title>" in html, html[:200]
+    for marker in ('id="windows-band"', 'id="fork-band"', "window-latest",
+                   "drawWindows(", "drawForkRuns(", "DAY LEDGER ",
+                   "jump to the latest window", '"windows"', '"fork_runs"'):
+        assert marker in html, marker
+    # The latest window is LAST in the payload the page draws from.
+    assert html.index('"seq": 1') < html.index('"seq": 2'), "latest last"
+    assert (cfg.reports_dir / ledger.LATEST_NAME).read_bytes() == \
+        day_page.read_bytes(), "latest.html follows the day page"
+
+
+def test_day_ledger_recomputes_the_whole_day_not_the_window():
+    from tokentracker import day_ledger, ledger
+    cfg = _ledger_cfg()          # four turns, five minutes ago
+    # A window seven seconds wide: it contains nothing at all, and the day
+    # page beside it still has to hold the whole day.
+    page = ledger.generate(cfg, "manual", hours=0.002)
+    stamp = page.name[:-len("-ledger.html")]
+    window = json.loads((cfg.reports_dir / f"{stamp}-summary.json")
+                        .read_text(encoding="utf-8"))
+    assert window["totals_by_model"] == {}, window["totals_by_model"]
+
+    day = json.loads(day_ledger.day_summary_path(cfg, day_ledger.day_date(cfg))
+                     .read_text(encoding="utf-8"))
+    totals = day["totals_by_model"]
+    assert totals["claude-opus-5"]["output_tokens"] == 300, totals
+    assert totals["claude-sonnet-5"]["output_tokens"] == 50, totals
+    assert day["window"]["start"] == day_ledger.day_bounds(cfg)[0].isoformat()
+    # Every day-level section is there, recomputed, not carried over.
+    for key in ("fable_vs_opus", "fable_work_breakdown", "cost", "verdict",
+                "root_causes", "recommendations", "utilization_series",
+                "hourly_output_by_model", "tier_blocks", "where_fable_went"):
+        assert key in day, key
+    assert day["verdict"]["one_paragraph"], day["verdict"]
+    assert day["cost"]["per_milestone_ranked"] == [], day["cost"]
+    assert any("DAY page" in c for c in day["caveats"]), day["caveats"]
+    # The window entry covers the day segment, so it sees the same turns: the
+    # slice is "since the last generation", never "the last --hours".
+    entry = day["windows"][0]
+    assert entry["totals_by_model"]["claude-opus-5"]["output_tokens"] == 300
+
+
+def test_day_ledger_fork_runs_from_the_handover_log():
+    from tokentracker import day_ledger, handover
+    cfg = _ledger_cfg()
+    start, end, _date = day_ledger.day_bounds(cfg)
+
+    def log_run(model, began, ended=None, status="done", tokens=None,
+                cost=None, sid=None):
+        handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                                model=model, parent_session=MAIN_ID,
+                                started_at=_day_at(cfg, began).isoformat())
+        if ended is None:
+            return
+        handover.finish_handover(cfg, status=status,
+                                 finished_at=_day_at(cfg, ended).isoformat(),
+                                 tokens=tokens, cost_usd=cost,
+                                 fork_session_id=sid)
+
+    log_run("claude-fable-5-1", 0.10, 0.20, "done", tokens=1200, cost=0.5,
+            sid="aaaaaaaa-1111-2222-3333-444444444444")
+    log_run("claude-fable-5", 0.30, 0.40, "failed",
+            sid="cccccccc-1111-2222-3333-444444444444")
+    log_run("claude-opus-5", 0.50)          # still running: no finish record
+
+    runs = day_ledger.fork_runs(cfg, start, end)
+    assert [r["run"] for r in runs] == [1, 2, 3], runs
+    assert [r["status"] for r in runs] == ["done", "failed", "started"], runs
+    assert [r["model"] for r in runs] == ["claude-fable-5-1", "claude-fable-5",
+                                          "claude-opus-5"], runs
+    assert all(set(r) == set(day_ledger.RUN_KEYS) for r in runs), runs
+    assert all(r["task_id"] == handover.FORK_TASK_ID for r in runs), runs
+    assert runs[0]["fork_session_id"] == "aaaaaaaa", runs[0]
+    # The handover record's own token figure is the BILLED sum (input + output
+    # + cache writes), so it lands in `total_tokens`. Output tokens have one
+    # source, the transcript, and this fork left none on this box.
+    assert runs[0]["total_tokens"] == 1200 and runs[0]["cost_usd"] == 0.5, runs[0]
+    assert runs[0]["tokens"] is None, runs[0]
+    # A run whose finish recorded no bill, and no transcript to price: unpriced,
+    # never a zero that would read as "this fork was free".
+    assert runs[1]["cost_usd"] is None and runs[1]["tokens"] is None, runs[1]
+    assert runs[1]["minutes"] > 0, runs[1]
+    # The one still running has no finish, and is still a row.
+    assert runs[2]["finished_at"] is None, runs[2]
+    assert runs[2]["fork_session_id"] == "", runs[2]
+
+    # A fork older than the log: found by its brief, and the transcript's own
+    # first and last turn are its span.
+    fork_id = "11111111-2222-3333-4444-555555555555"
+    ts = _day_at(cfg, 0.60).isoformat()
+    (cfg.projects_dir / "proj" / f"{fork_id}.jsonl").write_text("\n".join([
+        json.dumps({"type": "user", "uuid": "uu", "timestamp": ts,
+                    "message": {"role": "user",
+                                "content": cfg.throttle_prompt}}),
+        _entry("oldfork", "claude-opus-5", ts, ["Bash"], _usage(out=64),
+               uuid="uof"),
+    ]), encoding="utf-8")
+    runs = day_ledger.fork_runs(cfg, start, end)
+    assert len(runs) == 4, [r["fork_session_id"] for r in runs]
+    assert runs[3]["status"] == day_ledger.STATUS_UNRECORDED, runs[3]
+    assert runs[3]["source"] == day_ledger.SOURCE_TRANSCRIPT, runs[3]
+    assert runs[3]["fork_session_id"] == fork_id[:8], runs[3]
+    # Nothing recorded its tokens, so they are priced off the transcript - and
+    # the same three counters give the billed figure, which for a turn that
+    # only wrote is the output alone.
+    assert runs[3]["tokens"] == 64 and runs[3]["total_tokens"] == 64, runs[3]
+
+    # And the page carries them.
+    from tokentracker import ledger
+    ledger.generate(cfg, "manual", hours=1.0)
+    html = day_ledger.day_page_path(cfg, day_ledger.day_date(cfg)).read_text(
+        encoding="utf-8")
+    assert ">Today's forked sessions</h2>" in html, "the fork table's heading"
+    assert '"claude-fable-5-1"' in html and '"aaaaaaaa"' in html, "its rows"
+
+
+def test_day_ledger_fork_run_tokens_are_one_quantity_from_either_source():
+    """The two token columns each hold ONE quantity, whatever priced the row.
+
+    A run the handover log recorded and a run only a transcript remembers do
+    identical work here - the same usage on the same model - so their rows have
+    to read the same. The bug this pins: the handover record's `tokens` field
+    is input + output + cache writes (dispatch._finalize_record), roughly 50x
+    the output figure a transcript-only row reported in the same column, and
+    the table's total row added the two together.
+    """
+    from tokentracker import day_ledger, handover
+    cfg = _ledger_cfg()
+    start, end, _date = day_ledger.day_bounds(cfg)
+    usage = _usage(out=200, inp=1000, creation=500, read=9000)
+    billed = 1000 + 200 + 500     # cache READS are in neither figure
+
+    # Run 1: recorded by the log, and its transcript is on disk.
+    logged_id = "aaaaaaaa-1111-2222-3333-444444444444"
+    (cfg.projects_dir / "proj" / f"{logged_id}.jsonl").write_text(
+        _entry("logged", "claude-opus-5", _day_at(cfg, 0.15).isoformat(),
+               ["Edit"], usage, uuid="ul"), encoding="utf-8")
+    handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                            model="claude-opus-5", parent_session=MAIN_ID,
+                            started_at=_day_at(cfg, 0.10).isoformat())
+    handover.finish_handover(cfg, status="done",
+                             finished_at=_day_at(cfg, 0.20).isoformat(),
+                             tokens=billed, cost_usd=0.5,
+                             fork_session_id=logged_id)
+
+    # Run 2: nothing recorded it, so only the transcript speaks for it.
+    quiet_id = "bbbbbbbb-1111-2222-3333-444444444444"
+    ts = _day_at(cfg, 0.55).isoformat()
+    (cfg.projects_dir / "proj" / f"{quiet_id}.jsonl").write_text("\n".join([
+        json.dumps({"type": "user", "uuid": "uq", "timestamp": ts,
+                    "message": {"role": "user",
+                                "content": cfg.throttle_prompt}}),
+        _entry("quiet", "claude-opus-5", ts, ["Edit"], usage, uuid="uq2"),
+    ]), encoding="utf-8")
+
+    runs = day_ledger.fork_runs(cfg, start, end)
+    assert [r["source"] for r in runs] == [day_ledger.SOURCE_LOG,
+                                           day_ledger.SOURCE_TRANSCRIPT], runs
+    # Same work, same two numbers - which is the property the columns claim.
+    assert runs[0]["tokens"] == runs[1]["tokens"] == 200, runs
+    assert runs[0]["total_tokens"] == runs[1]["total_tokens"] == billed, runs
+    # And they are not the same number as each other: output is not the bill.
+    assert runs[0]["tokens"] < runs[0]["total_tokens"], runs[0]
+
+    from tokentracker import ledger
+    ledger.generate(cfg, "manual", hours=1.0)
+    html = day_ledger.day_page_path(cfg, day_ledger.day_date(cfg)).read_text(
+        encoding="utf-8")
+    # Two header cells in the table itself, not only two words in its prose.
+    assert '["Output tok", "n"]' in html, "the output column"
+    assert '["Billed tok", "n"]' in html, "the billed column beside it"
+    assert '"total_tokens"' in html, "and the field the second draws from"
+    assert html.count('"total_tokens"') == len(runs), "one per row"
+
+
+def test_day_ledger_fork_runs_survive_a_long_handover_log():
+    """RUN_MAX caps the DAY's runs, not the log's whole append-only history.
+
+    state/handover.log holds every fork this box ever launched and today's are
+    always at its tail, so a cap applied before the day filter is spent by the
+    oldest runs on the file and the table the page is actually about comes back
+    empty. At nine forks a day the fixture below is about three weeks in.
+    """
+    from tokentracker import day_ledger, handover
+    cfg = _ledger_cfg()
+    start, end, _date = day_ledger.day_bounds(cfg)
+
+    old = start - timedelta(days=30)
+    lines = []
+    for i in range(day_ledger.RUN_MAX + 10):
+        began = old + timedelta(minutes=3 * i)
+        done = began + timedelta(minutes=1)
+        base = {"task_id": handover.FORK_TASK_ID, "mode": "pace",
+                "model": "claude-opus-5", "parent_session": MAIN_ID,
+                "started_at": began.isoformat(), "fork_session_id": None,
+                "tokens": None, "cost_usd": None}
+        # Both lines a run writes, each stamped when it was appended.
+        lines.append(json.dumps({**base, "status": handover.STATUS_STARTED,
+                                 "finished_at": None,
+                                 handover.LOG_KEY: began.isoformat()}))
+        lines.append(json.dumps({**base, "status": handover.STATUS_DONE,
+                                 "finished_at": done.isoformat(),
+                                 handover.LOG_KEY: done.isoformat()}))
+    cfg.handover_log.parent.mkdir(parents=True, exist_ok=True)
+    cfg.handover_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    for model, began, done in (("claude-opus-5", 0.10, 0.20),
+                               ("claude-fable-5-1", 0.30, 0.40),
+                               ("claude-opus-5", 0.50, 0.60)):
+        handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                                model=model, parent_session=MAIN_ID,
+                                started_at=_day_at(cfg, began).isoformat())
+        handover.finish_handover(cfg, status=handover.STATUS_DONE,
+                                 finished_at=_day_at(cfg, done).isoformat())
+
+    runs = day_ledger.fork_runs(cfg, start, end)
+    assert [r["run"] for r in runs] == [1, 2, 3], len(runs)
+    assert [r["model"] for r in runs] == ["claude-opus-5", "claude-fable-5-1",
+                                          "claude-opus-5"], runs
+    assert all(r["status"] == handover.STATUS_DONE for r in runs), runs
+    # The history is untouched on disk: it is filtered out, not rotated away.
+    kept = cfg.handover_log.read_text(encoding="utf-8").splitlines()
+    assert len(kept) == 2 * (day_ledger.RUN_MAX + 10) + 6, len(kept)
+
+    # And the page says three, not none.
+    from tokentracker import ledger
+    ledger.generate(cfg, "manual", hours=1.0)
+    day = json.loads(day_ledger.day_summary_path(
+        cfg, day_ledger.day_date(cfg)).read_text(encoding="utf-8"))
+    assert len(day["fork_runs"]) == 3, day["fork_runs"]
+
+
+def test_day_ledger_attributes_commits_to_the_run_that_made_them():
+    if not _git_ok():
+        return
+    from tokentracker import day_ledger, handover
+    cfg = _ledger_cfg()
+    start, end, _date = day_ledger.day_bounds(cfg)
+    repo = cfg.root / "runrepo"
+    repo.mkdir(parents=True, exist_ok=True)
+    assert _git_run(repo, ["init", "-q", "."]) == 0
+    cfg.report_repo = str(repo)
+    for name, when in (("a", 0.15), ("b", 0.25), ("c", 0.45)):
+        (repo / f"{name}.txt").write_text(name, encoding="utf-8")
+        _git_run(repo, ["add", "-A"])
+        _git_run(repo, ["commit", "-q", "-m", f"work {name}"],
+                 _day_at(cfg, when))
+
+    for model, began, ended in (("claude-fable-5-1", 0.10, 0.20),
+                                ("claude-opus-5", 0.40, 0.50)):
+        handover.write_handover(cfg, task_id=handover.FORK_TASK_ID, mode="pace",
+                                model=model, parent_session=MAIN_ID,
+                                started_at=_day_at(cfg, began).isoformat())
+        handover.finish_handover(cfg, status="done",
+                                 finished_at=_day_at(cfg, ended).isoformat())
+
+    runs = day_ledger.fork_runs(cfg, start, end)
+    assert len(runs) == 2, runs
+    assert [c["subject"] for c in runs[0]["commits"]] == ["work a"], runs[0]
+    assert [c["subject"] for c in runs[1]["commits"]] == ["work c"], runs[1]
+    # "work b" landed between the two runs: it belongs to neither rather than
+    # to whichever one is nearest.
+    assert all(len(c["commit"]) == 8 for r in runs for c in r["commits"]), runs
+
+
+def test_day_ledger_status_line_and_window_only():
+    from tokentracker import day_ledger, ledger
+    from tokentracker.cli import main as cli_main
+    cfg = _ledger_cfg()
+    assert "none yet today" in day_ledger.day_status_line(cfg)
+    assert day_ledger.latest_day_page(cfg) is None
+
+    ledger.generate(cfg, "manual", hours=1.0)
+    line = day_ledger.day_status_line(cfg)
+    assert line.startswith("day ledger: 1 window,"), line
+    assert " CT, $" in line and "-day-ledger.html" in line, line
+    ledger.generate(cfg, "stopped", now=utcnow() + timedelta(seconds=61))
+    assert day_ledger.day_status_line(cfg).startswith("day ledger: 2 windows,")
+    # VIEW REPORT opens the day page by name, not yesterday's latest.html copy.
+    assert ledger.day_report(cfg) == day_ledger.day_page_path(
+        cfg, day_ledger.day_date(cfg))
+
+    # --window-only is the old behaviour: one page, and latest.html is a copy
+    # of it rather than of the day.
+    latest = cfg.reports_dir / ledger.LATEST_NAME
+    page = ledger.generate(cfg, "manual", hours=1.0,
+                           now=utcnow() + timedelta(seconds=122), day=False)
+    assert latest.read_bytes() == page.read_bytes(), "latest.html is the window"
+    day = json.loads(day_ledger.day_summary_path(
+        cfg, day_ledger.day_date(cfg)).read_text(encoding="utf-8"))
+    assert len(day["windows"]) == 2, "no window was appended for --window-only"
+
+    out = _capture(lambda: cli_main(["--root", str(cfg.root), "report",
+                                     "--window-only", "--hours", "2"]))
+    assert "wrote " in out and "day:" not in out, out
 
 
 def test_ledger_cli_report_command():
@@ -6906,10 +7285,21 @@ def test_tier_blocks_cap_and_rank_the_bullets():
 
 def test_tier_blocks_polish_is_off_and_calls_no_subprocess():
     """Disabled means no process is started, not "started and ignored"."""
+    import threading
+
     from tokentracker import ledger
     cfg, start, end = _blocks_cfg(with_repo=False)
     cfg.report_repo = ""
     assert ledger.summarize_settings(cfg)["enabled"] is False
+
+    # The guard below replaces a MODULE attribute, which every thread in the
+    # process shares. A report queued by an earlier tick test runs git through
+    # that same attribute on its own thread, so its calls would land in this
+    # test's list; wait those out before patching rather than assert against
+    # whatever else the suite happens to have in flight.
+    for thread in threading.enumerate():
+        if thread.name in ("ledger-report", "ledger-tiers"):
+            thread.join(timeout=60)
 
     calls: list = []
 
