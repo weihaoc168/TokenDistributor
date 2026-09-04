@@ -11,8 +11,9 @@ from pathlib import Path
 from .allocator import allocate
 from .config import Config, reload_config
 from .control import RUNNING as CONTROL_RUNNING
+from .control import OPERATOR as CONTROL_OPERATOR
 from .control import STOPPED as CONTROL_STOPPED
-from .control import read_control, write_control
+from .control import read_record, stopped_text, write_control
 from .goal import GOAL_FALLBACK, GOAL_STEP, read_goal, read_stop, write_goal
 from .graph import (
     COUNT_MAX,
@@ -520,7 +521,8 @@ class Overlay:
         self._scroll_idx = 0
         self._max_scroll = 0
         self._throttle = False
-        self._control = read_control(cfg)
+        self._record = read_record(cfg)
+        self._control = self._record["dispatch"]
         self._goal = read_goal(cfg)
         self._stop = read_stop(cfg)
         self._fork = fork_active(cfg)
@@ -864,7 +866,10 @@ class Overlay:
                                 tags="throttle_btn")
 
     def _set_control(self, mode: str) -> str:
-        self._control = write_control(self.cfg, mode)
+        # Always `operator`: a button under a finger is a person's decision, and
+        # `operator` is the one reason nothing lifts on its own. A STOP pressed
+        # here therefore outlives every bucket reset until START is pressed.
+        self._control = write_control(self.cfg, mode, reason=CONTROL_OPERATOR)
         self._refresh()
         return "break"
 
@@ -1373,6 +1378,20 @@ class Overlay:
     def _stop_text(self, short: bool = False) -> str | None:
         """The red band's wording; `short` is the collapsed bar's one-line form.
 
+        The switch first, in the same words `tracker.py status` prints: why
+        dispatch is parked ("fable bucket 97%", "by operator") and the reset
+        that lifts it. With the switch running the band still reports a
+        standing state/stop.json, because that record is a stop point the main
+        session is watching whether or not the loop is dispatching.
+        """
+        text = stopped_text(self.cfg, self._record, short=short, stop=self._stop)
+        if text is not None:
+            return text
+        return self._goal_stop_text(short)
+
+    def _goal_stop_text(self, short: bool = False) -> str | None:
+        """The band for a standing weekly-goal record while dispatch runs.
+
         Collapsed, the band shares its row with the mode word (already reading
         STOPPED), so the prefix is dead weight there while the two numbers are
         the whole point - and the long form only ever fits by dropping them.
@@ -1473,7 +1492,10 @@ class Overlay:
             self.root.after_cancel(self._after_id)
             self._after_id = None
         state = self._load_state()
-        self._control = read_control(self.cfg)
+        # The whole switch, not just the mode: the red band names the reason it
+        # was parked for and the reset that lifts it, and both live in here.
+        self._record = read_record(self.cfg)
+        self._control = self._record["dispatch"]
         # Both files are re-read every refresh, like the control flag: the loop
         # writes stop.json on its own tick and the goal may change from the CLI.
         self._goal = read_goal(self.cfg)

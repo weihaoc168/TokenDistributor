@@ -6,10 +6,15 @@ tap, so a click never has to rewrite the checked-in config.
 
 Every poll the loop compares the weekly window against the goal. On crossing it
 drops `state/stop.json` - the file the main session watches as its stop point -
-and flips the dispatch switch to stopped through the existing control file.
+and, when nothing has parked dispatch already, flips the switch to stopped
+through the control file with reason `weekly_goal` and `until` set to the
+weekly window's own reset. A stop already standing is left alone, reason and
+all: an operator STOP means the loop holds until a person lifts it, and
+restamping it here would give it a reset to resume at.
 Falling back below the goal (the weekly window rolled over) only clears the
-file: restarting dispatch stays an operator decision, so a fresh week never
-resumes work behind the user's back.
+file; the switch itself is flipped back by `control.maybe_resume` on the poll
+that reaches that `until`, which is what the operator asked for: the weekly
+budget, not a person, decides when the loop starts again.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import os
 from typing import Any
 
 from .config import Config
-from .control import STOPPED, write_control
+from .control import STOPPED, WEEKLY_GOAL, read_record, write_control
 from .models import utcnow
 
 GOAL_MIN = 0.05
@@ -171,13 +176,20 @@ def clear_stop(cfg: Config) -> bool:
         return False
 
 
-def apply_goal_stop(cfg: Config, weekly: float, now=None) -> tuple[dict | None, str | None]:
+def apply_goal_stop(cfg: Config, weekly: float, now=None,
+                    resets_at=None) -> tuple[dict | None, str | None]:
     """Compare the weekly window against the goal; returns (stop record, log line).
 
     Crossing the goal writes state/stop.json once and stops dispatch once - a
     stop record already on disk is never rewritten, so pressing START while the
     week is still over goal keeps running instead of being re-stopped every
     poll. Dropping back below the goal only deletes the record.
+
+    `resets_at` is the weekly window's own reset, and it becomes the `until` on
+    the control record: the moment `control.maybe_resume` lifts this stop
+    without anyone pressing START. The switch is only written when dispatch is
+    still running - a stop already standing keeps its own reason and its own
+    `until`, so an operator STOP is never converted into one that resumes.
 
     Never raises, and never acts on a weekly value it cannot trust: the usage
     payload is remote JSON, so `utilization` can arrive null or NaN, and
@@ -215,14 +227,31 @@ def apply_goal_stop(cfg: Config, weekly: float, now=None) -> tuple[dict | None, 
             "at": now.isoformat(),
         }
         _write_atomic(cfg.stop_file, json.dumps(record))
-        write_control(cfg, STOPPED)
+        # The switch is only flipped when nothing else has parked it, the way
+        # allocator.apply_bucket_stops guards its own stop: whoever got there
+        # first keeps the reason. The case that matters is the operator's own
+        # STOP, which carries no `until` and is meant to hold. TD does not own
+        # the weekly burn - the main session and the adopted workers spend it
+        # too - so the goal can be crossed on a poll long after that STOP, and
+        # restamping the record as weekly_goal would hand it the weekly reset
+        # as an `until`. control.maybe_resume would then start the loop again
+        # at that rollover, which is exactly the resume the operator's stop is
+        # supposed to be immune to. state/stop.json is a separate signal (the
+        # main session reads it, not this switch), so it is written either way.
+        already = read_record(cfg)["dispatch"] == STOPPED
+        if not already:
+            write_control(cfg, STOPPED, reason=WEEKLY_GOAL, until=resets_at,
+                          now=now)
         return record, (f"weekly goal {goal:.0%} reached (weekly {weekly:.0%}); "
-                        f"dispatch stopped, wrote {cfg.stop_file.name}")
+                        f"dispatch {'already stopped' if already else 'stopped'}"
+                        f", wrote {cfg.stop_file.name}")
 
     if existing is None:
         return None, (f"discarded unreadable {cfg.stop_file.name}"
                       if salvaged else None)
     clear_stop(cfg)
-    # Deliberately no write_control(RUNNING): the operator presses START.
+    # Deliberately no write_control(RUNNING) here: the switch is lifted by
+    # `control.maybe_resume`, which runs earlier in the same poll and knows
+    # which reason parked it. Clearing the record is this function's whole job.
     return None, (f"weekly {weekly:.0%} back under goal {goal:.0%}; "
-                  f"cleared {cfg.stop_file.name} (press START to resume)")
+                  f"cleared {cfg.stop_file.name}")

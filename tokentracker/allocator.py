@@ -507,6 +507,58 @@ def bucket_stop(cfg: Config, name: str, goal: float) -> float:
     return float(stop) if isinstance(stop, (int, float)) else goal
 
 
+def _row(bucket: Any, key: str) -> Any:
+    """One field off a Bucket or off the dict `Bucket.to_dict` wrote."""
+    if isinstance(bucket, dict):
+        value = bucket.get(key)
+        return parse_iso(value) if key == "resets_at" else value
+    return getattr(bucket, key, None)
+
+
+def apply_bucket_stops(cfg: Config, buckets: Any,
+                       now: datetime | None = None) -> str | None:
+    """The Fable hard stop: at 97% the allocator parks dispatch itself.
+
+    Until today this was a rule the director applied by hand - the loop knew
+    the threshold (`FABLE_STOP`, reported in every bucket row) and stopped
+    nothing. It writes the switch now, with reason `fable_bucket` and `until`
+    set to the Fable window's own reset, which is what lets
+    `control.maybe_resume` start the loop again at that reset with nobody at
+    the keyboard.
+
+    Returns the line the loop logs, or None. Two things hold it back: dispatch
+    already being stopped (whatever parked it, this must not overwrite the
+    reason), and a reading whose window has already expired - a Fable
+    utilization from a window that reset ten minutes ago says nothing about the
+    one running now, and stopping on it would park the loop for a whole week.
+
+    Never raises: it is called from inside the tick.
+    """
+    now = now or utcnow()
+    try:
+        from .control import FABLE_BUCKET, STOPPED, read_record, write_control
+
+        row = (buckets or {}).get(FABLE)
+        if row is None:
+            return None
+        util = _finite(_row(row, "utilization"), math.nan)
+        stop = _finite(_row(row, "stop"), math.nan)
+        resets = _row(row, "resets_at")
+        if not math.isfinite(util) or not math.isfinite(stop) or util < stop:
+            return None
+        if isinstance(resets, datetime) and resets <= now:
+            return None
+        if read_record(cfg)["dispatch"] == STOPPED:
+            return None
+        write_control(cfg, STOPPED, reason=FABLE_BUCKET, until=resets, now=now)
+        tail = (f"; resumes {reset_label(resets, cfg)}"
+                if isinstance(resets, datetime) else "")
+        return (f"fable bucket {util:.0%} >= hard stop {stop:.0%}; "
+                f"dispatch stopped{tail}")
+    except Exception:  # pragma: no cover - the poll must survive anything
+        return None
+
+
 def read_buckets(cfg: Config, snap: Any = None, now: datetime | None = None,
                  history: Any = None) -> dict[str, Bucket]:
     """Every bucket's utilization, burn rate, time to reset and pace. Never raises.

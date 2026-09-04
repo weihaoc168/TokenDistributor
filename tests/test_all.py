@@ -1047,6 +1047,390 @@ def test_write_control_round_trip():
     assert control.read_control(cfg) == control.RUNNING
 
 
+def test_control_reason_and_until_round_trip():
+    # The switch says WHY it is parked and WHEN that lifts, because a stop the
+    # buckets wrote has to be told from one a person wrote.
+    from tokentracker import control
+    cfg = make_cfg()
+    until = NOW + timedelta(hours=6)
+    assert control.write_control(cfg, "stopped", reason=control.FABLE_BUCKET,
+                                 until=until) == control.STOPPED
+    payload = json.loads(cfg.control_file.read_text(encoding="utf-8"))
+    assert list(payload) == list(control.CONTROL_KEYS), payload
+    assert payload["reason"] == control.FABLE_BUCKET, payload
+    assert parse_iso(payload["until"]) == until, payload
+    record = control.read_record(cfg)
+    assert record["dispatch"] == control.STOPPED
+    assert record["reason"] == control.FABLE_BUCKET
+    assert record["until"] == until and record["changed_at"] is not None
+
+    # An operator stop carries no reset to wait for.
+    control.write_control(cfg, "stopped")
+    record = control.read_record(cfg)
+    assert record["reason"] == control.OPERATOR and record["until"] is None
+    # Nor is one stored when a caller passes one anyway.
+    control.write_control(cfg, "stopped", reason=control.OPERATOR, until=until)
+    assert control.read_record(cfg)["until"] is None
+
+    # A file written before the field existed - or by hand - reads as the
+    # operator's, the one reason that never resumes on its own.
+    cfg.control_file.write_text('{"dispatch": "stopped"}', encoding="utf-8")
+    assert control.read_record(cfg)["reason"] == control.OPERATOR
+    for junk in ("{not json", "[]", "", '{"dispatch": "stopped", "reason": 7}'):
+        cfg.control_file.write_text(junk, encoding="utf-8")
+        record = control.read_record(cfg)
+        assert record["until"] is None, junk
+        assert record["dispatch"] in control.CONTROL_MODES, junk
+
+    # Running keeps the reason (so the log can say who started it) and never an
+    # until: there is nothing left to wait for.
+    control.write_control(cfg, "running", reason="auto_resume:fable_bucket",
+                          until=until)
+    record = control.read_record(cfg)
+    assert record["dispatch"] == control.RUNNING
+    assert record["reason"] == "auto_resume:fable_bucket"
+    assert record["until"] is None
+
+
+def test_auto_resume_fires_at_until_and_not_before():
+    from tokentracker import control
+    cfg = make_cfg()
+    until = NOW + timedelta(hours=2)
+    control.write_control(cfg, control.STOPPED, reason=control.FABLE_BUCKET,
+                          until=until)
+    for when in (NOW, until - timedelta(seconds=1)):
+        assert control.maybe_resume(cfg, None, when) is None, when
+        assert control.read_control(cfg) == control.STOPPED, when
+    line = control.maybe_resume(cfg, None, until)
+    assert line and line.startswith("dispatch resumed: fable reset at "), line
+    assert clock.fmt_local(until, "%a %H:%M", cfg, with_label=True) in line, line
+    assert control.read_control(cfg) == control.RUNNING
+    assert control.read_record(cfg)["reason"] == "auto_resume:fable_bucket"
+    # Already running: nothing to lift, and no second log line.
+    assert control.maybe_resume(cfg, None, until + timedelta(hours=1)) is None
+
+
+def test_operator_stop_never_auto_resumes():
+    from tokentracker import control
+    cfg = make_cfg()
+    control.write_control(cfg, control.STOPPED)
+    rolled = snap(0.01, 0.01, left_h=168.0, five_left_h=5.0)
+    for when in (NOW, NOW + timedelta(days=30)):
+        assert control.maybe_resume(cfg, None, when) is None, when
+        assert control.maybe_resume(cfg, rolled, when) is None, when
+        assert control.read_control(cfg) == control.STOPPED, when
+    # Even with an `until` hand-edited onto the record: `operator` is the whole
+    # decision, and no clock lifts it.
+    cfg.control_file.write_text(json.dumps(
+        {"dispatch": "stopped", "reason": "operator",
+         "until": NOW.isoformat()}), encoding="utf-8")
+    assert control.maybe_resume(cfg, None, NOW + timedelta(hours=1)) is None
+    assert control.read_control(cfg) == control.STOPPED
+    # And so does a reason nobody recognizes: unknown means "leave it alone".
+    cfg.control_file.write_text(json.dumps(
+        {"dispatch": "stopped", "reason": "because",
+         "until": NOW.isoformat()}), encoding="utf-8")
+    assert control.maybe_resume(cfg, None, NOW + timedelta(hours=1)) is None
+    assert control.read_control(cfg) == control.STOPPED
+
+
+def test_operator_stop_survives_the_weekly_goal_crossing():
+    # Today's sequence, end to end. The operator presses STOP; the weekly budget
+    # keeps burning anyway, because the main session and the adopted workers
+    # spend it and TD only watches. The poll that crosses the goal must write
+    # state/stop.json (the main session reads that file) WITHOUT restamping the
+    # switch: an operator stop rewritten as weekly_goal would pick up the weekly
+    # reset as its `until`, and maybe_resume would start the loop again at the
+    # rollover - the one thing an operator stop promises not to do.
+    from tokentracker import cli, control, goal
+    cfg = _gate_cfg()
+    goal.write_goal(cfg, 0.90)
+    d, launched = _gate_dispatcher(cfg)
+    history = usage.UsageHistory(cfg)
+    control.write_control(cfg, control.STOPPED)  # the operator's own STOP
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.95, left_h=100.0)
+    try:
+        _decision, actions, _e, _s, _r = cli._tick(cfg, d, history)
+        assert cfg.stop_file.exists(), "the main session still needs its signal"
+        assert any("weekly goal" in a for a in actions), actions
+        record = control.read_record(cfg)
+        assert record["reason"] == control.OPERATOR, record
+        assert record["until"] is None, record
+        assert launched == [], launched
+
+        # The weekly window rolls: the goal's own record clears itself, and the
+        # switch stays exactly where the operator left it.
+        usage.fetch_usage = lambda _cfg: snap(0.05, left_h=160.0)
+        decision, actions2, _e, _s, _r = cli._tick(cfg, d, history)
+        assert not cfg.stop_file.exists()
+        assert not any("dispatch resumed" in a for a in actions2), actions2
+        assert control.read_control(cfg) == control.STOPPED
+        assert control.read_record(cfg)["reason"] == control.OPERATOR
+        assert decision.mode == "stopped", decision
+        assert launched == [], launched
+        # Nor does any amount of clock: `operator` is not a bucket.
+        assert control.maybe_resume(cfg, None, NOW + timedelta(days=30)) is None
+        assert control.read_control(cfg) == control.STOPPED
+    finally:
+        usage.fetch_usage = real_fetch
+
+
+def test_a_hand_typed_bucket_stop_refuses_a_stale_reset():
+    # `tracker.py dispatch stop --reason fable_bucket` takes its `until` from
+    # state/allocation.json, and only the loop refreshes that file. Typed with
+    # the loop down, or after a machine slept through the window, the reset in
+    # it is already behind us - and an `until` in the past is a promise
+    # resume_due keeps on the very next poll, with nobody told. Both ends refuse.
+    from tokentracker import cli, control
+    cfg = make_cfg()
+
+    def allocation(resets):
+        cfg.allocation_file.write_text(json.dumps(
+            {"buckets": {"fable": {"name": "fable", "utilization": 0.98,
+                                   "resets_at": resets.isoformat()}}}),
+            encoding="utf-8")
+
+    allocation(utcnow() - timedelta(minutes=1))
+    assert cli._bucket_reset(cfg, control.FABLE_BUCKET) is None
+    out = _capture(lambda: cli.cmd_dispatch(cfg, "stop", control.FABLE_BUCKET))
+    assert "holds until a person lifts it" in out, out
+    record = control.read_record(cfg)
+    assert record["dispatch"] == control.STOPPED
+    assert record["reason"] == control.FABLE_BUCKET, record
+    assert record["until"] is None, record
+    # And so it stays: no clock lifts a stop with nothing to wait for.
+    assert control.maybe_resume(cfg, None, utcnow() + timedelta(days=30)) is None
+    assert control.read_control(cfg) == control.STOPPED
+
+    # A reading still ahead of us is stored, and does lift the stop on time.
+    fresh = utcnow() + timedelta(hours=6)
+    allocation(fresh)
+    control.write_control(cfg, control.RUNNING)
+    out = _capture(lambda: cli.cmd_dispatch(cfg, "stop", control.FABLE_BUCKET))
+    assert "holds until a person lifts it" not in out, out
+    assert cli._bucket_reset(cfg, control.FABLE_BUCKET) == fresh
+    assert control.read_record(cfg)["until"] == fresh
+    assert control.maybe_resume(cfg, None, fresh) is not None
+    assert control.read_control(cfg) == control.RUNNING
+
+    # write_control is the second line of defence: a past `until` from any
+    # caller is dropped rather than stored, and `now` is the clock it is judged
+    # against so a poll can hand it its own.
+    control.write_control(cfg, control.STOPPED, reason=control.WEEKLY_GOAL,
+                          until=utcnow() - timedelta(seconds=1))
+    assert control.read_record(cfg)["until"] is None
+    control.write_control(cfg, control.STOPPED, reason=control.WEEKLY_GOAL,
+                          until=fresh, now=fresh + timedelta(seconds=1))
+    assert control.read_record(cfg)["until"] is None
+
+
+def test_weekly_goal_stop_resumes_when_the_weekly_bucket_resets():
+    from tokentracker import control, goal
+    cfg = make_cfg()
+    goal.write_goal(cfg, 0.90)
+    resets = NOW + timedelta(hours=10)
+    stop, _line = goal.apply_goal_stop(cfg, 0.95, NOW, resets_at=resets)
+    record = control.read_record(cfg)
+    assert record["dispatch"] == control.STOPPED
+    assert record["reason"] == control.WEEKLY_GOAL, record
+    assert record["until"] == resets, record
+
+    # Still over goal and still before the reset: parked, record intact.
+    over = snap(0.96, left_h=10.0)
+    assert control.maybe_resume(cfg, over, NOW + timedelta(hours=1)) is None
+    assert cfg.stop_file.exists() and control.read_control(cfg) == control.STOPPED
+
+    # The window rolled: the reading is far under the goal AND its reset has
+    # moved past the one this stop was waiting for. Both are required, so a
+    # single low reading inside the same window cannot lift it.
+    early = snap(0.02, left_h=10.0)
+    assert control.maybe_resume(cfg, early, NOW + timedelta(hours=1)) is None
+    rolled = snap(0.02, left_h=168.0)
+    line = control.maybe_resume(cfg, rolled, NOW + timedelta(hours=1))
+    assert line and "dispatch resumed: weekly" in line, line
+    assert control.read_control(cfg) == control.RUNNING
+    assert not cfg.stop_file.exists(), "the weekly stop owns state/stop.json"
+
+
+def test_auto_resume_clears_only_its_own_stop_file():
+    from tokentracker import control, goal
+    cfg = make_cfg()
+    goal.write_goal(cfg, 0.90)
+    stop, _line = goal.apply_goal_stop(cfg, 0.95, NOW,
+                                       resets_at=NOW + timedelta(hours=10))
+    # A Fable stop written over the weekly one: lifting it must leave the
+    # weekly goal's record exactly where the main session expects it.
+    fable_until = NOW + timedelta(hours=2)
+    control.write_control(cfg, control.STOPPED, reason=control.FABLE_BUCKET,
+                          until=fable_until)
+    line = control.maybe_resume(cfg, None, fable_until)
+    assert line and "fable" in line, line
+    assert cfg.stop_file.exists(), "a fable resume must not clear the goal stop"
+    assert json.loads(cfg.stop_file.read_text(encoding="utf-8")) == stop
+
+    # And the weekly resume only deletes a record that is really its own.
+    cfg.stop_file.write_text(json.dumps({"reason": "some other stop"}),
+                             encoding="utf-8")
+    control.write_control(cfg, control.STOPPED, reason=control.WEEKLY_GOAL,
+                          until=NOW + timedelta(hours=10))
+    assert control.maybe_resume(cfg, None, NOW + timedelta(hours=10))
+    assert cfg.stop_file.exists(), "a foreign record is not this one's to delete"
+
+
+def test_snapshot_stop_lifts_when_the_pass_finishes():
+    from tokentracker import control
+    cfg = make_cfg()
+    control.write_control(cfg, control.STOPPED, reason=control.SNAPSHOT)
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "snapshot-1", "prompt": "p", "cwd": str(cfg.root),
+         "weight": "heavy", "status": "running"}]}), encoding="utf-8")
+    assert control.maybe_resume(cfg, None, NOW) is None
+    assert control.read_control(cfg) == control.STOPPED
+    cfg.tasks_file.write_text(json.dumps({"tasks": [
+        {"id": "snapshot-1", "prompt": "p", "cwd": str(cfg.root),
+         "weight": "heavy", "status": "done"}]}), encoding="utf-8")
+    line = control.maybe_resume(cfg, None, NOW)
+    assert line == "dispatch resumed: snapshot pass finished", line
+    assert control.read_control(cfg) == control.RUNNING
+
+
+def test_allocator_writes_the_fable_hard_stop():
+    # The 97% rule the director used to apply by hand. It writes the switch
+    # itself now, with the Fable window's own reset as the until that lifts it.
+    from tokentracker import allocator as A
+    from tokentracker import control
+    cfg = make_cfg()
+    resets = NOW + timedelta(hours=30)
+
+    def bucket(util: float, when=resets) -> dict:
+        return {A.FABLE: A.Bucket(name=A.FABLE, utilization=util,
+                                  hours_to_reset=30.0, goal=0.90,
+                                  stop=A.FABLE_STOP, resets_at=when)}
+
+    line = A.apply_bucket_stops(cfg, bucket(0.97), NOW)
+    assert line and "fable bucket 97%" in line, line
+    record = control.read_record(cfg)
+    assert record["dispatch"] == control.STOPPED
+    assert record["reason"] == control.FABLE_BUCKET, record
+    assert record["until"] == resets, record
+    # Parked once: a stop already standing is never rewritten, so whoever got
+    # there first keeps the reason (and the operator keeps their veto).
+    assert A.apply_bucket_stops(cfg, bucket(0.99), NOW) is None
+
+    cfg.control_file.unlink()
+    assert A.apply_bucket_stops(cfg, bucket(0.96), NOW) is None
+    assert control.read_control(cfg) == control.RUNNING
+    # A reading from a window that has already reset describes the week that
+    # just ended; stopping on it would park the loop for a fresh one.
+    assert A.apply_bucket_stops(cfg, bucket(0.99, NOW - timedelta(minutes=1)),
+                                NOW) is None
+    assert control.read_control(cfg) == control.RUNNING
+    assert A.apply_bucket_stops(cfg, {}, NOW) is None
+    # And it reads the dict rows state/allocation.json actually carries.
+    rows = {name: b.to_dict() for name, b in bucket(0.98).items()}
+    assert A.apply_bucket_stops(cfg, rows, NOW)
+    assert control.read_record(cfg)["until"] == resets
+
+
+def test_tick_stops_on_the_fable_bucket_and_resumes_at_its_reset():
+    # End to end: the poll that crosses 97% parks dispatch, and the poll after
+    # the Fable window resets starts it again with nobody at the keyboard.
+    from tokentracker import cli, control
+    cfg = _gate_cfg()
+    d, launched = _gate_dispatcher(cfg)
+    history = usage.UsageHistory(cfg)
+    reset = utcnow() + timedelta(hours=6)
+
+    def fable_snap(util: float, when):
+        return UsageSnapshot(
+            fetched_at=utcnow(),
+            five_hour=WindowUsage(0.1, utcnow() + timedelta(hours=2)),
+            seven_day=WindowUsage(0.2, utcnow() + timedelta(hours=100)),
+            extra={"fable_weekly": WindowUsage(util, when)})
+
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: fable_snap(0.98, reset)
+    try:
+        decision, actions, _e, _s, _r = cli._tick(cfg, d, history)
+        assert any("fable bucket" in a for a in actions), actions
+        assert decision.mode == "stopped", decision
+        assert launched == [], launched
+        record = control.read_record(cfg)
+        assert record["reason"] == control.FABLE_BUCKET, record
+        assert record["until"] == reset, record
+        # The wiring, not just the gate: the decision this tick stored says
+        # which bucket parked it, so `status`'s "last decision" line agrees
+        # with the STOPPED band above it instead of blaming the operator.
+        assert "on the fable bucket" in decision.reason, decision.reason
+
+        # The window rolls: 0% Fable, a reset a week out, and the stored until
+        # now in the past. The same tick resumes and launches.
+        control.write_control(cfg, control.STOPPED, reason=control.FABLE_BUCKET,
+                              until=utcnow() - timedelta(seconds=1))
+        usage.fetch_usage = lambda _cfg: fable_snap(
+            0.0, utcnow() + timedelta(hours=168))
+        _decision, actions2, _e, _s, _r = cli._tick(cfg, d, history)
+        assert any("dispatch resumed: fable" in a for a in actions2), actions2
+        assert control.read_control(cfg) == control.RUNNING
+        assert launched == [("pod", "cloud")], launched
+    finally:
+        usage.fetch_usage = real_fetch
+
+
+def test_stopped_text_names_the_reason_and_the_reset():
+    from tokentracker import control, goal
+    cfg = make_cfg()
+    assert control.stopped_text(cfg) is None, "running says nothing"
+    control.write_control(cfg, control.STOPPED)
+    assert control.stopped_text(cfg) == "STOPPED by operator"
+    assert control.stopped_text(cfg, short=True) == "STOPPED (operator)"
+
+    resets = NOW + timedelta(hours=8)
+    when = clock.fmt_local(resets, "%a %H:%M", cfg, with_label=True)
+    control.write_control(cfg, control.STOPPED, reason=control.FABLE_BUCKET,
+                          until=resets)
+    assert control.stopped_text(cfg) == f"STOPPED: fable bucket 97% - resumes {when}"
+
+    goal.write_goal(cfg, 0.85)
+    control.write_control(cfg, control.STOPPED, reason=control.WEEKLY_GOAL,
+                          until=resets)
+    stop = {"reason": goal.STOP_REASON, "goal": 0.85, "weekly": 0.86,
+            "at": NOW.isoformat()}
+    assert control.stopped_text(cfg, stop=stop) == (
+        f"STOPPED: weekly goal 85% reached (86%) - resumes {when}")
+    assert control.stopped_text(cfg, short=True, stop=stop) == "GOAL 85% HIT (86%)"
+    # A standing stop.json outranks the switch's own reason: whoever pressed
+    # STOP, the weekly goal is what START would not get past.
+    control.write_control(cfg, control.STOPPED)
+    assert control.stopped_text(cfg, stop=stop).startswith(
+        "STOPPED: weekly goal 85% reached (86%)")
+
+    control.write_control(cfg, control.STOPPED, reason=control.FIVE_HOUR,
+                          until=resets)
+    assert control.stopped_text(cfg) == (
+        f"STOPPED: 5h bucket {cfg.five_hour_guard_idle:.0%} - resumes {when}")
+    control.write_control(cfg, control.STOPPED, reason=control.SNAPSHOT)
+    assert control.stopped_text(cfg) == "STOPPED: snapshot pass holding the lane"
+    assert control.stopped_text(cfg, short=True) == "SNAPSHOT PASS"
+
+
+def test_status_prints_the_stopped_reason_line():
+    from tokentracker import cli, control
+    cfg = make_cfg()
+    real_fetch = usage.fetch_usage
+    usage.fetch_usage = lambda _cfg: snap(0.40)
+    try:
+        control.write_control(cfg, control.STOPPED, reason=control.FABLE_BUCKET,
+                              until=NOW + timedelta(hours=8))
+        line = control.stopped_text(cfg)
+        assert line in _capture(lambda: cli.cmd_status(cfg)).splitlines(), line
+        control.write_control(cfg, control.RUNNING)
+        assert "STOPPED" not in _capture(lambda: cli.cmd_status(cfg))
+    finally:
+        usage.fetch_usage = real_fetch
+
+
 def test_gate_decision_passes_through_when_running():
     from tokentracker import control
     d = Decision("pace", 3, True, "behind", local_concurrency=2)
@@ -1061,6 +1445,26 @@ def test_gate_decision_zeroes_both_lanes_when_stopped():
     assert gated.target_concurrency == 0 and gated.local_concurrency == 0
     assert not gated.allow_heavy
     assert d.target_concurrency == 4, "gate must not mutate the input decision"
+
+
+def test_gate_decision_names_the_reason_that_parked_it():
+    """The decision line has to agree with the band printed right above it.
+
+    `status` prints this sentence as "last decision" and the loop stores it in
+    state.json, so while a bucket stop stands it must not read "by operator".
+    """
+    from tokentracker import control
+    d = Decision("surge", 4, True, "throttle", local_concurrency=1)
+    assert "by operator" in control.gate_decision(d, control.STOPPED).reason
+    for reason, said in ((control.FABLE_BUCKET, "on the fable bucket"),
+                         (control.WEEKLY_GOAL, "on the weekly goal"),
+                         (control.FIVE_HOUR, "on the 5h bucket"),
+                         (control.SNAPSHOT, "for a snapshot pass")):
+        line = control.gate_decision(d, control.STOPPED, reason).reason
+        assert f"Dispatch stopped {said} (would be surge)" in line, line
+    # No reason, blank, and junk all still say something usable.
+    assert "by operator" in control.gate_decision(d, control.STOPPED, "  ").reason
+    assert "(banana)" in control.gate_decision(d, control.STOPPED, "banana").reason
 
 
 def _gate_cfg() -> Config:
@@ -1493,21 +1897,23 @@ def test_tick_stops_dispatch_at_weekly_goal():
         assert not any("weekly goal" in a for a in actions2), actions2
         assert json.loads(cfg.stop_file.read_text(encoding="utf-8")) == stop
 
-        # Weekly reset: the stop point clears, dispatch stays parked.
+        # Weekly reset: the stop point clears, and the switch lifts itself -
+        # nobody presses START. The stop was written with reason weekly_goal
+        # and the weekly window's own reset as its `until`.
+        record = control.read_record(cfg)
+        assert record["reason"] == control.WEEKLY_GOAL, record
         usage.fetch_usage = lambda _cfg: snap(0.05, left_h=160.0)
         decision, actions3, _e, _s, _r = cli._tick(cfg, d, history)
         assert not cfg.stop_file.exists()
-        assert any("cleared" in a for a in actions3), actions3
-        assert control.read_control(cfg) == control.STOPPED
-        assert decision.mode == "stopped", decision
-        assert launched == [], launched
+        assert any("dispatch resumed: weekly" in a for a in actions3), actions3
+        assert control.read_control(cfg) == control.RUNNING
+        assert control.read_record(cfg)["reason"] == "auto_resume:weekly_goal"
+        assert decision.mode != "stopped", decision
+        # And the same tick re-arms the work: the fork's cooldown still applies
+        # but a queued row launches at once.
+        assert launched == [("pod", "cloud")], launched
         state = json.loads(cfg.state_file.read_text(encoding="utf-8"))
         assert state["goal_stop"] is None, state
-
-        # Only now, on an operator START, does work resume.
-        control.write_control(cfg, control.RUNNING)
-        cli._tick(cfg, d, history)
-        assert launched == [("pod", "cloud")], launched
     finally:
         usage.fetch_usage = real_fetch
 

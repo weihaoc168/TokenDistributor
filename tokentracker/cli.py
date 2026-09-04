@@ -8,7 +8,15 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import Config, load_config
-from .control import STOPPED, gate_decision, read_control
+from .control import (
+    STOPPED,
+    gate_decision,
+    maybe_resume,
+    read_control,
+    read_record,
+    stopped_text,
+    write_control,
+)
 from .dispatch import Dispatcher, DispatchError
 from .goal import (
     apply_goal_stop,
@@ -354,7 +362,7 @@ def _tick(
     cfg: Config, dispatcher: Dispatcher, history, do_fetch: bool = True,
 ) -> tuple[Decision, list[str], Exception | None, "object | None", bool]:
     from .activity import detect_activity
-    from .allocator import allocate, evaluate, tick_notes
+    from .allocator import allocate, apply_bucket_stops, evaluate, tick_notes
     from .graph import apply_graph
     from .ledger import maybe_refresh_tiers, maybe_report
     from .scheduler import decide, decide_local, normalize, pacing
@@ -398,6 +406,14 @@ def _tick(
         if recent and (now - recent[-1].fetched_at).total_seconds() <= cfg.stale_snapshot_minutes * 60:
             snap = recent[-1]
     control = read_control(cfg)
+    # Before anything else reads the switch: a stop that was written for a
+    # budget bucket lifts itself the moment that bucket resets, so the poll at
+    # 07:00 is the poll that starts dispatching again - no START press, and the
+    # fork re-arms from here on its own cooldown. An operator stop is untouched.
+    resumed = maybe_resume(cfg, snap, now)
+    if resumed is not None:
+        control = read_control(cfg)
+        notes.append(resumed)
     if snap is None:
         reason = f"usage fetch failed: {fetch_exc}" if fetch_exc else "no usage snapshot available"
         decision = Decision("blocked", 0, False, reason)
@@ -405,7 +421,7 @@ def _tick(
         # costs no budget either way, so it may still run.
         activity = detect_activity(cfg, own_dirs, now)
         decision.local_concurrency = decide_local(decision, activity, cfg, now)
-        decision = gate_decision(decision, control)
+        decision = gate_decision(decision, control, read_record(cfg)["reason"])
         actions = notes + dispatcher.apply(decision, now)
         report_line = maybe_report(cfg, dispatcher, before=fork_state,
                                    control=control, stop=read_stop(cfg), now=now)
@@ -433,11 +449,20 @@ def _tick(
     notes += tick_notes(standing, allocation)
     apply_graph(cfg)
 
+    # The Fable hard stop, off this poll's own bucket row: at 97% the allocator
+    # parks dispatch itself, with the Fable window's reset as the `until` that
+    # lifts it again. The director used to do this by hand.
+    hard_stop = apply_bucket_stops(cfg, allocation.buckets, now)
+    if hard_stop is not None:
+        control = read_control(cfg)
+        notes.append(hard_stop)
+
     # The weekly goal is checked before anything is launched, so the poll that
     # crosses it is also the poll that stops dispatch. apply_goal_stop may have
     # just written the control file, hence the re-read.
     goal = read_goal(cfg)
-    stop, goal_line = apply_goal_stop(cfg, snap.seven_day.utilization, now)
+    stop, goal_line = apply_goal_stop(cfg, snap.seven_day.utilization, now,
+                                      resets_at=snap.seven_day.resets_at)
     if goal_line is not None:
         control = read_control(cfg)
 
@@ -479,9 +504,10 @@ def _tick(
             dispatcher.set_status(THROTTLE_TASK_ID, "killed")
 
     decision.local_concurrency = decide_local(decision, activity, cfg, now)
-    # Operator STOP is the last word: it zeroes both launch budgets, so apply()
-    # reaps and adopts as usual but starts nothing new.
-    decision = gate_decision(decision, control)
+    # A standing STOP is the last word: it zeroes both launch budgets, so apply()
+    # reaps and adopts as usual but starts nothing new. The reason rides along so
+    # the decision line names the bucket that parked it rather than the operator.
+    decision = gate_decision(decision, control, read_record(cfg)["reason"])
     actions = notes + dispatcher.apply(decision, now)
     if goal_line is not None:
         actions.insert(0, goal_line)
@@ -689,6 +715,9 @@ def cmd_status(cfg: Config) -> int:
     except UsageFetchError as exc:
         print(f"live usage unavailable: {exc}")
         print(f"dispatch: {read_control(cfg)}")
+        parked = stopped_text(cfg, stop=read_stop(cfg))
+        if parked is not None:
+            print(parked)
         fork_line = fork_status_line(cfg)
         if fork_line is not None:
             print(fork_line)
@@ -730,6 +759,11 @@ def cmd_status(cfg: Config) -> int:
               f"{fmt_local(stop.get('at'), '%a %H:%M', cfg, with_label=True)}")
 
     print(f"dispatch: {read_control(cfg)}")
+    # Why it is parked and when it lifts, in the same words the panel's red
+    # band uses - so "why is nothing running" has one answer in both places.
+    parked = stopped_text(cfg, stop=stop)
+    if parked is not None:
+        print(parked)
     # The monitor session reports from this line: who is acting as director,
     # since when, in which mode and on which model.
     fork_line = fork_status_line(cfg)
@@ -794,6 +828,84 @@ def cmd_goal(cfg: Config, value: str | None) -> int:
     write_goal(cfg, goal)
     print(f"weekly goal: {goal:.0%} (source: {read_goal_source(cfg)[1]})")
     return 0
+
+
+def cmd_dispatch(cfg: Config, action: str | None, reason: str | None) -> int:
+    """Print the dispatch switch, or flip it: `dispatch stop --reason ...`.
+
+    The hand equivalent of the overlay's START / STOP, and it defaults to
+    `operator` for the same reason the overlay does: a stop typed by a person
+    is a person's decision, and only a bucket reason lifts by itself. Passing
+    `--reason fable_bucket` writes the stop the allocator would have written,
+    which is how a stop applied by hand still resumes - but only when the last
+    poll left a reset that is still ahead of us; see `_bucket_reset`.
+    """
+    from .control import AUTO_REASONS, BUCKET_LABEL, OPERATOR, read_record
+
+    if action is None:
+        record = read_record(cfg)
+        print(f"dispatch: {record['dispatch']}")
+        if record["reason"]:
+            until = record["until"]
+            when = (f", until {fmt_dispatch(cfg, until)}" if until else "")
+            print(f"reason: {record['reason']}{when}")
+        line = stopped_text(cfg, record, stop=read_stop(cfg))
+        if line is not None:
+            print(line)
+        return 0
+    mode = STOPPED if action == "stop" else "running"
+    reason = (reason or "").strip() or (OPERATOR if mode == STOPPED else None)
+    if mode == STOPPED and reason not in (OPERATOR,) + AUTO_REASONS:
+        print(f"error: unknown reason '{reason}'; use one of "
+              f"{', '.join((OPERATOR,) + AUTO_REASONS)}")
+        return 1
+    until = None
+    if mode == STOPPED and reason in AUTO_REASONS:
+        # The reset that lifts it, taken from the live bucket rather than typed:
+        # a stop that resumes has to resume at the window's own boundary.
+        until = _bucket_reset(cfg, reason)
+    write_control(cfg, mode, reason=reason, until=until)
+    record = read_record(cfg)
+    print(f"dispatch: {record['dispatch']}" + (f" ({reason})" if reason else ""))
+    if mode == STOPPED and reason in BUCKET_LABEL and record["until"] is None:
+        # No future reset to hang the stop on: state/allocation.json is stale or
+        # missing (the loop is not running yet, or that window has since rolled).
+        # Say so, because this stop now behaves like the operator's.
+        print(f"no future {BUCKET_LABEL[reason]} reset on record "
+              f"(state/allocation.json is stale or missing): this stop holds "
+              f"until a person lifts it, or until a poll sees that bucket roll")
+    line = stopped_text(cfg, record, stop=read_stop(cfg))
+    if line is not None:
+        print(line)
+    return 0
+
+
+def fmt_dispatch(cfg: Config, when) -> str:
+    from .clock import fmt_local
+
+    return fmt_local(when, "%a %H:%M", cfg, with_label=True)
+
+
+def _bucket_reset(cfg: Config, reason: str, now: datetime | None = None):
+    """The reset of the bucket a stop reason names, or None when it has passed.
+
+    The reading comes out of state/allocation.json, which the *loop* writes: a
+    `resets_at` in it is only as fresh as the last poll. Typed before the loop
+    was ever started, after it stopped, or on a machine that slept through the
+    window, that time is already behind us - and an `until` in the past is a
+    promise `control.maybe_resume` keeps on the very next tick. So a stale
+    reset is refused here (and again in `write_control`) and the stop simply
+    holds, which is the direction that cannot surprise anyone.
+    """
+    from .allocator import allocate
+
+    names = {"fable_bucket": "fable", "weekly_goal": "weekly",
+             "five_hour": "five_hour"}
+    row = (allocate(cfg).buckets or {}).get(names.get(reason, ""))
+    resets = parse_iso(row.get("resets_at")) if isinstance(row, dict) else None
+    if not isinstance(resets, datetime) or resets <= (now or utcnow()):
+        return None
+    return resets
 
 
 def cmd_alloc(cfg: Config) -> int:
@@ -1125,6 +1237,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="0.85, 85 or 85%% - omit to print the current goal")
     sub.add_parser(
         "alloc", help="the automatic allocation: buckets, pace, ladder step")
+    disp_p = sub.add_parser(
+        "dispatch", help="show or flip the dispatch switch (START / STOP)")
+    disp_p.add_argument("action", nargs="?", choices=("start", "stop"),
+                        default=None,
+                        help="omit to print the switch, its reason and when "
+                             "it lifts")
+    disp_p.add_argument("--reason", default=None,
+                        help="operator (the default, and the only one that "
+                             "never auto-resumes), fable_bucket, weekly_goal, "
+                             "five_hour or snapshot")
     sub.add_parser("list", help="list tasks")
     sub.add_parser("overlay", help="always-on-top panel docked to the Sundial layer")
 
@@ -1186,6 +1308,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_goal(cfg, args.value)
         if args.cmd == "alloc":
             return cmd_alloc(cfg)
+        if args.cmd == "dispatch":
+            return cmd_dispatch(cfg, args.action, args.reason)
         if args.cmd == "report":
             return cmd_report(cfg, args)
         if args.cmd == "graph":
