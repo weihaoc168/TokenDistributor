@@ -141,6 +141,11 @@
   "report_on_milestone": true,
   "report_on_stop": true,
   "report_window_hours": 24,
+  "report_summarize": {
+    "enabled": false,
+    "model": "claude-haiku-4-5-20251001",
+    "max_bullets": 8
+  },
   "tiers_refresh_seconds": 300,
   "throttle_fork_enabled": true,
   "fork_in_pace": true,

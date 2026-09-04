@@ -56,7 +56,7 @@ import re
 import shutil
 import subprocess
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -562,6 +562,25 @@ def parse_transcript(path: Path, start: datetime, end: datetime,
 
 # ------------------------------------------------------------------- roles
 
+def declared_role(label: Any) -> str:
+    """The role a label DECLARES, or "" when it declares none.
+
+    Split out of `role_of` because two callers need the difference between "a
+    brief that named this lane a builder" and "a brief that named nothing, so
+    it is filed as one": the tier split may not read an absent declaration as
+    a positive one.
+    """
+    text = str(label or "").strip()
+    bare = text.lower().strip(" .:-")
+    for role, words in ROLE_WORDS:
+        if bare in words or bare == role:
+            return role
+    for role, _words in ROLE_WORDS:
+        if ROLE_RE[role].search(text):
+            return role
+    return ""
+
+
 def role_of(label: Any, source: str | None = None) -> str:
     """Which lane a label names: worker, reviewer, judge, ... or director.
 
@@ -577,14 +596,9 @@ def role_of(label: Any, source: str | None = None) -> str:
     session is the director, anything else is a worker, so every dollar lands
     in exactly one role and `by_role` adds up to the priced total.
     """
-    text = str(label or "").strip()
-    bare = text.lower().strip(" .:-")
-    for role, words in ROLE_WORDS:
-        if bare in words or bare == role:
-            return role
-    for role, _words in ROLE_WORDS:
-        if ROLE_RE[role].search(text):
-            return role
+    role = declared_role(label)
+    if role:
+        return role
     return ROLE_DIRECTOR if source in (MAIN_SOURCE, FORK_SOURCE) else ROLE_WORKER
 
 
@@ -619,8 +633,21 @@ def agent_role(path: Path) -> str:
     is written *by* the director and routinely quotes the standing director
     instructions, which is what a `director` match in one almost always is.
     """
-    role = role_of(first_user_text(path), AGENT_SOURCE)
-    return ROLE_WORKER if role == ROLE_DIRECTOR else role
+    return agent_role_declared(path)[0]
+
+
+def agent_role_declared(path: Path) -> tuple[str, bool]:
+    """(role, did the brief actually declare it) for one Workflow agent.
+
+    Same answer as `agent_role`, plus the one bit that call site loses: a lane
+    filed as `worker` because its brief said "Implementer:" is not the same
+    row as one filed as `worker` because its brief said nothing at all, and
+    the tier split is allowed to trust only the first.
+    """
+    role = declared_role(first_user_text(path))
+    if not role or role == ROLE_DIRECTOR:
+        return ROLE_WORKER, False
+    return role, True
 
 
 def _fork_probe(prompt: str) -> str:
@@ -870,24 +897,25 @@ def parse_git_log(text: str) -> list[dict]:
     return commits
 
 
-def repo_commits(cfg: Config, start: datetime, end: datetime) -> list[dict]:
-    """Commits in `report_repo` inside the window. [] when git cannot answer.
+def git_read(repo: Any, args: list[str], timeout: int = 20) -> str | None:
+    """One read-only git command's stdout, or None when git cannot answer.
 
-    Never raises and never blocks for long: this runs inside report generation,
-    which itself runs off a background thread during a poll.
+    Never raises and never blocks for long: every caller runs inside report
+    generation, which itself runs off a background thread during a poll. None
+    is "no answer" for every reason there is - no git on PATH, not a repo, a
+    non-zero exit, a timeout - because none of them is worth a stack trace in
+    a reader thread.
     """
-    repo = Path(str(getattr(cfg, "report_repo", "") or ""))
-    if not repo.name:
-        return []
+    path = Path(str(repo or ""))
+    if not path.name:
+        return None
     git = shutil.which("git")
-    if git is None or not (repo / ".git").exists():
-        return []
+    if git is None or not (path / ".git").exists():
+        return None
     try:
         done = subprocess.run(
-            [git, "-C", str(repo), "log", "--reverse",
-             f"--since={start.isoformat()}", f"--until={end.isoformat()}",
-             f"--format={GIT_FORMAT}"],
-            capture_output=True, timeout=20, check=False,
+            [git, "-C", str(path), *args],
+            capture_output=True, timeout=timeout, check=False,
             # Decoded here rather than by `text=True`: git writes commit
             # subjects as UTF-8, and the console codepage this runs under
             # (GBK on this machine) raises UnicodeDecodeError on the first
@@ -896,12 +924,19 @@ def repo_commits(cfg: Config, start: datetime, end: datetime) -> list[dict]:
             encoding="utf-8", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return (done.stdout or "") if done.returncode == 0 else None
+
+
+def repo_commits(cfg: Config, start: datetime, end: datetime) -> list[dict]:
+    """Commits in `report_repo` inside the window. [] when git cannot answer."""
+    text = git_read(getattr(cfg, "report_repo", ""),
+                    ["log", "--reverse", f"--since={start.isoformat()}",
+                     f"--until={end.isoformat()}", f"--format={GIT_FORMAT}"])
+    if text is None:
         return []
-    if done.returncode != 0:
-        return []
-    return [c for c in parse_git_log(done.stdout or "")
-            if start <= c["at"] <= end]
+    return [c for c in parse_git_log(text) if start <= c["at"] <= end]
 
 
 def _snapshot_commits(cfg: Config) -> set[str]:
@@ -951,6 +986,11 @@ def bucket_milestones(commits: list[dict], events: Iterable[tuple], start: datet
             "subject": str(commit.get("subject") or ""),
             "usd": round(spent, 4),
             "minutes": round(max(0.0, (at - previous).total_seconds()) / 60.0, 1),
+            # The span the row bills, so the page can show when the work
+            # happened rather than only how long it took. ISO UTC, like every
+            # other stored timestamp; the page renders it in the local zone.
+            "start": previous.isoformat(),
+            "end": at.isoformat(),
             # Prefix match both ways: the worker reports a short hash, git
             # returns the full one, and neither knows what the other printed.
             "snapshot": any(full.startswith(m) or m.startswith(full)
@@ -958,6 +998,994 @@ def bucket_milestones(commits: list[dict], events: Iterable[tuple], start: datet
         })
         previous = at
     return rows
+
+
+def _usd_of(row: Any) -> float:
+    value = row.get("usd") if isinstance(row, dict) else None
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def rank_milestones(rows: Any) -> list[dict]:
+    """The milestone rows again, costliest first, each carrying its rank.
+
+    `per_milestone` itself stays chronological: it is an append-only record of
+    what happened in what order, and re-sorting the stored list would change
+    the meaning of a file other tools already read. This is the second view,
+    which is the one the page's table draws - "what did the expensive commits
+    cost" is a ranking question, and answering it by eye down a time-ordered
+    column is exactly the work the page is supposed to have done already.
+
+    Ties on dollars break on minutes descending: two commits that cost the
+    same are ordered by how long the window in front of them was.
+    """
+    ordered = [row for row in (rows or []) if isinstance(row, dict)]
+    ordered.sort(key=lambda r: (-_usd_of(r),
+                                -(float(r.get("minutes"))
+                                  if isinstance(r.get("minutes"), (int, float))
+                                  else 0.0)))
+    return [{**row, "rank": index + 1} for index, row in enumerate(ordered)]
+
+
+def milestone_top_line(rows: Any, top: int = 3) -> str:
+    """"top 3 commits = 71% of the window's commit cost", or "" when there are none.
+
+    Stated above the table rather than left to the reader: a ranked table whose
+    first rows are most of the bill reads very differently from one whose cost
+    is flat, and that is the single sentence the ranking exists to support.
+    """
+    ranked = rank_milestones(rows)
+    total = sum(_usd_of(row) for row in ranked)
+    if not ranked or total <= 0:
+        return ""
+    count = min(max(int(top), 1), len(ranked))
+    head = sum(_usd_of(row) for row in ranked[:count])
+    return (f"top {count} commit{'s' if count != 1 else ''} = "
+            f"{head / total:.0%} of the window's commit cost "
+            f"(${head:,.2f} of ${total:,.2f})")
+
+
+# ------------------------------------------------------- what each tier did
+#
+# The cost blocks say where the tokens went. This says what came back for
+# them, per tier of the agentic graph, and it costs nothing to produce: every
+# bullet is lifted from a file something already wrote - git, the Workflow
+# journals, the transcripts on disk - never from a model call. The optional
+# polish (config `report_summarize`) is the single exception, and it is off.
+#
+# Three readers, one per tier:
+#
+#   executive  git commits in the tracked repo and in TokenDistributor itself,
+#              the contract headings those commits added, the workflows the
+#              director dispatched, the hand-over notes written, and the
+#              rulings the director's own transcripts state outright
+#   advisory   one line per review lens, from its journal result: did it
+#              approve, how much did it find, and what was the first serious
+#              finding
+#   workers    one line per build lane, from its journal result: how many
+#              files it changed, what the suite said, and what it touched first
+#
+# Nothing here may raise. A journal is written by whatever agent happened to
+# run - the result is an object here, a bare string there, half a line when a
+# lane was killed mid-write - so every reader parses defensively and a value
+# it cannot understand is skipped, never guessed at.
+
+DECISION_CAP = 12
+ADVISORY_CAP = 12
+WORKER_CAP = 15
+# The executive block gathers from five readers, and each one is capped
+# separately rather than the block being truncated as one list: a repo with a
+# busy dev_JSON/ would otherwise push every ruling off the end, which is the
+# one thing in that block a reader cannot get anywhere else.
+COMMIT_CAP = 8
+CONTRACT_CAP = 5
+DISPATCH_CAP = 5
+NOTE_CAP = 3
+EXEC_CAP = COMMIT_CAP + CONTRACT_CAP + DISPATCH_CAP + NOTE_CAP + DECISION_CAP
+BULLET_CHARS = 220
+DECISION_CHARS = 160
+FINDING_CHARS = 120
+TESTS_CHARS = 80
+# An absolute path longer than this is shortened to its basename: these
+# bullets are read on a page, and a 140-character Windows path is noise there.
+PATH_CHARS = 80
+JOURNAL_NAME = "journal.jsonl"
+WORKFLOW_ROOT = ("subagents", "workflows")
+# The sort placeholder for a workflow whose directory carries no readable
+# mtime: it orders last rather than crashing the comparison.
+_NO_STAMP = datetime.min.replace(tzinfo=timezone.utc)
+# Where a ruling lands when the director writes one down. Both are pathspecs,
+# so a repo that has neither simply returns nothing.
+CONTRACT_PATHS = ("dev_JSON", "docs/CONTRACTS.md")
+HANDOFF_FILE = "HANDOFF.md"
+PROGRESS_FILE = "PROGRESS_REPORT.json"
+# A turn that states a decision says so. Longest phrase first, so "Director
+# rulings" is reported as itself rather than as a bare "ruling".
+DECISION_WORDS = ("director rulings", "ruling", "decision", "decided")
+# Whole words only. A bare substring scan reported ordinary prose as a ruling -
+# "still undecided" matched `decided` and "a decisional matter" matched
+# `decision`, and the block then printed "Decided: ... is still undecided.",
+# a decision label on a sentence saying no decision was made.
+_DECISION_RE = re.compile(
+    r"\b(director rulings|rulings?|decisions?|decided)\b", re.IGNORECASE)
+# The result keys that mean "this lane reviewed something" and "this lane
+# built something". Shape decides the tier first, because a lens that forgot
+# to name itself still returns findings.
+ADVISORY_RESULT_KEYS = ("approve", "approved", "serious", "minors", "findings",
+                        "verdict")
+WORKER_RESULT_KEYS = ("changed", "fixed", "tests", "ladder", "report", "green")
+LABEL_KEYS = ("lens", "lane", "label", "role", "name", "agent", "task")
+FINDING_TEXT_KEYS = ("finding", "issue", "summary", "detail", "text", "what",
+                     "problem", "note")
+CHANGED_KEYS = ("changed", "fixed", "files", "edited")
+TESTS_KEYS = ("tests", "green", "ladder", "report", "suite")
+SERIOUS_WORDS = ("serious", "critical", "blocker", "high", "major")
+# `git log -p` is read back one commit at a time, so the commit header needs a
+# marker no diff line can start with. RS, not NUL: Windows `CreateProcess`
+# refuses a NUL anywhere in the command line, so a NUL sentinel makes every
+# call raise ValueError before git is even started.
+GIT_COMMIT_MARK = "\x1e"
+GIT_WIDEN_DAYS = 2
+SUMMARIZE_TIMEOUT = 60
+SUMMARIZE_DEFAULTS = {"enabled": False, "model": "claude-haiku-4-5-20251001",
+                      "max_bullets": 8}
+SUMMARIZE_PROMPT = (
+    "You are compressing one tier's work log from an agentic run into report "
+    "bullets. Rewrite the lines below as AT MOST {n} bullets, each one line, "
+    "each starting with '- ', past tense, plainest possible English.\n"
+    "Rules: invent nothing - every fact must appear in the input; keep commit "
+    "hashes, agent labels, file names and numbers exactly as written; merge "
+    "duplicates; drop filler; no preamble, no closing remark, output only the "
+    "bullets.\n\nTIER: {tier}\n\n{body}\n")
+
+_SECRET_RE = re.compile(
+    r"sk-[A-Za-z0-9_\-]{12,}"
+    r"|gh[pousr]_[A-Za-z0-9]{16,}"
+    r"|xox[abprs]-[A-Za-z0-9\-]{10,}"
+    r"|\b(?:Bearer|Basic)\s+[A-Za-z0-9._\-+/=]{12,}"
+    r"|\b(?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|token|secret"
+    r"|password|passwd|pwd)\s*[:=]\s*[^\s,;]{4,}",
+    re.IGNORECASE)
+# A drive-letter path, or a POSIX path with at least one directory in it. Only
+# matches LONGER than PATH_CHARS are rewritten, so a false positive here costs
+# nothing at all.
+_ABS_PATH_RE = re.compile(
+    r"[A-Za-z]:[\\/][^\s,;'\"()\[\]]+"
+    r"|/(?:[^\s,;'\"()\[\]/]+/)+[^\s,;'\"()\[\]]*")
+_HEADING_RE = re.compile(r"^\+(#{1,6})\s+(.*\S)\s*$")
+# A lane that names itself a lens. Prefix-matched, so "review-ledger",
+# "synthesize", "judge-2" and "planner" all answer to it.
+_ADVISORY_LABEL_RE = re.compile(r"(review|judge|synth|plan|lens|critic|audit)",
+                                re.IGNORECASE)
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s")
+
+
+def _basename(text: str) -> str:
+    tail = re.split(r"[\\/]", text)[-1]
+    return tail or text
+
+
+def shorten_paths(text: str, limit: int = PATH_CHARS) -> str:
+    """Absolute paths longer than `limit` collapse to their basename."""
+
+    def swap(match: "re.Match[str]") -> str:
+        found = match.group(0)
+        return found if len(found) <= limit else _basename(found)
+
+    return _ABS_PATH_RE.sub(swap, str(text or ""))
+
+
+def scrub(text: Any, limit: int = BULLET_CHARS) -> str:
+    """One bullet's text: one line, no secrets, no long paths, capped.
+
+    Everything here came off disk without being asked what it contained - an
+    agent's own prose, a diff, a journal a lane wrote in a hurry - so it is
+    laundered on the way to the page rather than trusted.
+    """
+    body = " ".join(str(text if text is not None else "").split())
+    body = _SECRET_RE.sub("<redacted>", body)
+    body = shorten_paths(body)
+    limit = max(int(limit), 8)
+    if len(body) > limit:
+        body = body[:limit - 1].rstrip() + "…"
+    return body
+
+
+def first_sentence(text: Any, limit: int) -> str:
+    """The first sentence of `text`, scrubbed and capped at `limit`."""
+    body = " ".join(str(text if text is not None else "").split())
+    if not body:
+        return ""
+    return scrub(_SENTENCE_END_RE.split(body, 1)[0], limit)
+
+
+def _as_list(value: Any) -> list:
+    """A journal field that should be a list, read defensively as one."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, str) and value.strip():
+        return [value]
+    return []
+
+
+def _bool_word(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "yes", "approve", "approved", "pass", "ok"):
+            return "true"
+        if low in ("false", "no", "reject", "rejected", "fail"):
+            return "false"
+    return "n/a"
+
+
+# ------------------------------------------------------- executive readers
+
+def report_repos(cfg: Config) -> list[Path]:
+    """The repos the executive tier commits into: the tracked one, and this one.
+
+    TokenDistributor is in the list because the director tier works on the
+    tracker itself as often as on the project it paces, and a report that only
+    read `report_repo` showed an empty commit list on exactly those windows.
+    """
+    found: list[Path] = []
+    seen: set[str] = set()
+    for raw in (getattr(cfg, "report_repo", ""), getattr(cfg, "root", "")):
+        path = Path(str(raw or ""))
+        if not path.name:
+            continue
+        try:
+            key = str(path.resolve()).lower()
+        except OSError:
+            key = str(path).lower()
+        if key in seen or not (path / ".git").exists():
+            continue
+        seen.add(key)
+        found.append(path)
+    return found
+
+
+def author_commits(repo: Any, start: datetime, end: datetime) -> list[dict]:
+    """Commits in `repo` whose AUTHOR date is inside the window.
+
+    `--since/--until` filter on the committer date, which a rebase or an
+    amend moves; the author date is when the work was actually done, so the
+    range asked of git is widened and the window is applied here.
+    """
+    text = git_read(repo, [
+        "log", "--reverse", "--no-merges",
+        f"--since={(start - timedelta(days=GIT_WIDEN_DAYS)).isoformat()}",
+        f"--until={(end + timedelta(days=GIT_WIDEN_DAYS)).isoformat()}",
+        f"--format=%H{GIT_SEP}%aI{GIT_SEP}%s"])
+    if text is None:
+        return []
+    return [c for c in parse_git_log(text) if start <= c["at"] <= end]
+
+
+def _iter_log_patch(text: str) -> Iterable[tuple[dict, str, list[str]]]:
+    """(commit, file path, added lines) for each file in a `git log -p` dump."""
+    commit: dict | None = None
+    path = ""
+    added: list[str] = []
+
+    def flush() -> tuple[dict, str, list[str]] | None:
+        if commit is None or not path or not added:
+            return None
+        return (commit, path, list(added))
+
+    # `.split("\n")`, never `.splitlines()`: Python breaks lines on the record
+    # separator too (and on \x0b, \x0c, \x85, U+2028...), so a splitlines pass
+    # eats the commit marker itself and every diff hunk carrying one of those
+    # bytes is silently cut in half.
+    for line in str(text or "").split("\n"):
+        line = line.rstrip("\r")
+        if line.startswith(GIT_COMMIT_MARK):
+            done = flush()
+            if done:
+                yield done
+            added, path = [], ""
+            parts = line[len(GIT_COMMIT_MARK):].split(GIT_SEP)
+            stamp = parse_iso(parts[1]) if len(parts) > 1 else None
+            commit = {"commit": parts[0].strip(), "at": stamp,
+                      "subject": parts[2].strip() if len(parts) > 2 else ""}
+            continue
+        if line.startswith("+++ "):
+            done = flush()
+            if done:
+                yield done
+            added = []
+            path = line[4:].strip()
+            path = path[2:] if path.startswith("b/") else path
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            added.append(line)
+    done = flush()
+    if done:
+        yield done
+
+
+def contract_notes(repo: Any, start: datetime, end: datetime,
+                   ) -> tuple[list[str], list[str]]:
+    """(contract bullets, hand-over bullets) from the window's own diffs.
+
+    One `git log -p` over `dev_JSON/` and `docs/CONTRACTS.md` answers both
+    questions, because both are the same question asked of different files:
+    what did the director tier write down that everything downstream is now
+    bound by. Headings are the unit - a new `## v2.5.3` section IS the ruling -
+    and HANDOFF.md / PROGRESS_REPORT.json are reported as the hand-over notes
+    they are.
+    """
+    text = git_read(repo, [
+        "log", "--no-color", "--no-merges", "--unified=0", "--date-order",
+        f"--since={(start - timedelta(days=GIT_WIDEN_DAYS)).isoformat()}",
+        f"--until={(end + timedelta(days=GIT_WIDEN_DAYS)).isoformat()}",
+        f"--format={GIT_COMMIT_MARK}%H{GIT_SEP}%aI{GIT_SEP}%s",
+        "-p", "--", *CONTRACT_PATHS])
+    if text is None:
+        return [], []
+    contracts: list[str] = []
+    notes: list[str] = []
+    for commit, path, added in _iter_log_patch(text):
+        at = commit.get("at")
+        if not isinstance(at, datetime) or at < start or at > end:
+            continue
+        short = str(commit.get("commit") or "")[:8]
+        headings = [f"{match.group(1)} {match.group(2)}" for match in
+                    (_HEADING_RE.match(line) for line in added) if match]
+        name = _basename(path)
+        if headings:
+            contracts.append(scrub(
+                f"contract {path}: added " +
+                ", ".join(f'"{h}"' for h in headings[:4]) +
+                (f" and {len(headings) - 4} more" if len(headings) > 4 else "") +
+                f" (commit {short})"))
+        elif name != PROGRESS_FILE and name != HANDOFF_FILE:
+            contracts.append(scrub(
+                f"contract {path}: {len(added)} line(s) added (commit {short})"))
+        if name == HANDOFF_FILE:
+            notes.append(scrub(
+                f"hand-over note {path}: {len(added)} line(s) written "
+                f"(commit {short} {commit.get('subject') or ''})"))
+        elif name == PROGRESS_FILE:
+            milestones = sum(1 for line in added
+                             if "milestone" in line.lower())
+            notes.append(scrub(
+                f"memory note {path}: {len(added)} line(s), {milestones} "
+                f"milestone line(s) added (commit {short})"))
+    return contracts, notes
+
+
+def transcript_decisions(path: Path, start: datetime, end: datetime,
+                         seen: set[str] | None = None) -> list[dict]:
+    """[{weighted, word, text}] for the ruling turns in one transcript.
+
+    A ruling is an assistant TEXT turn that says it is one: it opens with, or
+    contains, "Ruling", "Decision", "decided" or "Director rulings". The
+    sentence carrying the word is what is kept, because that is the ruling;
+    the paragraph around it is the argument for it.
+
+    `seen` is the same cross-file dedup the token parse uses, for the same
+    reason: a resumed fork's transcript opens with a verbatim copy of the
+    parent's turns, and the parent's rulings are not the fork's.
+    """
+    counted = seen if seen is not None else set()
+    turns: dict[str, dict[str, Any]] = {}
+    for entry in _iter_entries(path):
+        if entry.get("type") != "assistant":
+            continue
+        stamp = parse_iso(entry.get("timestamp"))
+        if stamp is None or stamp < start or stamp > end:
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        mid = str(message.get("id") or f"noid::{entry.get('uuid')}")
+        turn = turns.get(mid)
+        if turn is None:
+            if mid in counted:
+                continue
+            usage = new_usage()
+            add_usage(usage, message.get("usage"))
+            turn = {"weighted": weighted(usage), "text": []}
+            turns[mid] = turn
+            counted.add(mid)
+        content = message.get("content")
+        if isinstance(content, str):
+            turn["text"].append(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                turn["text"].append(str(block.get("text") or ""))
+
+    found: list[dict] = []
+    for turn in turns.values():
+        body = " ".join(t for t in turn["text"] if t).strip()
+        if not body:
+            continue
+        # Whole words, and the alternation is longest-phrase-first, so
+        # "Director rulings" is reported as itself and "undecided" is not
+        # reported at all.
+        hit = _DECISION_RE.search(body)
+        if hit is None:
+            continue
+        where, word = hit.start(), hit.group(1).lower()
+        # From the start of the sentence the word sits in, not from the start
+        # of the turn: a ruling three paragraphs down is still the ruling.
+        head = body.rfind(". ", 0, where)
+        sentence = first_sentence(body[head + 2 if head >= 0 else 0:],
+                                  DECISION_CHARS)
+        if sentence:
+            found.append({"weighted": turn["weighted"], "word": word,
+                          "text": sentence})
+    found.sort(key=lambda d: -d["weighted"])
+    return found
+
+
+# -------------------------------------------------------- workflow journals
+
+def workflow_dirs(cfg: Config, session_id: str) -> list[Path]:
+    """Every Workflow directory filed under one session."""
+    found: list[Path] = []
+    if not session_id:
+        return found
+    try:
+        for project in cfg.projects_dir.iterdir():
+            if not project.is_dir():
+                continue
+            root = project.joinpath(session_id, *WORKFLOW_ROOT)
+            if not root.is_dir():
+                continue
+            found.extend(sorted(p for p in root.iterdir() if p.is_dir()))
+    except OSError:
+        return found
+    return found
+
+
+def workflow_span(wf: Path) -> tuple[datetime | None, datetime | None]:
+    """(dispatched at, last touched) for one workflow, from its files' mtimes.
+
+    The journal carries no timestamps at all, so the directory is the clock:
+    the per-agent `.meta.json` files are written once at spawn and never
+    touched again, which makes the oldest file the dispatch, and the journal
+    is appended to until the last lane returns, which makes the newest file
+    the finish.
+    """
+    stamps: list[float] = []
+    try:
+        for path in wf.iterdir():
+            try:
+                stamps.append(path.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        return None, None
+    if not stamps:
+        return None, None
+    try:
+        return (datetime.fromtimestamp(min(stamps), tz=timezone.utc),
+                datetime.fromtimestamp(max(stamps), tz=timezone.utc))
+    except (OSError, OverflowError, ValueError):
+        return None, None
+
+
+def workflow_started_at(wf: Path) -> datetime | None:
+    """When the workflow was dispatched. None when the directory says nothing."""
+    return workflow_span(wf)[0]
+
+
+def workflow_meta(wf: Path) -> dict[str, str]:
+    """{name, description} for a workflow, from whatever persisted it.
+
+    The Workflow tool writes no manifest of its own, so this reads the ones
+    that exist when they exist - a `meta.json`/`workflow.json` the dispatching
+    script left behind, or a journal entry that named the run - and falls back
+    to the directory name, which is always there.
+    """
+    name, description = wf.name, ""
+    for candidate in ("meta.json", "workflow.json", "manifest.json"):
+        try:
+            data = json.loads((wf / candidate).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        name = str(data.get("name") or data.get("title") or name)
+        description = str(data.get("description") or data.get("goal") or "")
+        break
+    else:
+        for entry in _iter_entries(wf / JOURNAL_NAME):
+            if not isinstance(entry.get("meta"), dict) and not entry.get("name"):
+                continue
+            meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else entry
+            name = str(meta.get("name") or name)
+            description = str(meta.get("description") or description)
+            break
+    return {"name": scrub(name, 64), "description": scrub(description, 140)}
+
+
+def agent_model(wf: Path, agent: str) -> str:
+    """The model one Workflow agent ran on, from its `.meta.json`. "" when none."""
+    if not agent:
+        return ""
+    try:
+        data = json.loads(
+            (wf / f"agent-{agent}.meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ""
+    return str(data.get("model") or "") if isinstance(data, dict) else ""
+
+
+def result_label(result: Any, agent: str, role: str) -> str:
+    """What to call this lane: what it called itself, else its role, else its id."""
+    if isinstance(result, dict):
+        for key in LABEL_KEYS:
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return scrub(value, 48)
+    return scrub(role or agent[:8] or "agent", 48)
+
+
+def read_workflow(wf: Path) -> dict:
+    """One workflow directory read off disk. Never raises.
+
+    {dir, name, description, started, results: [{agent, label, role, model,
+    result}]}. `started` counts the journal's start entries, and can exceed
+    the results: a lane still running, or one that died, started and returned
+    nothing.
+    """
+    started = 0
+    results: list[dict] = []
+    for entry in _iter_entries(wf / JOURNAL_NAME):
+        kind = str(entry.get("type") or "").strip().lower()
+        if kind in ("started", "start"):
+            started += 1
+            continue
+        if kind not in ("result", "finished", "done"):
+            continue
+        agent = str(entry.get("agentId") or entry.get("agent") or "")
+        transcript = wf / f"agent-{agent}.jsonl"
+        role, declared = (agent_role_declared(transcript)
+                          if agent and transcript.exists()
+                          else (ROLE_WORKER, False))
+        results.append({
+            "agent": agent,
+            "role": role,
+            "declared": declared,
+            "model": agent_model(wf, agent),
+            "label": result_label(entry.get("result"), agent, role),
+            "result": entry.get("result"),
+        })
+    meta = workflow_meta(wf)
+    return {"dir": wf, "name": meta["name"], "description": meta["description"],
+            "started": max(started, len(results)), "results": results}
+
+
+def result_tier(row: dict, advisory_models: Iterable[str] = ()) -> str:
+    """Advisory or workers, for one journal result.
+
+    Shape first, because it cannot be wrong: a result carrying `approve` or
+    `findings` reviewed something whatever its lane was called, and one
+    carrying `changed` or `tests` built something whatever model it ran on.
+    Then the label, then the role the lane's own brief declared.
+
+    The model is the LAST resort, for a row with no shape, no label and no
+    declared role - never an override of the three. The fork brief routinely
+    runs hard build lanes on the executive/advisory model, and reading the
+    model first filed those under `advisory`, where the report then printed a
+    review verdict ("approve=n/a, 0 serious") for a lane that reviewed
+    nothing and dropped its changed files out of the workers block entirely.
+    """
+    result = row.get("result")
+    if isinstance(result, dict):
+        if any(k in result for k in ADVISORY_RESULT_KEYS):
+            return PANEL_ADVISORY
+        if any(k in result for k in WORKER_RESULT_KEYS):
+            return PANEL_WORKERS
+    label = str(row.get("label") or "").strip()
+    if _ADVISORY_LABEL_RE.match(label):
+        return PANEL_ADVISORY
+    role = str(row.get("role") or "").strip()
+    if role in ADVISORY_ROLES:
+        return PANEL_ADVISORY
+    # A brief that named this lane a builder outranks the model it ran on. An
+    # absent declaration does not: `read_workflow` files an unnamed lane as
+    # `worker` by default, and that default carries no evidence at all.
+    if role and role not in ADVISORY_ROLES and row.get("declared"):
+        return PANEL_WORKERS
+    model = str(row.get("model") or "")
+    if model and model in set(advisory_models):
+        return PANEL_ADVISORY
+    return PANEL_WORKERS
+
+
+def review_findings(result: Any) -> tuple[list[str], int, int]:
+    """(serious findings as text, serious count, minor count) for a review result.
+
+    Two shapes are in the journals on this machine and both are read: a
+    `serious`/`minors` split, and one `findings` list with a severity on each
+    row. Anything else contributes nothing rather than a wrong count.
+    """
+    if not isinstance(result, dict):
+        return [], 0, 0
+    serious: list[Any] = list(_as_list(result.get("serious")))
+    minor = len(_as_list(result.get("minors"))) + len(_as_list(result.get("minor")))
+    for item in _as_list(result.get("findings")):
+        severity = ""
+        if isinstance(item, dict):
+            severity = str(item.get("severity") or item.get("level") or "").lower()
+        if any(word in severity for word in SERIOUS_WORDS):
+            serious.append(item)
+        else:
+            minor += 1
+    return [finding_text(item) for item in serious], len(serious), minor
+
+
+def finding_text(item: Any) -> str:
+    """One finding as a line: its own words when it has any, else its JSON."""
+    if isinstance(item, dict):
+        for key in FINDING_TEXT_KEYS:
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return scrub(value, FINDING_CHARS)
+        try:
+            return scrub(json.dumps(item, ensure_ascii=False), FINDING_CHARS)
+        except (TypeError, ValueError):
+            return scrub(str(item), FINDING_CHARS)
+    return scrub(item, FINDING_CHARS)
+
+
+def advisory_bullet(workflow: str, row: dict) -> tuple[str, int]:
+    """(bullet, serious count) for one review lane."""
+    result = row.get("result")
+    findings, serious, minor = review_findings(result)
+    approve = None
+    if isinstance(result, dict):
+        for key in ("approve", "approved", "verdict"):
+            if key in result:
+                approve = result.get(key)
+                break
+    text = (f"{workflow}/{row.get('label') or 'agent'}: "
+            f"approve={_bool_word(approve)}, {serious} serious, {minor} minor")
+    if findings and findings[0]:
+        text += f" - {findings[0]}"
+    elif not isinstance(result, dict) and result is not None:
+        text += f" - {scrub(result, FINDING_CHARS)}"
+    return scrub(text), serious
+
+
+def worker_bullet(workflow: str, row: dict) -> tuple[str, int]:
+    """(bullet, changed-file count) for one build lane."""
+    result = row.get("result")
+    label = row.get("label") or "agent"
+    if not isinstance(result, dict):
+        return scrub(f"{workflow}/{label}: {scrub(result, FINDING_CHARS)}"
+                     if result is not None else
+                     f"{workflow}/{label}: returned nothing"), 0
+    changed: list = []
+    for key in CHANGED_KEYS:
+        changed = _as_list(result.get(key))
+        if changed:
+            break
+    tests = ""
+    for key in TESTS_KEYS:
+        tests = first_sentence(result.get(key), TESTS_CHARS)
+        if tests:
+            break
+    text = (f"{workflow}/{label}: {len(changed)} files, "
+            f"tests {tests or 'n/a'}")
+    if changed:
+        text += f" - {finding_text(changed[0])}"
+    elif not tests:
+        notes = first_sentence(result.get("notes"), FINDING_CHARS)
+        if notes:
+            text += f" - {notes}"
+    return scrub(text), len(changed)
+
+
+# ------------------------------------------------------------ the polish
+
+def summarize_settings(cfg: Config) -> dict:
+    """config `report_summarize`, normalised. Disabled unless it says otherwise.
+
+    Off is the default and the safe reading of anything malformed: this is the
+    one path in the report that spends tokens, and a typo in config.json must
+    never be the reason a page cost money to render.
+    """
+    raw = getattr(cfg, "report_summarize", None)
+    raw = raw if isinstance(raw, dict) else {}
+    model = str(raw.get("model") or SUMMARIZE_DEFAULTS["model"]).strip()
+    try:
+        cap = int(raw.get("max_bullets", SUMMARIZE_DEFAULTS["max_bullets"]))
+    except (TypeError, ValueError):
+        cap = int(SUMMARIZE_DEFAULTS["max_bullets"])
+    return {
+        "enabled": raw.get("enabled") is True and bool(model),
+        "model": model or str(SUMMARIZE_DEFAULTS["model"]),
+        "max_bullets": min(max(cap, 1), 40),
+    }
+
+
+def run_summarizer(cfg: Config, model: str, prompt: str,
+                   timeout: float = SUMMARIZE_TIMEOUT) -> str | None:
+    """`claude -p --model <model> --output-format text`, or None on any failure.
+
+    The one subprocess in this file that costs money, and the only one behind
+    a config flag. It is a module-level function so a test can replace it and
+    prove both halves: that it is called when the flag is on, and that nothing
+    reaches a subprocess when it is off.
+    """
+    command = str(getattr(cfg, "claude_cmd", "claude") or "claude")
+    exe = shutil.which(command) or command
+    try:
+        done = subprocess.run(
+            [exe, "-p", "--model", model, "--output-format", "text"],
+            input=prompt, capture_output=True, timeout=timeout, check=False,
+            encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return (done.stdout or "") if done.returncode == 0 else None
+
+
+def parse_bullets(text: Any, cap: int) -> list[str]:
+    """The bullet lines out of a model's plain-text answer."""
+    found: list[str] = []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = re.match(r"^(?:[-*•–]|\d{1,2}[.)])\s+(.*\S)\s*$", line)
+        if not match:
+            continue
+        bullet = scrub(match.group(1))
+        if bullet:
+            found.append(bullet)
+        if len(found) >= max(int(cap), 1):
+            break
+    return found
+
+
+def polish_tier(cfg: Config, tier: str, bullets: list[str], commits: list[str],
+                settings: dict | None = None, runner=None,
+                ) -> tuple[list[str], bool]:
+    """(bullets, polished). The raw bullets back unchanged on any failure."""
+    settings = settings if isinstance(settings, dict) else summarize_settings(cfg)
+    if not settings.get("enabled") or not bullets:
+        return bullets, False
+    body = "\n".join(f"- {b}" for b in bullets)
+    if commits:
+        body += "\n\nCOMMIT SUBJECTS IN THIS WINDOW:\n" + "\n".join(
+            f"- {c}" for c in commits[:20])
+    prompt = SUMMARIZE_PROMPT.format(n=settings["max_bullets"], tier=tier,
+                                     body=body)
+    call = runner or run_summarizer
+    try:
+        answer = call(cfg, settings["model"], prompt, SUMMARIZE_TIMEOUT)
+    except Exception:  # noqa: BLE001 - a polish must never fail the report
+        answer = None
+    polished = parse_bullets(answer, settings["max_bullets"])
+    return (polished, True) if polished else (bullets, False)
+
+
+# ------------------------------------------------------------ the blocks
+
+def empty_tier_blocks() -> dict:
+    return {tier: {"bullets": [], "source_counts": {}, "polished": False}
+            for tier in PANEL_TIERS} | {"polished": False, "polish_model": None,
+                                        "caveat": None}
+
+
+def build_tier_blocks(cfg: Config, start: datetime, end: datetime,
+                      sessions: list[dict] | None = None,
+                      graph: dict | None = None, runner=None) -> dict:
+    """What each tier of the graph actually did in the window, as bullets.
+
+    Reads only files: git, the workflow journals, the executive transcripts.
+    The optional polish is applied last, per tier, and a tier whose polish
+    failed keeps its raw bullets and says so.
+    """
+    from .graph import ADVISORY, WORKERS
+
+    graph = graph if isinstance(graph, dict) else {}
+    if sessions is None:
+        sessions = discover_sessions(cfg, start, end)
+    # The model only names the advisory tier when the graph gives that tier a
+    # model of its own. With one model at two tiers the id says nothing, and
+    # keying on it files every build lane under `advisory`.
+    advisory_models: set[str] = set()
+    advisory_model = str(graph.get(ADVISORY, {}).get("model") or "")
+    worker_model = str(graph.get(WORKERS, {}).get("model") or "")
+    if (advisory_model and advisory_model != worker_model
+            and graph_separates_tiers(graph)):
+        advisory_models.add(advisory_model)
+
+    # ---- executive -------------------------------------------------------
+    # Ranked before the cap, like the other two tiers and like the milestone
+    # table: `author_commits` reads `git log --reverse`, so slicing the head of
+    # it kept the OLDEST commits of the window and dropped the day's real work
+    # under a line that truthfully said "28 commits". Newest first, and across
+    # repos, because the list is grouped by repo before it is sorted.
+    commit_rows: list[tuple[datetime, str, str]] = []
+    contracts: list[str] = []
+    notes: list[str] = []
+    repos = report_repos(cfg)
+    for repo in repos:
+        for commit in author_commits(repo, start, end):
+            subject = str(commit.get("subject") or "")
+            short = str(commit.get("commit") or "")[:8]
+            tag = f" ({repo.name})" if len(repos) > 1 else ""
+            at = commit.get("at")
+            commit_rows.append((at if isinstance(at, datetime) else start,
+                                scrub(f"commit {short} {subject}{tag}"),
+                                scrub(f"{short} {subject}", FINDING_CHARS)))
+        one, two = contract_notes(repo, start, end)
+        contracts.extend(one)
+        notes.extend(two)
+    commit_rows.sort(key=lambda row: row[0], reverse=True)
+    commit_bullets = [row[1] for row in commit_rows]
+    commit_subjects = [row[2] for row in commit_rows]
+
+    # Every workflow under this window's sessions whose own lifetime overlaps
+    # the window. A session can be days old, and its workflows from Tuesday
+    # are not what this report is about; a workflow that started before the
+    # window and returned inside it is.
+    workflows: list[dict] = []
+    for session in sessions:
+        for wf in workflow_dirs(cfg, str(session.get("sid") or "")):
+            first, last = workflow_span(wf)
+            if first is not None and last is not None and (
+                    last < start or first > end):
+                continue
+            flow = read_workflow(wf)
+            flow["started_at"] = first
+            workflows.append(flow)
+    # Newest dispatch first, biggest wave first on a tie. `workflow_dirs`
+    # returns them sorted by directory name - `wf_<uuid>` - which carries no
+    # time and no size, so capping that order kept the five lexicographically
+    # smallest uuids and hid the day's six-agent waves behind an ordering that
+    # changes with whatever ids the Workflow tool happened to mint.
+    dispatched_rows: list[tuple[bool, datetime, int, str]] = []
+    for flow in workflows:
+        at = flow.get("started_at")
+        if isinstance(at, datetime) and not (start <= at <= end):
+            continue
+        line = (f"workflow {flow['name']}: {flow['started']} agent(s) "
+                f"dispatched, {len(flow['results'])} returned")
+        if flow["description"]:
+            line += f" - {flow['description']}"
+        dispatched_rows.append((isinstance(at, datetime),
+                                at if isinstance(at, datetime) else _NO_STAMP,
+                                int(flow["started"] or 0), scrub(line)))
+    dispatched_rows.sort(key=lambda row: row[:3], reverse=True)
+    dispatched = [row[3] for row in dispatched_rows]
+
+    decisions: list[dict] = []
+    seen_turns: set[str] = set()
+    for session in sessions:
+        path = session.get("path")
+        if isinstance(path, Path):
+            decisions.extend(transcript_decisions(path, start, end, seen_turns))
+    decisions.sort(key=lambda d: -d["weighted"])
+    # The sentence usually opens with the word that found it ("Ruling: ..."),
+    # and prefixing it again reads as a stutter; the prefix is for the ones
+    # that state the decision without labelling it.
+    decision_bullets = [
+        scrub(d["text"] if d["text"].lower().startswith(d["word"])
+              else f"{d['word'].title()}: {d['text']}")
+        for d in decisions[:DECISION_CAP]]
+
+    # The counts are what was FOUND; the bullets are what fits. A block that
+    # says "2 commits" and lists two is the same block either way, and one
+    # that found forty says so instead of implying the eight it shows.
+    exec_counts = {
+        "sessions": len(sessions),
+        "commits": len(commit_bullets),
+        "contracts": len(contracts),
+        "workflows": len(dispatched),
+        "notes": len(notes),
+        "decisions": len(decisions),
+        "repos": [repo.name for repo in repos],
+    }
+    exec_bullets = (commit_bullets[:COMMIT_CAP] + contracts[:CONTRACT_CAP]
+                    + dispatched[:DISPATCH_CAP] + notes[:NOTE_CAP]
+                    + decision_bullets)[:EXEC_CAP]
+
+    # ---- advisory and workers -------------------------------------------
+    advisory: list[tuple[int, str]] = []
+    workers: list[tuple[int, str]] = []
+    adv_agents = work_agents = changed_files = serious_total = 0
+    for flow in workflows:
+        for row in flow["results"]:
+            if result_tier(row, advisory_models) == PANEL_ADVISORY:
+                bullet, serious = advisory_bullet(flow["name"], row)
+                advisory.append((serious, bullet))
+                serious_total += serious
+                adv_agents += 1
+            else:
+                bullet, changed = worker_bullet(flow["name"], row)
+                workers.append((changed, bullet))
+                changed_files += changed
+                work_agents += 1
+    # Serious first for the lenses, biggest change first for the lanes: the
+    # cap has to keep the rows a reader would have looked for.
+    advisory.sort(key=lambda pair: -pair[0])
+    workers.sort(key=lambda pair: -pair[0])
+    advisory_bullets = [b for _n, b in advisory[:ADVISORY_CAP]]
+    worker_bullets = [b for _n, b in workers[:WORKER_CAP]]
+
+    blocks = {
+        PANEL_EXEC: {"bullets": exec_bullets, "source_counts": exec_counts},
+        PANEL_ADVISORY: {"bullets": advisory_bullets, "source_counts": {
+            "agents": adv_agents, "workflows": len(workflows),
+            "serious": serious_total}},
+        PANEL_WORKERS: {"bullets": worker_bullets, "source_counts": {
+            "agents": work_agents, "workflows": len(workflows),
+            "changed_files": changed_files}},
+    }
+
+    settings = summarize_settings(cfg)
+    failed: list[str] = []
+    any_polished = False
+    for tier in PANEL_TIERS:
+        bullets, ok = polish_tier(cfg, tier, blocks[tier]["bullets"],
+                                  commit_subjects, settings, runner)
+        blocks[tier]["bullets"] = bullets
+        blocks[tier]["polished"] = ok
+        any_polished = any_polished or ok
+        if settings["enabled"] and not ok and bullets:
+            failed.append(tier)
+    caveat = None
+    if failed:
+        caveat = (f"The bullet polish ({settings['model']}) did not answer for "
+                  + ", ".join(failed) + "; those tiers show the raw extraction.")
+    blocks["polished"] = any_polished
+    blocks["polish_model"] = settings["model"] if any_polished else None
+    blocks["caveat"] = caveat
+    return blocks
+
+
+def tier_blocks(cfg: Config, start: datetime, end: datetime,
+                sessions: list[dict] | None = None, graph: dict | None = None,
+                runner=None) -> dict:
+    """`build_tier_blocks`, but a failure is three empty blocks, not a report."""
+    try:
+        return build_tier_blocks(cfg, start, end, sessions, graph, runner)
+    except Exception:  # noqa: BLE001 - a malformed journal is not a page failure
+        return empty_tier_blocks()
+
+
+# --------------------------------------------------------------- the clock
+
+def timezone_block(cfg: Config, at: datetime | None = None) -> dict:
+    """The zone the page renders its times in. summary.json stays ISO UTC.
+
+    `offset_minutes` is the offset in force at the window's end, which is what
+    the page adds to every stored UTC stamp. On the fixed-offset fallback that
+    is exact for the whole window; through zoneinfo it can be an hour out for
+    the part of a window that sits on the far side of a DST change, which is
+    the price of one number instead of a per-timestamp table.
+    """
+    from . import clock
+
+    try:
+        local = clock.to_local(at or utcnow(), cfg)
+        offset = local.utcoffset() if local is not None else None
+        minutes = int(offset.total_seconds() // 60) if offset is not None else 0
+        return {
+            "name": clock.tz_name(cfg),
+            "label": clock.label(cfg),
+            "offset_minutes": minutes,
+            "source": "zoneinfo" if clock.uses_zoneinfo(cfg) else "fixed-offset",
+            "describes": clock.describe(cfg),
+        }
+    except Exception:  # noqa: BLE001 - a bad zone name is not a page failure
+        return {"name": "UTC", "label": "UTC", "offset_minutes": 0,
+                "source": "fallback", "describes": "timezone: UTC"}
 
 
 # ------------------------------------------------------------------ summary
@@ -1260,6 +2288,9 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
                          for r in overall.by_model.values())
     creation_1h = sum(r["usage"][CREATION_1H_KEY]
                       for r in overall.by_model.values())
+    milestones = bucket_milestones(repo_commits(cfg, start, end),
+                                   overall.events, start,
+                                   _snapshot_commits(cfg))
     cost_block = {
         "total_usd": round(overall.usd(), 4),
         "cache_write_1h_tokens": creation_1h,
@@ -1285,9 +2316,14 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
         "top_sinks": cost_sinks[:COST_ROWS],
         "per_hour": [{"hour": hour, "usd_by_model": usd_hours[hour]}
                      for hour in sorted(usd_hours)],
-        "per_milestone": bucket_milestones(repo_commits(cfg, start, end),
-                                           overall.events, start,
-                                           _snapshot_commits(cfg)),
+        # Chronological, and it stays chronological: this list is the
+        # append-only record of what was committed in what order.
+        "per_milestone": milestones,
+        # The same rows, costliest first, each carrying its rank. This is what
+        # the page's table draws - "which commits cost the most" is a ranking
+        # question, and a reader should not have to answer it by eye.
+        "per_milestone_ranked": rank_milestones(milestones),
+        "per_milestone_top_line": milestone_top_line(milestones),
         "pricing_used": pricing_used,
     }
     exec_hands = tiers[EXEC_TIER].hands_on_share()
@@ -1386,10 +2422,20 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
                        if r["role"] in ROLE_STAMPS else len(ROLE_STAMPS),
                        -r["weighted"]))
 
+    # What each tier actually did, read off git, the workflow journals and the
+    # transcripts. Built last so it can be handed the sessions and the graph
+    # this pass already resolved rather than resolving them a second time.
+    blocks = tier_blocks(cfg, start, end, sessions, graph)
+    zone = timezone_block(cfg, end)
+
     return {
         "generated_at": utcnow().isoformat(),
         "reason": reason,
+        # summary.json keeps ISO UTC everywhere; this is the zone the PAGE
+        # renders those stamps in, and the label it puts beside them.
+        "timezone": zone,
         "graph_in_force": graph_in_force,
+        "tier_blocks": blocks,
         "by_role": by_role_rows,
         "sources": {
             "main_session": ", ".join(
@@ -1504,7 +2550,16 @@ def build_summary(cfg: Config, start: datetime, end: datetime,
             "Only transcripts on this machine are read; a fork whose session id "
             "was never recorded is found by its brief, and one that wrote "
             "nothing in the window is invisible.",
-        ],
+            "'What each tier did' is extracted from files, not summarised by a "
+            "model: git commits and the diffs of dev_JSON/ and docs/"
+            "CONTRACTS.md, the Workflow journals' own result objects, and the "
+            "ruling sentences in the executive transcripts. Nothing is "
+            "inferred, and a lane that returned a result nobody could parse is "
+            "left out rather than described.",
+            f"Times on this page are {zone['label']} ({zone['name']}, "
+            f"{zone['source']}); summary.json keeps every timestamp in ISO UTC "
+            "and names the zone under 'timezone'.",
+        ] + ([blocks["caveat"]] if blocks.get("caveat") else []),
     }
 
 

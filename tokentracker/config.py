@@ -95,6 +95,11 @@ class Config:
     report_on_milestone: bool = True
     report_on_stop: bool = True
     report_window_hours: float = 24.0
+    # Optional polish of the report's "What each tier did" bullets: {enabled,
+    # model, max_bullets}. OFF by default, and off is also what any malformed
+    # value means - this is the one path in report generation that spends
+    # tokens, so it never turns itself on (tokentracker/ledger.py).
+    report_summarize: dict[str, Any] = field(default_factory=dict)
     local_enabled: bool = False
     local_base_url: str = "http://127.0.0.1:1919"
     local_daemon_url: str = "http://127.0.0.1:1900"

@@ -229,6 +229,52 @@
   }
   .banner strong { font-family: var(--font-mono); color: var(--warn); letter-spacing: 0.06em; }
 
+  /* ---- what each tier did ---- */
+  .tier-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 32px;
+    align-items: start;
+  }
+  .tier-card {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+    border-top: 2px solid var(--rule);
+    padding-top: 14px;
+  }
+  .tier-card.is-executive { border-top-color: var(--fable); }
+  .tier-card.is-advisory { border-top-color: var(--warn); }
+  .tier-card.is-workers { border-top-color: var(--opus); }
+  .tier-card h3 {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  .tier-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+  .bullets { display: flex; flex-direction: column; gap: 9px; font-size: 13px; }
+  .bullets li { display: flex; gap: 8px; align-items: baseline; }
+  .bullets li .marker { color: var(--muted); flex: none; }
+  .bullets li .body { min-width: 0; overflow-wrap: anywhere; }
+  .bullets .frag {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--ink);
+  }
+  .tier-note { font-size: 12px; color: var(--muted); font-family: var(--font-mono); }
+  .tier-empty { font-size: 13px; color: var(--muted); }
+
   ul, ol { margin: 0; padding: 0; list-style: none; }
   .list { display: flex; flex-direction: column; gap: 8px; max-width: 78ch; }
   .list li { display: flex; gap: 12px; }
@@ -343,6 +389,7 @@
 
   @media (max-width: 820px) {
     .cols2 { grid-template-columns: minmax(0, 1fr); gap: 36px; }
+    .tier-grid { grid-template-columns: minmax(0, 1fr); gap: 28px; }
     h1 { font-size: 30px; }
     .stat .fig { font-size: 44px; }
     .verdict-top { gap: 24px 32px; }
@@ -387,6 +434,13 @@
       <h3>Evidence</h3>
       <ul class="list" id="v-evidence" style="padding-top:10px"></ul>
     </div>
+  </section>
+
+  <section class="band" aria-labelledby="did-h">
+    <h2 id="did-h">What each tier did</h2>
+    <p class="sub">The decisions, reviews and work the window actually produced, one block per tier of the agentic graph. Every line is lifted from a file that was already written &mdash; git commits and the diffs under <span class="mono">dev_JSON/</span>, the Workflow journals' own result objects, the ruling sentences in the director's transcripts &mdash; so nothing here is inferred, and a lane whose result could not be parsed is left out rather than described.</p>
+    <p class="caption" id="did-window"></p>
+    <div class="tier-grid" id="tier-blocks"></div>
   </section>
 
   <section class="band" aria-labelledby="roles-h">
@@ -445,7 +499,7 @@
 
     <div class="panel">
       <h3>Cost per hour, stacked by model</h3>
-      <p class="caption">Dollars per UTC hour on the same model colours as the output chart further down, so a handoff between models is visible where the colour steps. Hours whose models are unpriced are empty here and present there.</p>
+      <p class="caption" id="cost-hourly-caption">Dollars per local hour on the same model colours as the output chart further down, so a handoff between models is visible where the colour steps. Hours whose models are unpriced are empty here and present there.</p>
       <div class="legend" id="cost-hourly-legend"></div>
       <div class="chart-wrap"><svg class="chart" id="cost-hourly-chart" role="img" aria-label="Stacked bar chart of hourly USD cost by model"></svg></div>
       <details id="cost-hourly-table-wrap">
@@ -456,8 +510,10 @@
 
     <div class="panel">
       <h3>Cost between commits</h3>
-      <p class="caption">One row per commit in the tracked repo, covering the span that ended with it: the previous commit, or the start of the window for the first. Work done after the last commit belongs to no milestone and is not listed, so these rows total less than the window.</p>
+      <p class="caption">One row per commit in the tracked repo, covering the span that ended with it: the previous commit, or the start of the window for the first. Work done after the last commit belongs to no milestone and is not listed, so these rows total less than the window. Ranked by cost, most expensive first.</p>
+      <p class="caption" id="cost-milestone-top"></p>
       <div class="scroll-x" id="cost-milestone-table"></div>
+      <p class="caption" id="cost-milestone-order"></p>
     </div>
   </section>
 
@@ -499,7 +555,7 @@
 
   <section class="band" aria-labelledby="hourly-h">
     <h2 id="hourly-h">Hourly output by model</h2>
-    <p class="caption">Output tokens per UTC hour, stacked by model. Each model carries its own colour, so a handoff between models is visible where the colour steps.</p>
+    <p class="caption" id="hourly-caption">Output tokens per local hour, stacked by model. Each model carries its own colour, so a handoff between models is visible where the colour steps.</p>
     <div class="legend" id="hourly-legend"></div>
     <div class="chart-wrap"><svg class="chart" id="hourly-chart" role="img" aria-label="Stacked bar chart of hourly output tokens by model"></svg></div>
     <details id="hourly-table-wrap">
@@ -637,13 +693,39 @@ const DATA = __DATA__;
   function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); }
   function byId(id) { return document.getElementById(id); }
 
+  /* ------------------------------------------------------------- the clock
+     Everything in DATA is ISO UTC, because that is what the tracker stores.
+     Everything drawn is the operator's zone, because "the expensive hour was
+     02:00" is only useful in the clock they read. `timezone.offset_minutes` is
+     the offset in force at the window's end; on the fixed-offset fallback that
+     holds for the whole window. */
+
+  var TZ = (D.timezone && typeof D.timezone === "object") ? D.timezone : {};
+  var TZ_OFF = num(TZ.offset_minutes) === null ? 0 : num(TZ.offset_minutes);
+  var TZ_LABEL = (typeof TZ.label === "string" && TZ.label.trim())
+    ? TZ.label.trim() : "UTC";
+
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  // Shifted through Date.UTC and read back with getUTC*, so the VIEWER's own
+  // zone never enters the arithmetic: the page shows the operator's clock on
+  // any machine that opens it.
+  function localDate(iso) {
+    var m = String(iso || "").match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+    if (!m) return null;
+    var t = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) + TZ_OFF * 60000;
+    var d = new Date(t);
+    return isFinite(d.getTime()) ? d : null;
+  }
   function hourLabel(iso) {
+    var d = localDate(iso);
+    if (d) return pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes());
     if (!iso) return "n/a";
     var m = String(iso).match(/T(\d{2}):(\d{2})/);
-    if (m) return m[1] + ":" + m[2];
-    return String(iso);
+    return m ? m[1] + ":" + m[2] : String(iso);
   }
   function dayLabel(iso) {
+    var d = localDate(iso);
+    if (d) return pad2(d.getUTCMonth() + 1) + "-" + pad2(d.getUTCDate());
     var m = String(iso || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
     return m ? m[2] + "-" + m[3] : "";
   }
@@ -852,7 +934,15 @@ const DATA = __DATA__;
   var wHours = pickNum(W, ["hours", "duration_hours", "h"]);
   byId("eyebrow").textContent =
     "TOKEN LEDGER \u00B7 " + (wStart ? stamp(wStart) : "n/a") + " \u2192 " + (wEnd ? stamp(wEnd) : "n/a") +
-    " UTC \u00B7 " + (wHours === null ? "n/a" : (Math.round(wHours * 100) / 100)) + " h";
+    " " + TZ_LABEL + " \u00B7 " + (wHours === null ? "n/a" : (Math.round(wHours * 100) / 100)) + " h" +
+    (D.generated_at ? " \u00B7 GENERATED " + stamp(D.generated_at) + " " + TZ_LABEL : "");
+  // The two hourly captions name the zone rather than saying "local", which
+  // is only useful to the person who already knows which one it is.
+  ["cost-hourly-caption", "hourly-caption"].forEach(function (id) {
+    var node = byId(id);
+    if (node) node.textContent = node.textContent.replace("local hour",
+                                                          TZ_LABEL + " hour");
+  });
 
   /* ------------------------------------------------------ sample banner */
 
@@ -1330,7 +1420,7 @@ const DATA = __DATA__;
           ? svg("path", { d: topRoundRect(x, y0, barW, drawH, 4), fill: modelColor(s.model) })
           : svg("rect", { x: x, y: y0 + gap, width: barW, height: drawH, fill: modelColor(s.model) });
         var ttl = svg("title");
-        ttl.textContent = hourLabel(hr) + " UTC · " + s.model + " · " + fmtUsd(s.v);
+        ttl.textContent = hourLabel(hr) + " " + TZ_LABEL + " · " + s.model + " · " + fmtUsd(s.v);
         node.appendChild(ttl);
         host.appendChild(node);
         running += s.v;
@@ -1356,9 +1446,9 @@ const DATA = __DATA__;
     });
 
     var tbl = el("table");
-    tbl.appendChild(el("caption", null, "USD per UTC hour, by model."));
+    tbl.appendChild(el("caption", null, "USD per " + TZ_LABEL + " hour, by model."));
     var thead = el("thead"), hr2 = el("tr");
-    hr2.appendChild(el("th", null, "Hour (UTC)"));
+    hr2.appendChild(el("th", null, "Hour (" + TZ_LABEL + ")"));
     models.forEach(function (mo) { hr2.appendChild(el("th", "n", mo)); });
     hr2.appendChild(el("th", "n", "Total"));
     thead.appendChild(hr2); tbl.appendChild(thead);
@@ -1377,37 +1467,104 @@ const DATA = __DATA__;
     byId("cost-hourly-table").appendChild(tbl);
   }
 
+  // usd desc, ties on minutes desc - the same order ledger.rank_milestones
+  // produces, so the page draws the same table whether or not the summary
+  // that reached it carried the ranked list.
+  function rankMilestones(rows) {
+    var out = rows.filter(function (r) { return r && typeof r === "object"; })
+      .slice();
+    out.sort(function (a, b) {
+      return (num(b.usd) || 0) - (num(a.usd) || 0)
+        || (num(b.minutes) || 0) - (num(a.minutes) || 0);
+    });
+    return out.map(function (r, i) {
+      return (num(r.rank) !== null) ? r : Object.assign({}, r, { rank: i + 1 });
+    });
+  }
+
+  function topCommitLine(ranked) {
+    var total = 0;
+    ranked.forEach(function (r) { total += num(r.usd) || 0; });
+    if (!ranked.length || total <= 0) return "";
+    var n = Math.min(3, ranked.length), head = 0;
+    for (var i = 0; i < n; i++) head += num(ranked[i].usd) || 0;
+    return "top " + n + " commit" + (n === 1 ? "" : "s") + " = " +
+      Math.round((head / total) * 100) + "% of the window's commit cost (" +
+      fmtUsd(head) + " of " + fmtUsd(total) + ")";
+  }
+
   function drawCostMilestones() {
-    var rows = (C && Array.isArray(C.per_milestone)) ? C.per_milestone : [];
+    var chrono = (C && Array.isArray(C.per_milestone)) ? C.per_milestone : [];
+    var ranked = (C && Array.isArray(C.per_milestone_ranked) && C.per_milestone_ranked.length)
+      ? C.per_milestone_ranked : rankMilestones(chrono);
     var host = byId("cost-milestone-table");
-    if (!rows.length) {
+    var topLine = byId("cost-milestone-top");
+    var orderLine = byId("cost-milestone-order");
+    if (!ranked.length) {
       host.appendChild(el("p", "caption",
         "n/a — no commits in the window, or the tracked repo could not be read."));
       return;
     }
-    var tbl = el("table");
-    var thead = el("thead"), hr = el("tr");
-    [["Commit", null], ["Subject", null], ["USD", "n"], ["Minutes", "n"]]
-      .forEach(function (c) { hr.appendChild(el("th", c[1], c[0])); });
-    thead.appendChild(hr); tbl.appendChild(thead);
-    var tb = el("tbody");
-    var total = 0;
-    rows.forEach(function (r) {
-      if (!r || typeof r !== "object") return;
-      var usd = num(r.usd);
-      if (usd !== null) total += usd;
-      var tr = el("tr");
-      tr.appendChild(el("td", "id", txt(r.commit)));
-      tr.appendChild(el("td", "what", txt(r.subject)));
-      tr.appendChild(el("td", "n", usd === null ? UNPRICED : fmtUsd(usd)));
-      var mins = num(r.minutes);
-      tr.appendChild(el("td", "n", mins === null ? "n/a" : mins.toFixed(1)));
-      tb.appendChild(tr);
-    });
-    tbl.appendChild(tb);
-    tbl.appendChild(el("caption", null,
-      rows.length + " commit(s), " + fmtUsd(total) + " attributed to a milestone."));
-    host.appendChild(tbl);
+    var stated = (C && typeof C.per_milestone_top_line === "string")
+      ? C.per_milestone_top_line : "";
+    if (topLine) topLine.textContent = stated || topCommitLine(ranked);
+
+    function render(rows, byRank) {
+      clear(host);
+      var tbl = el("table");
+      var thead = el("thead"), hr = el("tr");
+      [["#", "n"], ["Commit", null], ["Subject", null], ["USD", "n"],
+       ["Minutes", "n"], ["From", null], ["To", null]]
+        .forEach(function (c) { hr.appendChild(el("th", c[1], c[0])); });
+      thead.appendChild(hr); tbl.appendChild(thead);
+      var tb = el("tbody");
+      var total = 0;
+      rows.forEach(function (r, i) {
+        if (!r || typeof r !== "object") return;
+        var usd = num(r.usd);
+        if (usd !== null) total += usd;
+        var tr = el("tr");
+        var rank = num(r.rank);
+        tr.appendChild(el("td", "n", byRank
+          ? String(rank === null ? i + 1 : rank)
+          : (rank === null ? "—" : "#" + rank)));
+        tr.appendChild(el("td", "id", txt(r.commit)));
+        // A gallery refresh the snapshot policy scheduled, marked so the table
+        // reads as work vs upkeep rather than one undifferentiated list.
+        tr.appendChild(el("td", "what",
+          txt(r.subject) + (r.snapshot ? "  [snapshot]" : "")));
+        tr.appendChild(el("td", "n", usd === null ? UNPRICED : fmtUsd(usd)));
+        var mins = num(r.minutes);
+        tr.appendChild(el("td", "n", mins === null ? "n/a" : mins.toFixed(1)));
+        tr.appendChild(el("td", "id", r.start ? stamp(r.start) : "—"));
+        tr.appendChild(el("td", "id", r.end ? stamp(r.end) : "—"));
+        tb.appendChild(tr);
+      });
+      tbl.appendChild(tb);
+      tbl.appendChild(el("caption", null,
+        rows.length + " commit(s), " + fmtUsd(total) +
+        " attributed to a milestone, " +
+        (byRank ? "costliest first" : "in the order they were committed") +
+        ". Times " + TZ_LABEL + "."));
+      host.appendChild(tbl);
+    }
+
+    var byRank = true;
+    render(ranked, byRank);
+    // The chronological list is already in the payload, so the toggle costs
+    // nothing to keep: no second table is stored and none is fetched.
+    if (orderLine && chrono.length) {
+      var link = el("a", null, "show them in commit order");
+      link.href = "#";
+      link.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        byRank = !byRank;
+        render(byRank ? ranked : chrono, byRank);
+        link.textContent = byRank
+          ? "show them in commit order" : "rank them by cost again";
+      });
+      orderLine.appendChild(link);
+    }
   }
 
   function drawPricingUsed() {
@@ -1517,7 +1674,7 @@ const DATA = __DATA__;
     });
     var xl = svg("text", { x: m.l, y: m.t + ph + 34, fill: "var(--muted)", "font-size": 10.5,
       "font-family": "var(--font-mono)", "letter-spacing": "0.08em" });
-    xl.textContent = "HH:MM UTC";
+    xl.textContent = "HH:MM " + TZ_LABEL;
     host.appendChild(xl);
 
     var ends = [];
@@ -1567,7 +1724,7 @@ const DATA = __DATA__;
     var cap = el("caption", null, "Utilization samples, percent of limit.");
     tbl.appendChild(cap);
     var thead = el("thead"), hr = el("tr");
-    ["Time (UTC)", "Scoped", "Five-hour", "Seven-day"].forEach(function (hd, i) {
+    ["Time (" + TZ_LABEL + ")", "Scoped", "Five-hour", "Seven-day"].forEach(function (hd, i) {
       var th = el("th", i ? "n" : null, hd); hr.appendChild(th);
     });
     thead.appendChild(hr); tbl.appendChild(thead);
@@ -1966,7 +2123,7 @@ const DATA = __DATA__;
           node = svg("rect", { x: x, y: y0 + gap, width: barW, height: drawH, fill: modelColor(s.model) });
         }
         var ttl = svg("title");
-        ttl.textContent = hourLabel(hr) + " UTC \u00B7 " + s.model + " \u00B7 " + fmtInt(s.v) + " output tokens";
+        ttl.textContent = hourLabel(hr) + " " + TZ_LABEL + " \u00B7 " + s.model + " \u00B7 " + fmtInt(s.v) + " output tokens";
         node.appendChild(ttl);
         host.appendChild(node);
         running += s.v;
@@ -1992,9 +2149,9 @@ const DATA = __DATA__;
 
     // table twin
     var tbl = el("table");
-    tbl.appendChild(el("caption", null, "Output tokens per UTC hour."));
+    tbl.appendChild(el("caption", null, "Output tokens per " + TZ_LABEL + " hour."));
     var thead = el("thead"), hr2 = el("tr");
-    hr2.appendChild(el("th", null, "Hour (UTC)"));
+    hr2.appendChild(el("th", null, "Hour (" + TZ_LABEL + ")"));
     models.forEach(function (mo) { hr2.appendChild(el("th", "n", mo)); });
     hr2.appendChild(el("th", "n", "Total"));
     thead.appendChild(hr2); tbl.appendChild(thead);
@@ -2011,6 +2168,115 @@ const DATA = __DATA__;
     });
     tbl.appendChild(tb);
     byId("hourly-table").appendChild(tbl);
+  }
+
+  /* --------------------------------------------------- what each tier did */
+
+  var TIER_CARDS = [
+    { key: "executive", title: "Executive", graph: "executive",
+      unit: ["sessions", "session", "sessions"],
+      parts: [["commits", "commit", "commits"],
+              ["contracts", "contract change", "contract changes"],
+              ["workflows", "workflow dispatched", "workflows dispatched"],
+              ["notes", "hand-over note", "hand-over notes"],
+              ["decisions", "ruling", "rulings"]] },
+    { key: "advisory", title: "Advisory", graph: "advisory",
+      unit: ["agents", "review lane", "review lanes"],
+      parts: [["workflows", "workflow", "workflows"],
+              ["serious", "serious finding", "serious findings"]] },
+    { key: "workers", title: "Workers", graph: "workers",
+      unit: ["agents", "build lane", "build lanes"],
+      parts: [["workflows", "workflow", "workflows"],
+              ["changed_files", "file changed", "files changed"]] }
+  ];
+
+  // The head of a bullet is an identifier - a commit hash, a workflow/lane
+  // label, a path - and reads as one only in the mono face.
+  var BULLET_HEAD = [
+    /^commit [0-9a-f]{6,40}/,
+    /^[\w.@+-]+\/[^\s:]+:/,
+    /^(?:contract|hand-over note|memory note|workflow) [^\s]+/
+  ];
+
+  function bulletBody(text) {
+    var s = String(text === null || text === undefined ? "" : text);
+    var span = el("span", "body");
+    for (var i = 0; i < BULLET_HEAD.length; i++) {
+      var m = s.match(BULLET_HEAD[i]);
+      if (m) {
+        span.appendChild(el("span", "frag", m[0]));
+        span.appendChild(document.createTextNode(s.slice(m[0].length)));
+        return span;
+      }
+    }
+    span.textContent = s;
+    return span;
+  }
+
+  function plural(n, one, many) {
+    return String(n) + " " + (Math.abs(n) === 1 ? one : many);
+  }
+
+  function tierModels(block) {
+    var names = [];
+    if (block && typeof block === "object") {
+      if (block.model) names.push(String(block.model));
+      if (block.fallback) names.push(String(block.fallback) + " (fallback)");
+    }
+    return names.length ? names.join(" · ") : "model not recorded";
+  }
+
+  function drawTierBlocks() {
+    var host = byId("tier-blocks");
+    if (!host) return;
+    var TB = (D.tier_blocks && typeof D.tier_blocks === "object") ? D.tier_blocks : {};
+    var G = (D.graph_in_force && typeof D.graph_in_force === "object")
+      ? D.graph_in_force : {};
+    var win = byId("did-window");
+    if (win) {
+      win.textContent = "Window " + (wStart ? stamp(wStart) : "n/a") + " → " +
+        (wEnd ? stamp(wEnd) : "n/a") + " " + TZ_LABEL + ".";
+    }
+    TIER_CARDS.forEach(function (spec) {
+      var block = (TB[spec.key] && typeof TB[spec.key] === "object")
+        ? TB[spec.key] : {};
+      var counts = (block.source_counts && typeof block.source_counts === "object")
+        ? block.source_counts : {};
+      var card = el("div", "tier-card is-" + spec.key);
+      card.appendChild(el("h3", null, spec.title));
+
+      var meta = el("div", "tier-meta");
+      meta.appendChild(el("div", null, tierModels(G[spec.graph])));
+      var head = num(counts[spec.unit[0]]);
+      var bits = [plural(head === null ? 0 : head, spec.unit[1], spec.unit[2])];
+      spec.parts.forEach(function (p) {
+        var v = num(counts[p[0]]);
+        if (v !== null && v > 0) bits.push(plural(v, p[1], p[2]));
+      });
+      meta.appendChild(el("div", null, bits.join(" · ")));
+      card.appendChild(meta);
+
+      var bullets = Array.isArray(block.bullets) ? block.bullets : [];
+      if (!bullets.length) {
+        card.appendChild(el("p", "tier-empty", "nothing recorded in this window"));
+      } else {
+        var ul = el("ul", "bullets");
+        bullets.forEach(function (b) {
+          var li = el("li");
+          li.appendChild(el("span", "marker", "—"));
+          li.appendChild(bulletBody(b));
+          ul.appendChild(li);
+        });
+        card.appendChild(ul);
+      }
+
+      var model = (typeof TB.polish_model === "string" && TB.polish_model)
+        ? TB.polish_model : null;
+      card.appendChild(el("p", "tier-note",
+        (block.polished === true && model)
+          ? "(polished by " + model + ")" : "(unpolished extraction)"));
+      host.appendChild(card);
+    });
   }
 
   /* ------------------------------------------------------ lists & footer */
@@ -2033,6 +2299,7 @@ const DATA = __DATA__;
     });
   }
 
+  try { drawTierBlocks(); } catch (e) { console.error("tier blocks", e); }
   try { drawRoles(); } catch (e) { console.error("roles", e); }
   try { drawGraphInForce(); } catch (e) { console.error("graph in force", e); }
   try { drawCost(); } catch (e) { console.error("cost section", e); }

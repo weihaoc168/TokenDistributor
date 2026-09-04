@@ -5988,6 +5988,696 @@ def test_tasks_file_is_a_wake_signal_and_add_reports_the_loop():
     assert dispatch.Dispatcher(cfg).get("q1") is not None
 
 
+# --------------------------------------------- what each tier did (report)
+#
+# The extraction reads four things off disk and never a model: git (commits,
+# and the diffs of the contract files), the Workflow journals, the executive
+# transcripts, and the workflow directory's own mtimes. Every fixture below is
+# one of those four, built from scratch, so the assertions are about the
+# reader and not about whatever this machine's checkouts happen to hold.
+
+def _git_ok() -> bool:
+    import shutil
+    return shutil.which("git") is not None
+
+
+def _git_run(repo: Path, args: list[str], when: datetime | None = None) -> int:
+    import os
+    import shutil
+    import subprocess
+    env = dict(os.environ)
+    env.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"})
+    if when is not None:
+        env["GIT_AUTHOR_DATE"] = when.isoformat()
+        env["GIT_COMMITTER_DATE"] = when.isoformat()
+    done = subprocess.run([shutil.which("git"), "-C", str(repo), *args],
+                          capture_output=True, env=env)
+    return done.returncode
+
+
+def _fixture_repo(root: Path, inside: datetime, outside: datetime) -> Path:
+    """A repo with two commits inside the window and one before it."""
+    repo = root / "repo"
+    (repo / "dev_JSON").mkdir(parents=True, exist_ok=True)
+    assert _git_run(repo, ["init", "-q", "."]) == 0
+    (repo / "README.md").write_text("old\n", encoding="utf-8")
+    _git_run(repo, ["add", "-A"])
+    _git_run(repo, ["commit", "-q", "-m", "before the window"], outside)
+    (repo / "dev_JSON" / "CONTRACTS.md").write_text(
+        "## v2.5.3\nthe rule\n", encoding="utf-8")
+    _git_run(repo, ["add", "-A"])
+    _git_run(repo, ["commit", "-q", "-m", "ledger: contract v2.5.3"], inside)
+    (repo / "dev_JSON" / "HANDOFF.md").write_text("wave 1\n", encoding="utf-8")
+    _git_run(repo, ["add", "-A"])
+    _git_run(repo, ["commit", "-q", "-m", "handoff: wave 1"], inside)
+    return repo
+
+
+def _text_entry(mid, model, ts, text, usage, uuid="ut"):
+    """One assistant JSONL entry whose content is prose, not a tool call."""
+    return json.dumps({
+        "type": "assistant", "uuid": uuid, "timestamp": ts,
+        "message": {"id": mid, "model": model, "usage": usage,
+                    "content": [{"type": "text", "text": text}]},
+    })
+
+
+REVIEW_RESULT = {
+    "lens": "review-ledger", "approve": False,
+    "serious": [{"file": "C:/Users/chenw/TokenDistributor/tokentracker/ledger.py",
+                 "line": 12, "finding": "The cap is applied before the sort."}],
+    "minors": [{"where": "README.md:11", "finding": "loose wording"}],
+}
+WORKER_RESULT = {
+    "changed": ["tokentracker/ledger.py: extraction", "tests/test_all.py"],
+    "tests": "182/182 passed. Ran with py -3.13.",
+    "notes": "nothing else",
+}
+
+
+def _workflow_fixture(cfg: Config, session_id: str, name: str = "wf_test",
+                      extra_lines: list[str] | None = None) -> Path:
+    """One Workflow directory: a journal, agent briefs and per-agent meta."""
+    ts = (utcnow() - timedelta(minutes=3)).isoformat()
+    wf = cfg.projects_dir / "proj" / session_id / "subagents" / "workflows" / name
+    wf.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps({"type": "started", "agentId": "a1"}),
+        json.dumps({"type": "started", "agentId": "a2"}),
+        json.dumps({"type": "started", "agentId": "a3"}),
+        json.dumps({"type": "result", "agentId": "a1", "result": REVIEW_RESULT}),
+        json.dumps({"type": "result", "agentId": "a2", "result": WORKER_RESULT}),
+        # A lane that answered with a bare string, which is legal and common.
+        json.dumps({"type": "result", "agentId": "a3",
+                    "result": "wrote the README bullet"}),
+    ] + (extra_lines or [])
+    (wf / "journal.jsonl").write_text("\n".join(lines), encoding="utf-8")
+    # The models match the graph _ledger_cfg builds: the lens on the advisory
+    # model, the lanes on the workers' one, which is the split the extraction's
+    # model rule is allowed to read.
+    for agent, model, brief in (("a1", "claude-opus-5", "You are the adversarial reviewer."),
+                                ("a2", "claude-sonnet-5", "Implementer: build the extraction."),
+                                ("a3", "claude-sonnet-5", "Author: write the bullet.")):
+        (wf / f"agent-{agent}.meta.json").write_text(
+            json.dumps({"agentType": "workflow-subagent", "model": model}),
+            encoding="utf-8")
+        (wf / f"agent-{agent}.jsonl").write_text(json.dumps({
+            "type": "user", "timestamp": ts,
+            "message": {"role": "user", "content": brief}}), encoding="utf-8")
+    return wf
+
+
+def _blocks_cfg(with_repo: bool = True) -> tuple[Config, datetime, datetime]:
+    """A cfg whose disk holds a session, a ruling, a workflow and (maybe) a repo."""
+    cfg = _ledger_cfg(exec_tools=())
+    # The end runs a few minutes ahead so that fixtures a test writes AFTER
+    # this helper returns still land inside the window: a workflow's clock is
+    # the mtimes of its own files, and those are stamped when the test runs.
+    start, end = utcnow() - timedelta(hours=1), utcnow() + timedelta(minutes=5)
+    ts = (utcnow() - timedelta(minutes=6)).isoformat()
+    with (cfg.projects_dir / "proj" / f"{MAIN_ID}.jsonl").open(
+            "a", encoding="utf-8") as handle:
+        handle.write("\n" + _text_entry(
+            "dec1", "claude-fable-5-1", ts,
+            "I looked at both options at length. Ruling: the ledger keeps "
+            "per_milestone chronological and adds a ranked view. That is "
+            "final.", _usage(out=400, read=1000), uuid="udec"))
+        handle.write("\n" + _text_entry(
+            "dec2", "claude-fable-5-1", ts,
+            "Decision: the polish stays off by default.",
+            _usage(out=20), uuid="udec2"))
+    _workflow_fixture(cfg, MAIN_ID)
+    if with_repo and _git_ok():
+        repo = _fixture_repo(cfg.root, utcnow() - timedelta(minutes=20),
+                             utcnow() - timedelta(hours=9))
+        cfg.report_repo = str(repo)
+    return cfg, start, end
+
+
+def test_tier_blocks_extract_from_git_journals_and_transcripts():
+    from tokentracker import graph as G
+    from tokentracker import ledger
+    cfg, start, end = _blocks_cfg()
+    G.apply_graph(cfg)
+    blocks = ledger.build_tier_blocks(cfg, start, end)
+    assert set(blocks) >= set(ledger.PANEL_TIERS), blocks
+    ex = blocks[ledger.PANEL_EXEC]["bullets"]
+    counts = blocks[ledger.PANEL_EXEC]["source_counts"]
+
+    # The rulings the director stated, most expensive turn first, and only the
+    # sentence that is the ruling.
+    rulings = [b for b in ex if b.startswith(("Ruling:", "Decision:"))]
+    assert rulings and rulings[0].startswith("Ruling: the ledger keeps"), rulings
+    assert "I looked at both options" not in " ".join(rulings), rulings
+    assert counts["decisions"] == 2, counts
+
+    # The workflow it dispatched, with the agent counts off the journal.
+    flows = [b for b in ex if b.startswith("workflow ")]
+    assert flows == ["workflow wf_test: 3 agent(s) dispatched, 3 returned"], flows
+
+    if _git_ok():
+        commits = [b for b in ex if b.startswith("commit ")]
+        subjects = " | ".join(commits)
+        assert "ledger: contract v2.5.3" in subjects, commits
+        assert "handoff: wave 1" in subjects, commits
+        # The commit before the window is not this window's work.
+        assert "before the window" not in subjects, commits
+        assert counts["commits"] == 2, counts
+        # The contract heading the commit added, quoted as it was written.
+        assert any('"## v2.5.3"' in b and b.startswith("contract ") for b in ex), ex
+        assert any(b.startswith("hand-over note ") and "HANDOFF.md" in b
+                   for b in ex), ex
+
+    # One bullet per review lens, its own counts, its first serious finding.
+    adv = blocks[ledger.PANEL_ADVISORY]["bullets"]
+    assert adv == ["wf_test/review-ledger: approve=false, 1 serious, 1 minor - "
+                   "The cap is applied before the sort."], adv
+    assert blocks[ledger.PANEL_ADVISORY]["source_counts"]["serious"] == 1
+
+    # One bullet per build lane: files changed, what the suite said, first item.
+    work = blocks[ledger.PANEL_WORKERS]["bullets"]
+    assert len(work) == 2, work
+    assert work[0] == ("wf_test/worker: 2 files, tests 182/182 passed. - "
+                       "tokentracker/ledger.py: extraction"), work[0]
+    assert "wf_test/author: wrote the README bullet" in work, work
+    assert blocks[ledger.PANEL_WORKERS]["source_counts"]["changed_files"] == 2
+
+    # Nothing was polished, and nothing claims to have been.
+    assert blocks["polished"] is False and blocks["polish_model"] is None
+    assert all(blocks[t]["polished"] is False for t in ledger.PANEL_TIERS)
+
+
+def test_tier_blocks_cap_and_rank_the_bullets():
+    from tokentracker import ledger
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    wf = cfg.projects_dir / "proj" / MAIN_ID / "subagents" / "workflows" / "wf_big"
+    wf.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for i in range(20):
+        lines.append(json.dumps({"type": "result", "agentId": f"r{i}", "result": {
+            "lens": f"lens-{i}", "approve": False,
+            "serious": [{"finding": f"finding {i}"}] * i, "minors": []}}))
+        lines.append(json.dumps({"type": "result", "agentId": f"w{i}", "result": {
+            "changed": [f"file{j}.py" for j in range(i)],
+            "tests": f"{i} passed"}}))
+    (wf / "journal.jsonl").write_text("\n".join(lines), encoding="utf-8")
+
+    blocks = ledger.build_tier_blocks(cfg, start, end)
+    adv = blocks[ledger.PANEL_ADVISORY]["bullets"]
+    work = blocks[ledger.PANEL_WORKERS]["bullets"]
+    assert len(adv) == ledger.ADVISORY_CAP == 12, len(adv)
+    assert len(work) == ledger.WORKER_CAP == 15, len(work)
+    # Serious-first for the lenses, biggest change first for the lanes: the cap
+    # has to keep the rows a reader was going to look for.
+    assert adv[0].startswith("wf_big/lens-19: approve=false, 19 serious"), adv[0]
+    assert "19 serious" in adv[0] and "8 serious" in adv[-1], (adv[0], adv[-1])
+    assert work[0].startswith("wf_big/worker: 19 files"), work[0]
+    assert len(blocks[ledger.PANEL_EXEC]["bullets"]) <= ledger.EXEC_CAP
+
+    # Each executive reader is capped separately, so a flood of one kind never
+    # pushes the rulings - the one thing only the transcripts carry - off the
+    # end of the block. The counts still say how many there really were.
+    for i in range(9):
+        extra = wf.parent / f"wf_flood{i}"
+        extra.mkdir(parents=True, exist_ok=True)
+        (extra / "journal.jsonl").write_text(
+            json.dumps({"type": "started", "agentId": "f"}), encoding="utf-8")
+    flooded = ledger.build_tier_blocks(cfg, start, end)
+    ex = flooded[ledger.PANEL_EXEC]["bullets"]
+    counts = flooded[ledger.PANEL_EXEC]["source_counts"]
+    assert counts["workflows"] == 11, counts       # wf_test + wf_big + nine
+    assert len([b for b in ex if b.startswith("workflow ")]) == \
+        ledger.DISPATCH_CAP == 5, ex
+    assert len([b for b in ex if b.startswith(("Ruling:", "Decision:"))]) == 2, ex
+
+
+def test_tier_blocks_polish_is_off_and_calls_no_subprocess():
+    """Disabled means no process is started, not "started and ignored"."""
+    from tokentracker import ledger
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    cfg.report_repo = ""
+    assert ledger.summarize_settings(cfg)["enabled"] is False
+
+    calls: list = []
+
+    class Guard:
+        SubprocessError = Exception
+
+        def run(self, *a, **k):
+            calls.append(a)
+            raise AssertionError("a disabled polish must not run anything")
+
+    real = ledger.subprocess
+    ledger.subprocess = Guard()
+    try:
+        blocks = ledger.build_tier_blocks(cfg, start, end)
+    finally:
+        ledger.subprocess = real
+    assert calls == [], calls
+    assert blocks["polished"] is False and blocks["caveat"] is None
+    assert blocks[ledger.PANEL_ADVISORY]["bullets"], blocks
+
+    # A malformed block is read as "off" too: this is the one path that spends
+    # money, so it never turns itself on.
+    for bad in ({"enabled": "yes"}, {"enabled": 1}, "on", None, {"model": ""}):
+        cfg.report_summarize = bad
+        assert ledger.summarize_settings(cfg)["enabled"] is False, bad
+
+
+def test_tier_blocks_polish_uses_the_model_when_enabled():
+    from tokentracker import ledger
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    cfg.report_summarize = {"enabled": True, "model": "claude-haiku-4-5-20251001",
+                            "max_bullets": 2}
+    seen: list[tuple] = []
+
+    def stub(config, model, prompt, timeout):
+        seen.append((model, timeout, prompt))
+        return "Here you go:\n- polished one\n- polished two\n- polished three\n"
+
+    blocks = ledger.build_tier_blocks(cfg, start, end, runner=stub)
+    assert blocks["polished"] is True, blocks
+    assert blocks["polish_model"] == "claude-haiku-4-5-20251001"
+    assert blocks[ledger.PANEL_WORKERS]["bullets"] == ["polished one",
+                                                       "polished two"], blocks
+    assert blocks["caveat"] is None, blocks["caveat"]
+    # One call per tier that had anything to say, on the configured model, with
+    # the raw bullets in the prompt.
+    assert len(seen) == 3 and {s[0] for s in seen} == {"claude-haiku-4-5-20251001"}
+    assert all(s[1] == ledger.SUMMARIZE_TIMEOUT for s in seen), seen
+    assert "wf_test/review-ledger" in seen[1][2], seen[1][2][:200]
+
+    # A summarizer that fails, times out or answers nothing usable falls back
+    # to the raw extraction and says so.
+    def broken(config, model, prompt, timeout):
+        raise TimeoutError("no answer")
+
+    fell_back = ledger.build_tier_blocks(cfg, start, end, runner=broken)
+    assert fell_back["polished"] is False, fell_back
+    assert "wf_test/review-ledger" in fell_back[ledger.PANEL_ADVISORY]["bullets"][0]
+    assert "did not answer" in (fell_back["caveat"] or ""), fell_back["caveat"]
+
+
+def test_tier_blocks_survive_a_hostile_journal():
+    from tokentracker import ledger
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    wf = cfg.projects_dir / "proj" / MAIN_ID / "subagents" / "workflows" / "wf_test"
+    (wf / "journal.jsonl").write_text("\n".join([
+        "{not json at all",
+        "",
+        "[]",
+        json.dumps({"type": "result", "agentId": "z1", "result": 17}),
+        json.dumps({"type": "result", "agentId": "z2", "result": None}),
+        json.dumps({"type": "result", "agentId": "z3",
+                    "result": {"approve": "maybe", "serious": "one line",
+                               "findings": [{"severity": "serious"}]}}),
+        json.dumps({"type": "result", "result": {"changed": "just a string"}}),
+        json.dumps({"type": "result", "agentId": "z5", "result": WORKER_RESULT}),
+    ]), encoding="utf-8")
+    blocks = ledger.build_tier_blocks(cfg, start, end)
+    text = " ".join(blocks[ledger.PANEL_ADVISORY]["bullets"]
+                    + blocks[ledger.PANEL_WORKERS]["bullets"])
+    # The malformed lines are skipped, the readable ones are still reported.
+    assert "182/182 passed" in text, text
+    assert "approve=n/a, 2 serious" in text, text
+    assert "1 files" in text, text
+
+    # And a directory with no journal at all is simply an empty block.
+    (wf / "journal.jsonl").unlink()
+    for stray in wf.glob("agent-*"):
+        stray.unlink()
+    empty = ledger.build_tier_blocks(cfg, start, end)
+    assert empty[ledger.PANEL_ADVISORY]["bullets"] == [], empty
+    assert empty[ledger.PANEL_WORKERS]["bullets"] == [], empty
+
+
+def test_tier_block_bullets_carry_no_secrets_or_long_paths():
+    from tokentracker import ledger
+    long_path = ("C:/Users/chenw/AppData/Local/Temp/claude/C--Users-chenw/"
+                 "329cb798-b055-4f92-ba8d-96174a22413d/scratchpad/wave1_pods.js")
+    assert len(long_path) > ledger.PATH_CHARS
+    line = ledger.scrub(f"changed {long_path} with api_key=sk-ant-abcdefgh12345678")
+    assert "wave1_pods.js" in line and "AppData" not in line, line
+    assert "sk-ant" not in line and "<redacted>" in line, line
+    # A path a reader can still act on is left alone.
+    short = "tokentracker/ledger.py:31 changed"
+    assert ledger.scrub(short) == short
+    assert len(ledger.scrub("x" * 4000)) <= ledger.BULLET_CHARS
+
+
+def test_summary_carries_the_tier_blocks_and_the_zone():
+    from tokentracker import graph as G
+    from tokentracker import ledger
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    G.apply_graph(cfg)
+    summary = ledger.build_summary(cfg, start, end)
+    blocks = summary["tier_blocks"]
+    assert set(blocks) >= set(ledger.PANEL_TIERS) | {"polished"}, blocks
+    for tier in ledger.PANEL_TIERS:
+        assert isinstance(blocks[tier]["bullets"], list), blocks[tier]
+        assert isinstance(blocks[tier]["source_counts"], dict), blocks[tier]
+    assert blocks[ledger.PANEL_EXEC]["source_counts"]["sessions"] >= 1
+    # The whole payload still round-trips as JSON: it is written to disk.
+    json.dumps(summary)
+
+
+def test_milestone_rows_are_ranked_and_the_top_share_is_stated():
+    from tokentracker import ledger
+    start = datetime(2026, 9, 3, 9, 0, tzinfo=timezone.utc)
+
+    def at(hour):
+        return datetime(2026, 9, 3, hour, 0, tzinfo=timezone.utc)
+
+    commits = [{"commit": "a" * 40, "at": at(10), "subject": "cheap"},
+               {"commit": "b" * 40, "at": at(11), "subject": "dear"},
+               {"commit": "c" * 40, "at": at(13), "subject": "middling"},
+               {"commit": "d" * 40, "at": at(16), "subject": "same as cheap"}]
+    events = [(at(9) + timedelta(minutes=30), "m", 1.0),
+              (at(10) + timedelta(minutes=30), "m", 8.0),
+              (at(12), "m", 4.0),
+              (at(13) + timedelta(minutes=30), "m", 1.0)]
+    rows = ledger.bucket_milestones(commits, events, start)
+    # per_milestone itself stays chronological: it is an append-only record.
+    assert [r["subject"] for r in rows] == ["cheap", "dear", "middling",
+                                            "same as cheap"], rows
+    assert rows[0]["start"] == start.isoformat() and rows[0]["end"] == at(10).isoformat()
+
+    ranked = ledger.rank_milestones(rows)
+    assert [r["rank"] for r in ranked] == [1, 2, 3, 4], ranked
+    assert [r["subject"] for r in ranked] == ["dear", "middling", "same as cheap",
+                                              "cheap"], ranked
+    # $1.00 twice: the tie breaks on the longer span, 180 minutes against 60.
+    assert ranked[2]["minutes"] == 180.0 and ranked[3]["minutes"] == 60.0
+    assert ranked[0]["usd"] == 8.0 and ranked[1]["usd"] == 4.0
+    # The one sentence the ranking exists to support.
+    line = ledger.milestone_top_line(rows)
+    assert line.startswith("top 3 commits = 93%"), line
+    assert "$13.00 of $14.00" in line, line
+    assert ledger.milestone_top_line([]) == ""
+    assert ledger.milestone_top_line([{"usd": 0.0}]) == ""
+
+    # The summary carries both cuts and the sentence.
+    cfg, start2, end2 = _blocks_cfg(with_repo=False)
+    cost = ledger.build_summary(cfg, start2, end2)["cost"]
+    assert set(cost) >= {"per_milestone", "per_milestone_ranked",
+                         "per_milestone_top_line"}, sorted(cost)
+
+
+def test_report_times_render_in_the_operator_zone():
+    from tokentracker import clock, ledger
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    cfg.timezone = "Nowhere/Fictional"      # forces the fixed-offset fallback
+    cfg.tz_offset_hours = -5
+    cfg.tz_label = "CT"
+    clock._ZONE_CACHE.clear()
+    zone = ledger.timezone_block(cfg, end)
+    assert zone["label"] == "CT" and zone["offset_minutes"] == -300, zone
+    assert zone["source"] == "fixed-offset", zone
+    # 02:00 UTC is 21:00 the previous day in the operator's clock; that is the
+    # shift the page applies to every hour bucket and milestone time.
+    moment = parse_iso("2026-09-03T02:00:00+00:00")
+    assert clock.fmt_local(moment, "%m-%d %H:%M", cfg) == "09-02 21:00"
+
+    summary = ledger.build_summary(cfg, start, end)
+    assert summary["timezone"]["label"] == "CT", summary["timezone"]
+    # summary.json itself stays ISO UTC everywhere.
+    assert summary["window"]["end"].endswith("+00:00"), summary["window"]
+    for hour in summary["hourly_output_by_model"].values():
+        assert all(k.endswith(":00Z") for k in hour), hour
+    assert any("CT" in c and "ISO UTC" in c for c in summary["caveats"]), \
+        summary["caveats"]
+
+    page = ledger.render(cfg, summary)
+    html = page.read_text(encoding="utf-8")
+    # The page shifts by that offset and labels what it drew.
+    assert '"offset_minutes": -300' in html, "the offset reaches the page"
+    assert "var TZ_OFF" in html and "function localDate(" in html
+    assert 'TZ_LABEL + " hour, by model."' in html, "hourly table follows the zone"
+    assert "Hour (UTC)" not in html, "no hardcoded UTC column left"
+    clock._ZONE_CACHE.clear()
+
+
+def test_ledger_page_renders_the_tier_block_section():
+    from tokentracker import ledger
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    page = ledger.generate(cfg, "manual", hours=1.0)
+    html = page.read_text(encoding="utf-8")
+    assert "__DATA__" not in html and ledger.TITLE_PLACEHOLDER not in html
+    for marker in (">What each tier did</h2>", "tier-blocks", "drawTierBlocks(",
+                   '"tier_blocks"', "nothing recorded in this window",
+                   "(unpolished extraction)", "tier-card is-", ".tier-grid",
+                   '"timezone"', '"per_milestone_ranked"',
+                   "% of the window's commit cost", "cost-milestone-top",
+                   "rankMilestones(", "show them in commit order"):
+        assert marker in html, marker
+    # Three blocks, stacking under 820px, and the tier names on them.
+    assert html.count("{ key: \"executive\"") == 1, "the three cards are declared"
+    assert ".tier-grid { grid-template-columns: minmax(0, 1fr)" in html
+    data = json.loads((cfg.reports_dir / f"{page.name[:16]}-summary.json")
+                      .read_text(encoding="utf-8"))
+    assert data["tier_blocks"][ledger.PANEL_WORKERS]["bullets"], data["tier_blocks"]
+
+
+def test_result_tier_reads_the_work_before_the_model():
+    """What a lane returned outranks which model it happened to run on.
+
+    The fork brief routinely runs hard build lanes on the executive/advisory
+    model. Reading the model id first filed those under `advisory`, where the
+    report printed a review verdict ("approve=n/a, 0 serious, 0 minor") for a
+    lane that reviewed nothing, and the files it changed vanished from the
+    workers block and from its changed-file count.
+    """
+    from tokentracker import graph as G
+    from tokentracker import ledger
+    adv = {"claude-fable-5-1"}
+
+    # A build lane on the advisory model. Its result says what it did.
+    built = {"role": "worker", "model": "claude-fable-5-1", "label": "worker",
+             "result": {"changed": ["a.py", "b.py"], "tests": "182/182 passed"}}
+    assert ledger.result_tier(built, adv) == ledger.PANEL_WORKERS, built
+    bullet, changed = ledger.worker_bullet("wf", built)
+    assert changed == 2 and "2 files" in bullet, bullet
+
+    # A brief that named the lane a builder outranks the model too, even when
+    # the lane answered with a bare string that has no shape to read.
+    named = {"role": "author", "declared": True, "model": "claude-fable-5-1",
+             "label": "author", "result": "wrote the README bullet"}
+    assert ledger.result_tier(named, adv) == ledger.PANEL_WORKERS, named
+
+    # A review result is still a review, whatever model it ran on...
+    lens = {"model": "claude-sonnet-5", "label": "w", "result": {"approve": True}}
+    assert ledger.result_tier(lens, adv) == ledger.PANEL_ADVISORY, lens
+    # ...and the model stays the LAST resort, for a row with no shape, no
+    # label and no declared role. `worker` there is the default, not evidence.
+    bare = {"role": "worker", "declared": False, "model": "claude-fable-5-1",
+            "label": "", "result": "done"}
+    assert ledger.result_tier(bare, adv) == ledger.PANEL_ADVISORY, bare
+
+    # End to end: the same lane read off a real journal, with the graph that
+    # does separate the tiers, still lands in the workers block.
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    G.apply_graph(cfg)
+    graph = G.read_graph(cfg)
+    assert ledger.graph_separates_tiers(graph), graph
+    wf = cfg.projects_dir / "proj" / MAIN_ID / "subagents" / "workflows" / "wf_hard"
+    wf.mkdir(parents=True, exist_ok=True)
+    (wf / "journal.jsonl").write_text(json.dumps(
+        {"type": "result", "agentId": "h1", "result": WORKER_RESULT}),
+        encoding="utf-8")
+    (wf / "agent-h1.meta.json").write_text(
+        json.dumps({"agentType": "workflow-subagent",
+                    "model": graph[G.ADVISORY]["model"]}), encoding="utf-8")
+    (wf / "agent-h1.jsonl").write_text(json.dumps({
+        "type": "user", "timestamp": (utcnow() - timedelta(minutes=3)).isoformat(),
+        "message": {"role": "user", "content": "Implementer: build the extraction."}}),
+        encoding="utf-8")
+
+    blocks = ledger.build_tier_blocks(cfg, start, end, graph=graph)
+    work = blocks[ledger.PANEL_WORKERS]["bullets"]
+    assert any(b.startswith("wf_hard/worker: 2 files") for b in work), work
+    assert not any("wf_hard" in b for b in blocks[ledger.PANEL_ADVISORY]["bullets"])
+    # Its two files are counted where the work happened.
+    assert blocks[ledger.PANEL_WORKERS]["source_counts"]["changed_files"] == 4
+
+
+def test_ruling_scan_matches_whole_words_only():
+    """"still undecided" is not a decision, and the block may not say it is.
+
+    The scan was a bare substring search, so `decided` matched "undecided" and
+    `decision` matched "decisional"; the block then printed "Decided: the
+    wave-2 plan is still undecided." - a decision label on a sentence that
+    says no decision was made - and the inflated count reached the card's
+    meta line as "N rulings".
+    """
+    from tokentracker import ledger
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    path = cfg.projects_dir / "proj" / "prose.jsonl"
+    ts = (utcnow() - timedelta(minutes=4)).isoformat()
+    path.write_text("\n".join([
+        _text_entry("p1", "claude-fable-5-1", ts,
+                    "The wave-2 plan is still undecided.",
+                    _usage(out=900), uuid="up1"),
+        _text_entry("p2", "claude-fable-5-1", ts,
+                    "Precision is a decisional matter here.",
+                    _usage(out=800), uuid="up2"),
+        _text_entry("p3", "claude-fable-5-1", ts,
+                    "Ruling: the ranked view ships.", _usage(out=10), uuid="up3"),
+    ]), encoding="utf-8")
+    found = ledger.transcript_decisions(path, start, end)
+    assert [d["text"] for d in found] == ["Ruling: the ranked view ships."], found
+    assert found[0]["word"] == "ruling", found
+    # The two prose turns cost more, so a substring match would have ranked
+    # them first and pushed the real ruling down the block.
+    assert "undecided" not in " ".join(d["text"] for d in found), found
+
+    # The plural still answers, and so does the phrase, as itself.
+    path.write_text("\n".join([
+        _text_entry("p4", "claude-fable-5-1", ts,
+                    "Director rulings: the polish stays off.",
+                    _usage(out=10), uuid="up4"),
+        _text_entry("p5", "claude-fable-5-1", ts,
+                    "Two decisions were taken today.", _usage(out=5), uuid="up5"),
+    ]), encoding="utf-8")
+    words = {d["word"] for d in ledger.transcript_decisions(path, start, end)}
+    assert words == {"director rulings", "decisions"}, words
+
+
+def test_commit_bullets_keep_the_newest_of_a_busy_window():
+    """The capped commit list is ranked first, like every other capped list.
+
+    `author_commits` reads `git log --reverse`, so slicing the head of it kept
+    the OLDEST commits of the window: a live 24 h report said "28 commits" and
+    listed the eight from the first hour, dropping the whole of the report
+    day, which inverts the answer the block exists to give.
+    """
+    from tokentracker import ledger
+    if not _git_ok():
+        return
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    repo = cfg.root / "busy"
+    repo.mkdir(parents=True, exist_ok=True)
+    assert _git_run(repo, ["init", "-q", "."]) == 0
+    for i in range(12):
+        (repo / f"f{i:02d}.txt").write_text("x\n", encoding="utf-8")
+        _git_run(repo, ["add", "-A"])
+        _git_run(repo, ["commit", "-q", "-m", f"c{i:02d}"],
+                 utcnow() - timedelta(minutes=50 - i * 3))
+    cfg.report_repo = str(repo)
+
+    blocks = ledger.build_tier_blocks(cfg, start, end)
+    commits = [b for b in blocks[ledger.PANEL_EXEC]["bullets"]
+               if b.startswith("commit ")]
+    # The count says what was found; the list shows what fits, newest first.
+    assert blocks[ledger.PANEL_EXEC]["source_counts"]["commits"] == 12, blocks
+    assert len(commits) == ledger.COMMIT_CAP == 8, commits
+    assert [b.split()[-1] for b in commits] == [f"c{i:02d}" for i in
+                                                range(11, 3, -1)], commits
+    assert not any(b.endswith(("c00", "c01", "c02", "c03")) for b in commits)
+
+
+def test_workflow_dispatch_bullets_lead_with_the_latest_wave():
+    """Dispatches are ordered by when they ran, never by their uuid.
+
+    `workflow_dirs` sorts by directory name - `wf_<uuid>` - which carries no
+    time and no size, so capping that order kept the five lexicographically
+    smallest uuids and hid the day's six-agent waves behind an ordering that
+    changes with whatever ids the Workflow tool happens to mint.
+    """
+    import os
+
+    from tokentracker import ledger
+    cfg, start, end = _blocks_cfg(with_repo=False)
+    root = cfg.projects_dir / "proj" / MAIN_ID / "subagents" / "workflows"
+    base = utcnow()
+    # Name order, wave size and dispatch time all disagree on purpose.
+    plan = [("wf_zz_oldest", 6, 45), ("wf_aa_mid", 1, 30),
+            ("wf_mm_new", 4, 12), ("wf_bb_tie", 2, 12), ("wf_cc_extra", 3, 20)]
+    for name, agents, ago in plan:
+        wf = root / name
+        wf.mkdir(parents=True, exist_ok=True)
+        (wf / "journal.jsonl").write_text("\n".join(
+            json.dumps({"type": "started", "agentId": f"a{i}"})
+            for i in range(agents)), encoding="utf-8")
+        when = (base - timedelta(minutes=ago)).timestamp()
+        for path in wf.iterdir():
+            os.utime(path, (when, when))
+
+    blocks = ledger.build_tier_blocks(cfg, start, end)
+    flows = [b.split(":")[0].removeprefix("workflow ")
+             for b in blocks[ledger.PANEL_EXEC]["bullets"]
+             if b.startswith("workflow ")]
+    # wf_test is written by the fixture and is the newest of the six; the tie
+    # at 12 minutes breaks on the bigger wave; the cap drops the oldest run,
+    # not the alphabetically unlucky one - and dropping the 6-agent wave while
+    # keeping the 1-agent one is the ordering saying plainly that it is time.
+    assert flows == ["wf_test", "wf_mm_new", "wf_bb_tie", "wf_cc_extra",
+                     "wf_aa_mid"], flows
+    assert blocks[ledger.PANEL_EXEC]["source_counts"]["workflows"] == 6, blocks
+    assert len(flows) == ledger.DISPATCH_CAP == 5, flows
+    assert "wf_zz_oldest" not in " ".join(blocks[ledger.PANEL_EXEC]["bullets"])
+
+
+def test_extraction_windows_exclude_the_neighbouring_days():
+    """Both git readers widen their range, so both re-apply the window by hand.
+
+    `author_commits` and `contract_notes` ask git for a range GIT_WIDEN_DAYS
+    wider than the report window (an author date a rebase moved is still the
+    work that was done), and `transcript_decisions` reads whole transcripts.
+    Delete either window check and yesterday's contract and yesterday's ruling
+    walk into today's report.
+    """
+    from tokentracker import ledger
+    cfg, start, end = _blocks_cfg(with_repo=False)
+
+    # A ruling stated before the window, in the same transcript, and the most
+    # expensive turn in the file: without the check it would be bullet one.
+    path = cfg.projects_dir / "proj" / f"{MAIN_ID}.jsonl"
+    stale = (utcnow() - timedelta(hours=9)).isoformat()
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("\n" + _text_entry(
+            "old1", "claude-fable-5-1", stale,
+            "Ruling: yesterday's rule, which is not this window's work.",
+            _usage(out=9000), uuid="uold"))
+    found = ledger.transcript_decisions(path, start, end)
+    assert len(found) == 2, found
+    assert "yesterday" not in " ".join(d["text"] for d in found), found
+    # The same transcript read over a window that DOES contain it finds it,
+    # so the check is what excluded it and not a parse failure.
+    wide = ledger.transcript_decisions(path, utcnow() - timedelta(hours=12), end)
+    assert len(wide) == 3, wide
+
+    if not _git_ok():
+        return
+    # A contract heading written before the window, well inside the widened
+    # git range the reader asks for.
+    repo = cfg.root / "contracts"
+    (repo / "dev_JSON").mkdir(parents=True, exist_ok=True)
+    assert _git_run(repo, ["init", "-q", "."]) == 0
+    book = repo / "dev_JSON" / "CONTRACTS.md"
+    book.write_text("## v0.0.0 yesterday\n", encoding="utf-8")
+    _git_run(repo, ["add", "-A"])
+    _git_run(repo, ["commit", "-q", "-m", "contract: the day before"],
+             utcnow() - timedelta(hours=9))
+    book.write_text("## v0.0.0 yesterday\n## v9.9.9 today\n", encoding="utf-8")
+    _git_run(repo, ["add", "-A"])
+    _git_run(repo, ["commit", "-q", "-m", "contract: today"],
+             utcnow() - timedelta(minutes=20))
+
+    contracts, _notes = ledger.contract_notes(repo, start, end)
+    assert len(contracts) == 1, contracts
+    assert '"## v9.9.9 today"' in contracts[0], contracts
+    assert "yesterday" not in contracts[0], contracts
+    # Widen the window over both and both are reported, so again it is the
+    # check doing the work.
+    both, _ = ledger.contract_notes(repo, utcnow() - timedelta(hours=12), end)
+    assert len(both) == 2, both
+    assert [c for c in both if "yesterday" in c], both
+    # And the commit reader agrees about the same two commits.
+    assert len(ledger.author_commits(repo, start, end)) == 1
+    assert len(ledger.author_commits(repo, utcnow() - timedelta(hours=12), end)) == 2
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
